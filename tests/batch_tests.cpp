@@ -1,5 +1,6 @@
 // End-to-end batch render: DDP + WAV/FLAC 16/44.1 + hi-res, then checks that the 16-bit
 // track files are bit-identical to the DDP image and the tags are present.
+#include "../app/Source/ControlSurface.h"
 #include "../app/Source/DdpFormat.h"
 #include "../app/Source/Exporter.h"
 #include "../core/util/FlacTags.h"
@@ -23,6 +24,17 @@ static juce::File noiseFile(const juce::File& dir, const juce::String& name, dou
     w->writeFromAudioSampleBuffer(b, 0, b.getNumSamples());
     return f;
 }
+
+// Records which commands a control surface triggers.
+struct CommandSpy : juce::ApplicationCommandTarget {
+    juce::Array<juce::CommandID> fired;
+    juce::ApplicationCommandTarget* getNextCommandTarget() override { return nullptr; }
+    void getAllCommands(juce::Array<juce::CommandID>& ids) override { for (auto& d : allCommands()) ids.add(d.id); }
+    void getCommandInfo(juce::CommandID id, juce::ApplicationCommandInfo& info) override {
+        if (auto* d = findCommand(id)) info.setInfo(d->name, d->description, d->category, 0);
+    }
+    bool perform(const InvocationInfo& i) override { fired.add(i.commandID); return true; }
+};
 
 int main() {
     juce::ScopedJuceInitialiser_GUI gui;
@@ -117,6 +129,50 @@ int main() {
         auto report = out.getChildFile("Render Report.txt").loadFileAsString();
         CHECK(report.contains("written and verified") && report.contains("IMAGE.DAT") && report.contains("Integrated loudness"));
     }
+    // ---- Control surface: Mackie defaults, jog, MIDI learn, HUI zone/port learn.
+    {
+        CommandSpy spy;
+        juce::ApplicationCommandManager cm;
+        cm.registerAllCommandsForTarget(&spy);
+        cm.setFirstCommandTarget(&spy);
+        juce::PropertiesFile::Options po;
+        po.applicationName = "LatheTest";
+        po.filenameSuffix = ".settings";
+        juce::PropertiesFile props(dir.getChildFile("surface.settings"), po);
+        ControlSurface cs(cm, props);
+        double jogged = 0;
+        cs.jog = [&](double d) { jogged += d; };
+        cs.isPlaying = [] { return true; };
+        cs.handle(juce::MidiMessage::noteOn(1, 0x5E, juce::uint8(127)));   // Play
+        cs.handle(juce::MidiMessage::noteOn(1, 0x5E, juce::uint8(0)));     // release: ignored
+        cs.handle(juce::MidiMessage::noteOn(1, 0x54, juce::uint8(127)));   // Marker
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x3C, 3));         // jog +3
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x3C, 0x42));      // jog -2
+        CHECK(spy.fired.size() == 2 && spy.fired[0] == cmd::playStop && spy.fired[1] == cmd::addTrackMarker);
+        CHECK(std::abs(jogged - 1.0 / 75.0) < 1e-9);
+        cs.learn(cmd::analyse);
+        cs.handle(juce::MidiMessage::controllerEvent(2, 20, 127));         // learned, not fired
+        CHECK(spy.fired.size() == 2 && cs.mappingFor(cmd::analyse).contains("CC 20"));
+        cs.handle(juce::MidiMessage::controllerEvent(2, 20, 127));
+        CHECK(spy.fired.getLast() == cmd::analyse);
+        // HUI: zone 0x0E, port 3 press (0x43) / release (0x03).
+        cs.configure({}, {}, ControlSurface::Protocol::Hui);
+        cs.learn(cmd::exportDdp);
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x0F, 0x0E));
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x2F, 0x43));
+        CHECK(cs.mappingFor(cmd::exportDdp).contains("zone 14 port 3"));
+        int before = spy.fired.size();
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x0F, 0x0E));
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x2F, 0x03));      // release: nothing
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x0F, 0x0E));
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x2F, 0x43));      // press: export
+        CHECK(spy.fired.size() == before + 1 && spy.fired.getLast() == cmd::exportDdp);
+        // Mappings persist.
+        ControlSurface cs2(cm, props);
+        CHECK(cs2.mappingFor(cmd::analyse).contains("CC 20"));
+        std::printf("control surface: %d commands fired\n", spy.fired.size());
+    }
+
     // ---- DDP round trip: render -> open as session -> re-export is bit-identical, PQ preserved.
     {
         auto a = noiseFile(dir, "rt_a.wav", 44100, 5.0, 21);

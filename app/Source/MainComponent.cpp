@@ -335,6 +335,11 @@ MainComponent::MainComponent() {
 #if JUCE_MAC
     juce::MenuBarModel::setMacMainMenu(this);
 #endif
+    surface_ = std::make_unique<ControlSurface>(commands_, *props_.getUserSettings());
+    surface_->position = [this] { return engine_.positionSeconds(); };
+    surface_->isPlaying = [this] { return engine_.isPlaying(); };
+    surface_->isRecording = [this] { return engine_.isRecording(); };
+    surface_->jog = [this](double dt) { engine_.setPositionSeconds(juce::jmax(0.0, engine_.positionSeconds() + dt)); };
     setWantsKeyboardFocus(true);
     setSize(1440, 900);
     newSession();
@@ -342,6 +347,8 @@ MainComponent::MainComponent() {
 }
 
 MainComponent::~MainComponent() {
+    surfaceWindow_.reset();
+    surface_.reset();
 #if JUCE_MAC
     juce::MenuBarModel::setMacMainMenu(nullptr);
 #endif
@@ -529,6 +536,7 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::analyse: runAnalysis(); break;
         case cmd::showAnalysis: showAnalysisWindow(); break;
         case cmd::ddpPlayer: openDdpPlayer(); break;
+        case cmd::controlSurfaces: showControlSurfaces(); break;
         case cmd::record:
             if (engine_.isRecording()) finishRecording();
             else showRecordDialog();
@@ -611,7 +619,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::ddpPlayer, cmd::verifyDdp, cmd::nullTest});
             m.addSeparator();
-            add({cmd::pluginManager, cmd::audioSetup, cmd::followProjectRate});
+            add({cmd::pluginManager, cmd::audioSetup, cmd::controlSurfaces, cmd::followProjectRate});
             break;
         case 6: add({cmd::keyGuide, cmd::editKeyCommands}); break;
         default: break;
@@ -1409,6 +1417,106 @@ void MainComponent::finishRecording() {
     timeline_.resized();
     timeline_.selectRegion(reg.id);
     commands_.commandStatusChanged();
+}
+
+// ---------------------------------------------------------------- control surfaces
+
+namespace {
+class SurfacePanel : public juce::Component, private juce::TableListBoxModel, private juce::Timer {
+public:
+    SurfacePanel(ControlSurface& s) : s_(s) {
+        ins_ = juce::MidiInput::getAvailableDevices();
+        outs_ = juce::MidiOutput::getAvailableDevices();
+        in_.addItem("(none)", 1);
+        for (int i = 0; i < ins_.size(); ++i) { in_.addItem(ins_[i].name, i + 2); if (ins_[i].identifier == s_.inputId()) in_.setSelectedId(i + 2, juce::dontSendNotification); }
+        if (in_.getSelectedId() == 0) in_.setSelectedId(1, juce::dontSendNotification);
+        out_.addItem("(none)", 1);
+        for (int i = 0; i < outs_.size(); ++i) { out_.addItem(outs_[i].name, i + 2); if (outs_[i].identifier == s_.outputId()) out_.setSelectedId(i + 2, juce::dontSendNotification); }
+        if (out_.getSelectedId() == 0) out_.setSelectedId(1, juce::dontSendNotification);
+        proto_.addItem("Mackie Control (MCU and compatibles)", 1);
+        proto_.addItem("HUI (keep-alive; assign buttons with Learn)", 2);
+        proto_.addItem("MIDI learn only", 3);
+        proto_.setSelectedId(int(s_.protocol()) + 1, juce::dontSendNotification);
+        auto apply = [this] {
+            s_.configure(in_.getSelectedId() > 1 ? ins_[in_.getSelectedId() - 2].identifier : juce::String(),
+                         out_.getSelectedId() > 1 ? outs_[out_.getSelectedId() - 2].identifier : juce::String(),
+                         ControlSurface::Protocol(proto_.getSelectedId() - 1));
+            status_.setText(s_.status(), juce::dontSendNotification);
+        };
+        in_.onChange = apply;
+        out_.onChange = apply;
+        proto_.onChange = apply;
+        for (auto* c : {&in_, &out_, &proto_}) addAndMakeVisible(*c);
+        for (auto* l : {&inL_, &outL_, &protoL_, &status_, &hint_}) { l->setColour(juce::Label::textColourId, colours::dim); addAndMakeVisible(*l); }
+        inL_.setText("MIDI in", juce::dontSendNotification);
+        outL_.setText("MIDI out", juce::dontSendNotification);
+        protoL_.setText("Protocol", juce::dontSendNotification);
+        status_.setText(s_.status(), juce::dontSendNotification);
+        hint_.setText("Mackie Control works out of the box (transport, jog, cursor/zoom, Marker, F1-F8, Save, Undo, timecode display). "
+                      "To assign anything else, select a command and press Learn, then press a button or move a control.",
+                      juce::dontSendNotification);
+        hint_.setFont(juce::FontOptions(12.0f));
+        hint_.setJustificationType(juce::Justification::topLeft);
+        table_.getHeader().addColumn("Command", 1, 300);
+        table_.getHeader().addColumn("Assigned to", 2, 200);
+        table_.getHeader().setColour(juce::TableHeaderComponent::backgroundColourId, colours::bg);
+        table_.getHeader().setColour(juce::TableHeaderComponent::textColourId, colours::dim);
+        table_.setColour(juce::ListBox::backgroundColourId, colours::panel);
+        table_.setRowHeight(22);
+        addAndMakeVisible(table_);
+        for (auto* b : {&learn_, &clear_}) { styleButton(*b, b == &learn_); addAndMakeVisible(*b); }
+        learn_.onClick = [this] {
+            int r = table_.getSelectedRow();
+            if (r < 0) return;
+            s_.learn(allCommands()[size_t(r)].id);
+            learn_.setButtonText("Waiting for MIDI...");
+        };
+        clear_.onClick = [this] { int r = table_.getSelectedRow(); if (r >= 0) { s_.clearMapping(allCommands()[size_t(r)].id); table_.repaint(); } };
+        s_.onLearned = [this] { learn_.setButtonText("Learn"); table_.repaint(); };
+        startTimerHz(5);
+        setSize(620, 560);
+    }
+    ~SurfacePanel() override { s_.onLearned = nullptr; }
+    void paint(juce::Graphics& g) override { g.fillAll(colours::bg); }
+    void resized() override {
+        auto r = getLocalBounds().reduced(10);
+        auto row = [&](juce::Label& l, juce::Component& c) { auto x = r.removeFromTop(26); l.setBounds(x.removeFromLeft(80)); c.setBounds(x); r.removeFromTop(4); };
+        row(inL_, in_);
+        row(outL_, out_);
+        row(protoL_, proto_);
+        status_.setBounds(r.removeFromTop(20));
+        hint_.setBounds(r.removeFromTop(40));
+        auto b = r.removeFromBottom(28);
+        learn_.setBounds(b.removeFromLeft(160));
+        b.removeFromLeft(6);
+        clear_.setBounds(b.removeFromLeft(90));
+        r.removeFromBottom(6);
+        table_.setBounds(r);
+    }
+private:
+    int getNumRows() override { return int(allCommands().size()); }
+    void paintRowBackground(juce::Graphics& g, int, int, int, bool sel) override { g.fillAll(sel ? colours::accent.withAlpha(0.25f) : colours::panel); }
+    void paintCell(juce::Graphics& g, int row, int col, int w, int h, bool) override {
+        auto& d = allCommands()[size_t(row)];
+        g.setColour(col == 1 ? colours::text : colours::accent);
+        g.setFont(13.0f);
+        g.drawText(col == 1 ? juce::String(d.category) + " - " + d.name : s_.mappingFor(d.id), 6, 0, w - 10, h, juce::Justification::centredLeft);
+    }
+    void timerCallback() override { if (!s_.isLearning()) learn_.setButtonText("Learn"); }
+    ControlSurface& s_;
+    juce::Array<juce::MidiDeviceInfo> ins_, outs_;
+    juce::ComboBox in_, out_, proto_;
+    juce::Label inL_, outL_, protoL_, status_, hint_;
+    juce::TableListBox table_{"Mappings", this};
+    juce::TextButton learn_{"Learn"}, clear_{"Clear"};
+};
+}  // namespace
+
+void MainComponent::showControlSurfaces() {
+    surfaceWindow_.reset();
+    auto* w = new PlainWindow(new SurfacePanel(*surface_), "Control Surfaces / MIDI", false);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { surfaceWindow_.reset(); }); };
+    surfaceWindow_.reset(w);
 }
 
 void MainComponent::jumpToMarker(int dir) {

@@ -77,6 +77,7 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::openDdpSession, "Open DDP as Session...", "File", "Turn a DDP back into an editable session (PQ, CD-Text, ISRC) for revisions", "command + option + O"},
         {cmd::nullTest, "Null Test / Compare Files...", "Tools", "Align two renders and measure exactly how they differ", "command + shift + N"},
         {cmd::pluginManager, "Plugin Manager...", "Tools", "Scan for and manage AU / VST3 plugins", ""},
+        {cmd::controlSurfaces, "Control Surfaces / MIDI...", "Tools", "Mackie Control, HUI and MIDI-learn for any command", ""},
         {cmd::audioSetup, "Audio Setup...", "Tools", "Choose the audio interface and buffer size", "command + ,"},
         {cmd::followProjectRate, "Follow Project Sample Rate", "Tools", "Switch the interface to the project's rate so playback is never resampled", ""},
         // Help

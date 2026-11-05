@@ -2,6 +2,7 @@
 
 #include "AudioEngine.h"
 #include "ChainPanel.h"
+#include "ControlSurface.h"
 #include "DdpFormat.h"
 #include "DdpPlayer.h"
 #include "Commands.h"
@@ -110,6 +111,7 @@ private:
     void runAnalysis();
     void openDdpPlayer();
     void showRecordDialog();
+    void showControlSurfaces();
     void beginRecording();
     void finishRecording();
     juce::File recordingsFolder() const;
@@ -171,7 +173,8 @@ private:
     } rec_;
     juce::File recFile_;
     juce::Range<double> recPunch_;
-    std::unique_ptr<juce::DocumentWindow> recWindow_;
+    std::unique_ptr<juce::DocumentWindow> recWindow_, surfaceWindow_;
+    std::unique_ptr<ControlSurface> surface_;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };
