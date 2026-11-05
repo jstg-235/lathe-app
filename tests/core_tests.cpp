@@ -1,0 +1,280 @@
+// Core unit tests: run with `ctest` or directly. No framework, so they build anywhere.
+#include "../core/cd/CdTextEncoder.h"
+#include "../core/cd/Disc.h"
+#include "../core/ddp/Ddp.h"
+#include "../core/dsp/Meters.h"
+#include "../core/util/Hash.h"
+
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+using namespace lathe;
+namespace fs = std::filesystem;
+
+static int failures = 0, checks = 0;
+#define CHECK(cond)                                                                      \
+    do {                                                                                 \
+        ++checks;                                                                        \
+        if (!(cond)) { ++failures; std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); } \
+    } while (0)
+#define NEAR(a, b, tol) CHECK(std::abs(double(a) - double(b)) <= (tol))
+
+static cd::Disc sampleDisc() {
+    cd::Disc d;
+    d.upcEan = "0123456789012";
+    d.masterId = "LATHE TEST";
+    d.text.title = "Test Album";
+    d.text.performer = "The Testers";
+    cd::Track t1;
+    t1.indexes = {{0, 0}, {1, 150}};
+    t1.isrc = "USABC2600001";
+    t1.text.title = "First";
+    cd::Track t2;
+    t2.indexes = {{0, 150 + 75 * 10}, {1, 150 + 75 * 12}, {2, 150 + 75 * 15}};
+    t2.isrc = "USABC2600002";
+    t2.copyPermitted = true;
+    t2.text.title = "Second Song — Café";   // em dash and é: must map to Latin-1
+    d.tracks = {t1, t2};
+    d.leadOutSector = 150 + 75 * 22;
+    return d;
+}
+
+static void testMsf() {
+    CHECK(cd::Msf::fromSectors(0).str() == "00:00:00");
+    CHECK(cd::Msf::fromSectors(150).str() == "00:02:00");
+    CHECK(cd::Msf::fromSectors(75 * 61 + 74).str() == "01:01:74");
+    CHECK(cd::Msf::fromSectors(cd::kMaxSectors).str() == "99:59:74");
+    CHECK((cd::Msf{1, 1, 74}).toSectors() == 75 * 61 + 74);
+    CHECK(cd::samplesToSectorsCeil(588) == 1);
+    CHECK(cd::samplesToSectorsCeil(589) == 2);
+}
+
+static void testValidation() {
+    auto d = sampleDisc();
+    CHECK(!cd::hasErrors(cd::validate(d)));
+
+    auto shortT = d;
+    shortT.leadOutSector = shortT.tracks[1].startSector() + 75 * 3;  // 3 s last track
+    CHECK(cd::hasErrors(cd::validate(shortT)));
+
+    auto noPregap = d;
+    noPregap.tracks[0].indexes = {{0, 0}, {1, 100}};
+    CHECK(cd::hasErrors(cd::validate(noPregap)));
+
+    auto badIsrc = d;
+    badIsrc.tracks[0].isrc = "US-ABC-26";
+    CHECK(cd::hasErrors(cd::validate(badIsrc)));
+
+    auto dcpScms = d;
+    dcpScms.tracks[1].scms = true;
+    CHECK(cd::hasErrors(cd::validate(dcpScms)));
+
+    CHECK(cd::isValidIsrc("GBAYE0000351"));
+    CHECK(cd::normaliseIsrc("us-abc-26-00001") == "USABC2600001");
+    bool ok = false;
+    CHECK(cd::isValidUpcEan("4006381333931", &ok) && ok);   // valid EAN-13
+    CHECK(cd::isValidUpcEan("036000291452", &ok) && ok);    // valid UPC-A
+    CHECK(cd::isValidUpcEan("4006381333932", &ok) && !ok);  // wrong check digit
+}
+
+static void testHashes() {
+    util::Md5 m;
+    m.update("", 0);
+    CHECK(m.hexDigest() == "d41d8cd98f00b204e9800998ecf8427e");
+    m.reset();
+    std::string q = "The quick brown fox jumps over the lazy dog";
+    m.update(q.data(), q.size());
+    CHECK(m.hexDigest() == "9e107d9d372bb6826bd81d3542a419d6");
+    m.reset();
+    std::string big(1000001, 'a');   // crosses many block boundaries in odd chunk sizes
+    for (size_t i = 0; i < big.size(); i += 777) m.update(big.data() + i, std::min<size_t>(777, big.size() - i));
+    util::Md5 m2;
+    m2.update(big.data(), big.size());
+    CHECK(m.hexDigest() == m2.hexDigest());
+
+    util::Crc32 c;
+    c.update("123456789", 9);
+    CHECK(c.value() == 0xCBF43926u);
+    CHECK(util::crc16Ccitt(reinterpret_cast<const uint8_t*>("123456789"), 9) == 0x31C3);
+}
+
+static void testCdText() {
+    auto d = sampleDisc();
+    auto r = cd::encodeCdText(d);
+    CHECK(r.error.empty());
+    CHECK(r.packs.size() % 18 == 0);
+    CHECK(!r.packs.empty());
+    // Every pack's CRC must verify; sequence numbers count up from 0.
+    bool crcOk = true, seqOk = true;
+    for (size_t i = 0; i < r.packs.size() / 18; ++i) {
+        auto* p = r.packs.data() + i * 18;
+        uint16_t crc = uint16_t(~util::crc16Ccitt(p, 16));
+        crcOk &= p[16] == (crc >> 8) && p[17] == (crc & 0xFF);
+        seqOk &= p[2] == i;
+    }
+    CHECK(crcOk);
+    CHECK(seqOk);
+    CHECK(r.packs[r.packs.size() - 18] == 0x8F);   // size info last
+    // Character outside Latin-1 is refused with a clear message.
+    auto bad = d;
+    bad.tracks[0].text.title = "東京";
+    CHECK(!cd::encodeCdText(bad).error.empty());
+}
+
+static void testDdpRoundTrip() {
+    auto d = sampleDisc();
+    fs::path dir = fs::temp_directory_path() / "lathe_ddp_test";
+    fs::remove_all(dir);
+
+    // Deterministic ramp so the image content can be checked byte-for-byte.
+    int64_t sample = 0;
+    auto pull = [&](int16_t* buf, int64_t frames) {
+        for (int64_t i = 0; i < frames; ++i, ++sample) {
+            buf[i * 2] = int16_t(sample & 0x7FFF);
+            buf[i * 2 + 1] = int16_t(-(sample & 0x7FFF));
+        }
+        return true;
+    };
+    auto w = ddp::writeDdp(d, dir.string(), pull);
+    if (!w.ok) std::printf("write error: %s\n", w.error.c_str());
+    CHECK(w.ok);
+    CHECK(fs::file_size(dir / "DDPID") == 128);
+    CHECK(fs::file_size(dir / "DDPMS") == 128 * 3);
+    CHECK(fs::file_size(dir / "IMAGE.DAT") == uint64_t(d.leadOutSector) * 2352);
+    CHECK(fs::file_size(dir / "PQDESCR") % 64 == 0);
+
+    // Field positions from the published layout.
+    std::ifstream f(dir / "DDPMS", std::ios::binary);
+    std::string ms((std::istreambuf_iterator<char>(f)), {});
+    CHECK(ms.substr(0, 6) == "VVVMS0");
+    CHECK(ms.substr(30, 8) == "CDTEXT  ");
+    CHECK(ms.substr(256 + 4, 2) == "D0");
+    CHECK(ms.substr(256 + 38, 4) == "DA70");
+    CHECK(ms.substr(256 + 46, 4) == " 150");
+    CHECK(ms.substr(256 + 74, 9) == "IMAGE.DAT");
+
+    std::ifstream pqf(dir / "PQDESCR", std::ios::binary);
+    std::string pq((std::istreambuf_iterator<char>(pqf)), {});
+    CHECK(pq.substr(0, 18) == "VVVS0000  00000001");
+    CHECK(pq.substr(64, 18) == "VVVS0100  00000001");   // track 1 index 0
+    CHECK(pq.substr(64 + 20, 12) == "USABC2600001");     // ISRC rides on the track's first packet (index 00)
+    CHECK(pq.substr(128 + 20, 12) == std::string(12, ' '));
+
+    auto r = ddp::readDdp(dir.string());
+    if (!r.ok) std::printf("read error: %s\n", r.error.c_str());
+    CHECK(r.ok);
+    CHECK(r.checksumsChecked && r.checksumsOk);
+    CHECK(r.disc.tracks.size() == 2);
+    CHECK(r.disc.upcEan == d.upcEan);
+    CHECK(r.disc.leadOutSector == d.leadOutSector);
+    CHECK(r.disc.tracks[1].isrc == "USABC2600002");
+    CHECK(r.disc.tracks[1].copyPermitted);
+    CHECK(r.disc.tracks[1].indexes.size() == 3);
+    CHECK(r.disc.tracks[1].startSector() == d.tracks[1].startSector());
+    CHECK(r.disc.text.title == "Test Album");
+    CHECK(r.disc.tracks[1].text.title == "Second Song - Café");
+
+    // Corrupt one byte of audio: verification must catch it.
+    {
+        std::fstream img(dir / "IMAGE.DAT", std::ios::binary | std::ios::in | std::ios::out);
+        img.seekp(5000);
+        img.put('\x55');
+    }
+    auto r2 = ddp::readDdp(dir.string());
+    CHECK(r2.ok && !r2.checksumsOk);
+
+    // A disc with errors must refuse to export.
+    auto bad = d;
+    bad.tracks[0].indexes = {{1, 0}};
+    sample = 0;
+    CHECK(!ddp::writeDdp(bad, (dir / "bad").string(), pull).ok);
+    fs::remove_all(dir);
+}
+
+static void testLoudness() {
+    // EBU Tech 3341: a 1 kHz sine at -23 dBFS peak in both channels reads -23.0 LUFS.
+    const double fs = 48000;
+    dsp::LoudnessMeter m;
+    m.prepare(fs, 2);
+    const int n = int(fs * 20);
+    std::vector<float> l(static_cast<size_t>(n)), r(static_cast<size_t>(n));
+    double a = std::pow(10.0, -23.0 / 20.0);
+    for (int i = 0; i < n; ++i) l[size_t(i)] = r[size_t(i)] = float(a * std::sin(2 * M_PI * 1000 * i / fs));
+    const float* ch[2] = {l.data(), r.data()};
+    for (int off = 0; off < n; off += 512) {
+        const float* p[2] = {ch[0] + off, ch[1] + off};
+        m.process(p, std::min(512, n - off));
+    }
+    NEAR(m.integratedLufs(), -23.0, 0.1);
+    NEAR(m.shortTermLufs(), -23.0, 0.1);
+    NEAR(m.momentaryLufs(), -23.0, 0.1);
+    CHECK(m.loudnessRange() < 0.2);
+
+    // 44.1 kHz too (re-derived filter coefficients).
+    dsp::LoudnessMeter m44;
+    m44.prepare(44100, 2);
+    std::vector<float> s(44100 * 10);
+    for (size_t i = 0; i < s.size(); ++i) s[i] = float(a * std::sin(2 * M_PI * 1000 * double(i) / 44100));
+    const float* p44[2] = {s.data(), s.data()};
+    m44.process(p44, int(s.size()));
+    NEAR(m44.integratedLufs(), -23.0, 0.1);
+}
+
+static void testTruePeak() {
+    // fs/4 sine with 45° phase: samples peak at 0.707, true peak is 1.0 (+3 dB over sample peak).
+    dsp::TruePeak tp;
+    tp.prepare(44100);
+    std::vector<float> x(4410);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.5 * std::sin(M_PI / 2 * double(i) + M_PI / 4));
+    tp.process(x.data(), int(x.size()));
+    double db = 20 * std::log10(tp.maxLinear() / 0.5);
+    NEAR(db, 0.0, 0.5);   // within half a dB of the real peak
+
+    // Below that, a plain sample-peak meter would read 3 dB low.
+    float samplePeak = 0;
+    for (float v : x) samplePeak = std::max(samplePeak, std::abs(v));
+    CHECK(20 * std::log10(samplePeak / 0.5) < -2.5);
+}
+
+static void testDither() {
+    dsp::Ditherer d;
+    d.prepare(2, 16, dsp::Ditherer::Shape::None);
+    std::vector<float> l(48000), r(48000);
+    for (size_t i = 0; i < l.size(); ++i) l[i] = r[i] = float(0.25 * std::sin(2 * M_PI * 997 * double(i) / 44100));
+    std::vector<int16_t> out(l.size() * 2);
+    const float* p[2] = {l.data(), r.data()};
+    d.process16(p, int(l.size()), out.data());
+    double errSq = 0, errMean = 0;
+    for (size_t i = 0; i < l.size(); ++i) {
+        double e = out[i * 2] - l[i] * 32768.0;
+        errSq += e * e;
+        errMean += e;
+    }
+    errSq /= double(l.size());
+    errMean /= double(l.size());
+    NEAR(errMean, 0.0, 0.05);   // unbiased
+    NEAR(errSq, 0.25, 0.08);    // TPDF + rounding: 1/12 + 2/12 ≈ 0.25 LSB²
+
+    // Full-scale input must clamp, never wrap.
+    std::vector<float> hot(64, 1.5f), neg(64, -1.5f);
+    const float* hp[2] = {hot.data(), neg.data()};
+    std::vector<int16_t> o(128);
+    d.process16(hp, 64, o.data());
+    CHECK(o[0] == 32767 && o[1] == -32768);
+}
+
+int main() {
+    testMsf();
+    testValidation();
+    testHashes();
+    testCdText();
+    testDdpRoundTrip();
+    testLoudness();
+    testTruePeak();
+    testDither();
+    std::printf("%d checks, %d failures\n", checks, failures);
+    return failures ? 1 : 0;
+}

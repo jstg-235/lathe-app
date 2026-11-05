@@ -1,0 +1,51 @@
+name: Build Lathe
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (universal: Apple Silicon + Intel)
+        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+      - name: Build
+        run: cmake --build build --config Release -- -quiet
+
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        run: |
+          APP=$(find build -name "Lathe.app" -type d | grep Release | head -1)
+          codesign --force --deep --sign - "$APP"
+          mkdir -p dist
+          ditto -c -k --keepParent "$APP" dist/Lathe-mac.zip
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Lathe-mac
+          path: dist/Lathe-mac.zip
+
+      - name: Publish to builds branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          cp dist/Lathe-mac.zip /tmp/
+          git fetch origin builds || true
+          git checkout --orphan builds-new
+          git rm -rf --quiet . || true
+          cp /tmp/Lathe-mac.zip .
+          echo "Built from ${GITHUB_SHA} on $(date -u)" > BUILD_INFO.txt
+          git add Lathe-mac.zip BUILD_INFO.txt
+          git commit -m "Build ${GITHUB_SHA::7}"
+          git push --force origin builds-new:builds
