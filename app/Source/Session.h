@@ -37,6 +37,7 @@ struct Region {
     double fadeIn = 0, fadeOut = 0;      // seconds (overlaps on the same lane extend these automatically)
     FadeShape fadeInShape = FadeShape::EqualPower, fadeOutShape = FadeShape::EqualPower;
     juce::Array<GainPoint> envelope;     // empty = flat
+    juce::String fxState;                // region effects chain (base64), empty = none
 
     double length() const { return double(srcOut - srcIn) / fileRate; }
     double end() const { return start + length(); }

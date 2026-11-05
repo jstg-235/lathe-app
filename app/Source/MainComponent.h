@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AudioEngine.h"
+#include "ChainPanel.h"
 #include "Commands.h"
 #include "EditPanels.h"
 #include "Exporter.h"
@@ -103,6 +104,8 @@ private:
     void jumpToMarker(int dir);
     void applyFollowRate();
     void saveKeyMappings();
+    void openRegionFx(int regionId);
+    void showBatchDialog();
     int markerRowToTrackNumber(int row) const;
 
     Session session_;
@@ -138,6 +141,8 @@ private:
     std::unique_ptr<juce::FileChooser> chooser_;
     juce::Component::SafePointer<CrossfadeEditor> xfadeEditor_;
     std::unique_ptr<juce::DocumentWindow> xfadeWindow_;
+    std::unique_ptr<juce::DocumentWindow> fxWindow_;
+    int fxWindowRegion_ = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

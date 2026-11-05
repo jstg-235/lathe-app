@@ -8,15 +8,33 @@
 
 namespace lathe {
 
-class PluginChain {
+// Plugin formats and the scanned plugin list, shared by every chain in the app.
+class PluginHost {
 public:
-    PluginChain();
-    ~PluginChain();
-
+    PluginHost();
+    ~PluginHost();
     juce::AudioPluginFormatManager& formats() { return formats_; }
     juce::KnownPluginList& known() { return known_; }
     juce::File deadMansPedal() const;
     void saveKnownList();
+private:
+    juce::File appData() const;
+    juce::AudioPluginFormatManager formats_;
+    juce::KnownPluginList known_;
+};
+
+class PluginChain {
+public:
+    explicit PluginChain(PluginHost& host, juce::String label = {});
+    ~PluginChain();
+
+    PluginHost& host() { return host_; }
+    juce::AudioPluginFormatManager& formats() { return host_.formats(); }
+    juce::KnownPluginList& known() { return host_.known(); }
+    juce::File deadMansPedal() const { return host_.deadMansPedal(); }
+    void saveKnownList() { host_.saveKnownList(); }
+    void setLabel(const juce::String& l) { label_ = l; }
+    void reset();   // clears plugin tails/history (e.g. after a seek)
 
     struct Slot {
         std::unique_ptr<juce::AudioPluginInstance> plugin;
@@ -30,6 +48,7 @@ public:
     void setBypassed(int i, bool b);
 
     bool add(const juce::PluginDescription& d, juce::String& error);
+    void addInstance(std::unique_ptr<juce::AudioPluginInstance> inst);   // already-created plugin (tests)
     void remove(int i);
     void move(int from, int to);
     void showEditor(int i);
@@ -51,8 +70,8 @@ public:
     void setState(const juce::MemoryBlock& state, juce::StringArray& problems);
 
 private:
-    juce::AudioPluginFormatManager formats_;
-    juce::KnownPluginList known_;
+    PluginHost& host_;
+    juce::String label_;
     juce::OwnedArray<Slot> slots_;
     juce::CriticalSection lock_;
     juce::AudioBuffer<float> scratch_;
@@ -60,8 +79,7 @@ private:
     juce::MidiBuffer midi_;
     double rate_ = 44100;
     int block_ = 512;
-    bool prepared_ = false;
-    juce::File appData() const;
+    bool prepared_ = false, preparedDouble_ = false;
 };
 
 }  // namespace lathe

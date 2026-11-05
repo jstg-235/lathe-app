@@ -1,8 +1,52 @@
 // Renderer tests: real WAV files through ProgramRenderer (gaps, gain, fades, SRC) and the
 // DDP layout derived from the same session, so playback, export and PQ stay in step.
 #include "../app/Source/Commands.h"
+#include "../core/util/FlacTags.h"
 #include "../app/Source/NullTest.h"
 #include "../app/Source/ProgramRenderer.h"
+
+// A test plugin: hard clip at +/-level with a fixed latency, in float and double.
+class ClipDelayPlugin : public juce::AudioPluginInstance {
+public:
+    ClipDelayPlugin(double level, int latency)
+        : AudioPluginInstance(BusesProperties().withInput("In", juce::AudioChannelSet::stereo()).withOutput("Out", juce::AudioChannelSet::stereo())),
+          level_(level), lat_(latency) {}
+    void fillInPluginDescription(juce::PluginDescription& d) const override { d.name = "ClipDelay"; d.pluginFormatName = "Test"; d.fileOrIdentifier = "clipdelay"; }
+    const juce::String getName() const override { return "ClipDelay"; }
+    void prepareToPlay(double, int) override { setLatencySamples(lat_); reset(); }
+    void reset() override { for (auto& d : delay_) { d.assign(size_t(lat_ + 1), 0.0); } pos_ = 0; }
+    void releaseResources() override {}
+    bool supportsDoublePrecisionProcessing() const override { return true; }
+    template <typename T> void run(juce::AudioBuffer<T>& b) {
+        for (int i = 0; i < b.getNumSamples(); ++i) {
+            for (int ch = 0; ch < 2; ++ch) {
+                double x = juce::jlimit(-level_, level_, double(b.getSample(ch, i)));
+                auto& d = delay_[size_t(ch)];
+                d[size_t(pos_)] = x;
+                b.setSample(ch, i, T(d[size_t((pos_ + 1) % (lat_ + 1))]));
+            }
+            pos_ = (pos_ + 1) % (lat_ + 1);
+        }
+    }
+    void processBlock(juce::AudioBuffer<float>& b, juce::MidiBuffer&) override { run(b); }
+    void processBlock(juce::AudioBuffer<double>& b, juce::MidiBuffer&) override { run(b); }
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    double level_;
+    int lat_, pos_ = 0;
+    std::vector<double> delay_[2];
+};
 #include "../core/ddp/Ddp.h"
 
 #include <cmath>
@@ -244,6 +288,104 @@ int main() {
         // Identical files are reported bit-identical.
         auto same = nullTest(fm, fa, fa, {}, {});
         CHECK(same.ok && same.offset == 0 && same.residualPeak == 0.0);
+    }
+
+    // ---- Region effects: run before fades, with latency compensated exactly.
+    {
+        auto f = dir.getChildFile("fxsrc.wav");
+        {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(f.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 44100, 2, 32, {}, 0));
+            os.release();
+            juce::Random rnd(5);
+            juce::AudioBuffer<float> n(2, 44100 * 3);
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < n.getNumSamples(); ++i) n.setSample(ch, i, (rnd.nextFloat() - 0.5f) * 0.8f);
+            w->writeFromAudioSampleBuffer(n, 0, n.getNumSamples());
+        }
+        lathe::PluginHost host;
+        lathe::RegionFxBank bank(host);
+        Session fs;
+        int id = fs.append(regionFor(fs, fm, f), 2.0);
+        bank.chainFor(id, true)->addInstance(std::make_unique<ClipDelayPlugin>(0.1, 100));
+        CHECK(bank.hasEffects(id));
+        ProgramRenderer fr(fm);
+        fr.setRegionFx(&bank);
+        fr.setSession(fs, 44100, true);
+        CHECK(bank.latency(id) == 100);
+        juce::AudioBuffer<double> o(2, int(fr.totalSamples()));
+        fr.render(o, 0, o.getNumSamples());
+        std::unique_ptr<juce::AudioFormatReader> rd(fm.createReaderFor(f));
+        juce::AudioBuffer<float> src(2, int(rd->lengthInSamples));
+        rd->read(&src, 0, src.getNumSamples(), 0, true, true);
+        int bad = 0;
+        for (int i = 0; i < src.getNumSamples(); ++i)
+            if (std::abs(o.getSample(0, 88200 + i) - juce::jlimit(-0.1, 0.1, double(src.getSample(0, i)))) > 1e-12) ++bad;
+        std::printf("region fx (clip + 100-sample latency): %d mismatches in %d samples\n", bad, src.getNumSamples());
+        CHECK(bad == 0);
+
+        // Fades shape the processed sound: with a 1 s fade-in, half-way gain applies AFTER the clipper.
+        fs.findRegion(id)->fadeIn = 1.0;
+        fs.findRegion(id)->fadeInShape = FadeShape::Linear;
+        ProgramRenderer fr2(fm);
+        fr2.setRegionFx(&bank);
+        fr2.setSession(fs, 44100, true);
+        juce::AudioBuffer<double> o2(2, int(fr2.totalSamples()));
+        fr2.render(o2, 0, o2.getNumSamples());
+        int k = 22050;   // 0.5 s into the region
+        double expect = juce::jlimit(-0.1, 0.1, double(src.getSample(0, k))) * (double(k) / 44100.0);
+        CHECK(std::abs(o2.getSample(0, 88200 + k) - expect) < 1e-9);
+
+        // Bypass-all removes both the processing and the latency.
+        bank.setBypassAll(true);
+        ProgramRenderer fr3(fm);
+        fr3.setRegionFx(&bank);
+        fs.findRegion(id)->fadeIn = 0;
+        fr3.setSession(fs, 44100, true);
+        juce::AudioBuffer<double> o3(2, int(fr3.totalSamples()));
+        fr3.render(o3, 0, o3.getNumSamples());
+        CHECK(o3.getSample(0, 88200 + 1000) == double(src.getSample(0, 1000)));
+        bank.setBypassAll(false);
+
+        // Split copies the region's effects state; sync builds the new region's chain.
+        fs.findRegion(id)->fxState = "dummy-not-loaded";   // pretend a captured state exists
+        int tail = fs.split(id, 3.0);
+        CHECK(fs.findRegion(tail)->fxState == fs.findRegion(id)->fxState);
+    }
+
+    // ---- FLAC tags: written and read back, audio untouched.
+    {
+        auto ff = dir.getChildFile("tag.flac");
+        juce::FlacAudioFormat flac;
+        {
+            std::unique_ptr<juce::OutputStream> os(ff.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(flac.createWriterFor(os.get(), 44100, 2, 16, {}, 5));
+            os.release();
+            juce::AudioBuffer<float> n(2, 44100);
+            for (int i = 0; i < 44100; ++i) { n.setSample(0, i, float(std::sin(i * 0.05) * 0.5)); n.setSample(1, i, 0.25f); }
+            w->writeFromAudioSampleBuffer(n, 0, 44100);
+        }
+        std::unique_ptr<juce::AudioFormatReader> before(fm.createReaderFor(ff));
+        juce::AudioBuffer<float> a(2, 44100), b(2, 44100);
+        before->read(&a, 0, 44100, 0, true, true);
+        before.reset();
+        auto e = lathe::util::writeFlacTags(ff.getFullPathName().toStdString(),
+                                            {{"TITLE", "Caf\xc3\xa9 Song"}, {"ARTIST", "Tester"}, {"ISRC", "USABC2600001"}, {"TRACKNUMBER", "3"}});
+        CHECK(e.empty());
+        lathe::util::Tags got;
+        CHECK(lathe::util::readFlacTags(ff.getFullPathName().toStdString(), got));
+        CHECK(got.size() == 4 && got[0].second == "Caf\xc3\xa9 Song" && got[2].second == "USABC2600001");
+        std::unique_ptr<juce::AudioFormatReader> after(fm.createReaderFor(ff));
+        CHECK(after != nullptr && after->lengthInSamples == 44100);
+        after->read(&b, 0, 44100, 0, true, true);
+        bool same = true;
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 44100; ++i) same &= a.getSample(ch, i) == b.getSample(ch, i);
+        CHECK(same);
+        // Re-tagging replaces, not appends.
+        CHECK(lathe::util::writeFlacTags(ff.getFullPathName().toStdString(), {{"TITLE", "New"}}).empty());
+        got.clear();
+        lathe::util::readFlacTags(ff.getFullPathName().toStdString(), got);
+        CHECK(got.size() == 1 && got[0].second == "New");
     }
 
     // ---- Key commands: every default parses, and no two commands share a key.

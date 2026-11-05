@@ -33,6 +33,7 @@ public:
     std::function<void(int out, int in)> onCrossfade;  // open the crossfade editor
     std::function<void(int markerId)> onMarkerSelected;
     std::function<void(int markerId)> onMarkerDoubleClicked;
+    std::function<void(int regionId)> onRegionFx;      // open the region's effects window
 
     void setPlayhead(double sec, bool follow);
     double playhead() const { return playhead_; }

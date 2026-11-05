@@ -446,6 +446,7 @@ juce::var Session::toVar() const {
         juce::Array<juce::var> env;
         for (auto& p : r.envelope) env.add(juce::Array<juce::var>{p.t, p.db});
         o->setProperty("envelope", env);
+        if (r.fxState.isNotEmpty()) o->setProperty("fx", r.fxState);
         rl.add(o);
     }
     root->setProperty("regions", rl);
@@ -550,6 +551,7 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             r.fadeOutShape = FadeShape(juce::jlimit(0, 4, int(o["fadeOutShape"])));
             if (auto* env = o["envelope"].getArray())
                 for (auto& p : *env) r.envelope.add({double(p[0]), double(p[1])});
+            r.fxState = o["fx"].toString();
             nextId = juce::jmax(nextId, r.id + 1);
             regions.add(r);
         }

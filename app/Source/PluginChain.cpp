@@ -17,27 +17,33 @@ public:
 };
 }  // namespace
 
-PluginChain::PluginChain() {
+PluginHost::PluginHost() {
     formats_.addDefaultFormats();
     if (auto xml = juce::XmlDocument::parse(appData().getChildFile("plugins.xml")))
         known_.recreateFromXml(*xml);
 }
 
-PluginChain::~PluginChain() {
-    closeAllEditors();
-    saveKnownList();
-}
+PluginHost::~PluginHost() { saveKnownList(); }
 
-juce::File PluginChain::appData() const {
+juce::File PluginHost::appData() const {
     auto d = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("Lathe");
     d.createDirectory();
     return d;
 }
 
-juce::File PluginChain::deadMansPedal() const { return appData().getChildFile("plugin-scan-in-progress.txt"); }
+juce::File PluginHost::deadMansPedal() const { return appData().getChildFile("plugin-scan-in-progress.txt"); }
 
-void PluginChain::saveKnownList() {
+void PluginHost::saveKnownList() {
     if (auto xml = known_.createXml()) xml->writeTo(appData().getChildFile("plugins.xml"));
+}
+
+PluginChain::PluginChain(PluginHost& host, juce::String label) : host_(host), label_(std::move(label)) {}
+
+PluginChain::~PluginChain() { closeAllEditors(); }
+
+void PluginChain::reset() {
+    const juce::ScopedLock sl(lock_);
+    for (auto* s : slots_) s->plugin->reset();
 }
 
 juce::String PluginChain::nameAt(int i) const {
@@ -53,7 +59,7 @@ void PluginChain::setBypassed(int i, bool b) {
 }
 
 bool PluginChain::add(const juce::PluginDescription& d, juce::String& error) {
-    auto inst = formats_.createPluginInstance(d, rate_, block_, error);
+    auto inst = host_.formats().createPluginInstance(d, rate_, block_, error);
     if (!inst) return false;
     // Mastering is stereo in, stereo out.
     auto layout = juce::AudioProcessor::BusesLayout();
@@ -64,12 +70,24 @@ bool PluginChain::add(const juce::PluginDescription& d, juce::String& error) {
         return false;
     }
     inst->setNonRealtime(false);
+    if (preparedDouble_ && inst->supportsDoublePrecisionProcessing())
+        inst->setProcessingPrecision(juce::AudioProcessor::doublePrecision);
     inst->prepareToPlay(rate_, block_);
     auto slot = std::make_unique<Slot>();
     slot->plugin = std::move(inst);
     const juce::ScopedLock sl(lock_);
     slots_.add(slot.release());
     return true;
+}
+
+void PluginChain::addInstance(std::unique_ptr<juce::AudioPluginInstance> inst) {
+    if (preparedDouble_ && inst->supportsDoublePrecisionProcessing())
+        inst->setProcessingPrecision(juce::AudioProcessor::doublePrecision);
+    inst->prepareToPlay(rate_, block_);
+    auto slot = std::make_unique<Slot>();
+    slot->plugin = std::move(inst);
+    const juce::ScopedLock sl(lock_);
+    slots_.add(slot.release());
 }
 
 void PluginChain::remove(int i) {
@@ -94,7 +112,7 @@ void PluginChain::showEditor(int i) {
     if (!s->window) {
         auto* ed = s->plugin->createEditorIfNeeded();
         if (!ed) ed = new juce::GenericAudioProcessorEditor(*s->plugin);
-        s->window = std::make_unique<EditorWindow>(ed, s->plugin->getName());
+        s->window = std::make_unique<EditorWindow>(ed, label_.isEmpty() ? s->plugin->getName() : s->plugin->getName() + "  -  " + label_);
     }
     s->window->setVisible(true);
     s->window->toFront(true);
@@ -108,6 +126,7 @@ void PluginChain::prepare(double rate, int block, bool doublePrecision) {
     const juce::ScopedLock sl(lock_);
     rate_ = rate;
     block_ = block;
+    preparedDouble_ = doublePrecision;
     scratch_.setSize(2, juce::jmax(block, 8192));
     dscratch_.setSize(2, juce::jmax(block, 8192));
     for (auto* s : slots_) {

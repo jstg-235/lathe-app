@@ -268,6 +268,17 @@ void Timeline::paintRegion(juce::Graphics& g, int i) {
     juce::String label = r.name;
     if (std::abs(r.gainDb) > 0.05) label << "  " << (r.gainDb > 0 ? "+" : "") << juce::String(r.gainDb, 1) << " dB";
     if (r.mute) label << "  (muted)";
+    if (r.fxState.isNotEmpty()) {
+        // FX badge: this region has its own effects chain.
+        auto badge = juce::Rectangle<float>(box.getRight() - 30, box.getY() + 3, 26, 14);
+        if (badge.getX() > box.getX() + 40) {
+            g.setColour(colours::accent);
+            g.fillRoundedRectangle(badge, 3.0f);
+            g.setColour(colours::bg);
+            g.setFont(10.0f);
+            g.drawText("FX", badge.toNearestInt(), juce::Justification::centred);
+        }
+    }
     g.drawText(label, box.reduced(6, 2).removeFromTop(14).toNearestInt(), juce::Justification::left);
 }
 
@@ -393,9 +404,12 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
         menu.addItem(4, "Delete (leave gap)");
         menu.addItem(5, "Clear gain envelope", !r->envelope.isEmpty());
         menu.addItem(6, "Select region range");
+        menu.addSeparator();
+        menu.addItem(7, r->fxState.isNotEmpty() ? "Region effects... (active)" : "Region effects...");
         menu.showMenuAsync({}, [this, id](int c) {
             auto* rr = s_.findRegion(id);
             if (!rr || c == 0) return;
+            if (c == 7) { if (onRegionFx) onRegionFx(id); return; }
             if (c == 1) s_.split(id, playhead_);
             if (c == 2) rr->mute = !rr->mute;
             if (c == 3) s_.deleteRegion(id, true);

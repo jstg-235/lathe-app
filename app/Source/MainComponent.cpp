@@ -234,6 +234,7 @@ MainComponent::MainComponent() {
     timeline_.onEdit = [this] { sessionChanged(); };
     timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
     timeline_.onCrossfade = [this](int a, int b) { openCrossfade(a, b); };
+    timeline_.onRegionFx = [this](int id) { openRegionFx(id); };
     timeline_.onMarkerSelected = [this](int id) {
         for (int i = 0; i < session_.markers.size(); ++i)
             if (session_.markers[i].id == id) { pqList_.selectRow(i); break; }
@@ -428,7 +429,9 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::followProjectRate: info.setTicked(followRate_); break;
         case cmd::muteRegion:
         case cmd::nudgeLeft: case cmd::nudgeRight: case cmd::nudgeLeftBig: case cmd::nudgeRightBig:
-        case cmd::selectRegionRange: info.setActive(timeline_.selectedRegion() != 0); break;
+        case cmd::selectRegionRange:
+        case cmd::regionEffects: info.setActive(timeline_.selectedRegion() != 0); break;
+        case cmd::bypassRegionFx: info.setTicked(engine_.regionFx().bypassAll()); break;
         default: break;
     }
 }
@@ -462,6 +465,12 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::selectRegionRange:
             if (auto* r = session_.findRegion(timeline_.selectedRegion())) timeline_.setSelection({r->start, r->end()});
             break;
+        case cmd::regionEffects: openRegionFx(timeline_.selectedRegion()); break;
+        case cmd::bypassRegionFx:
+            engine_.regionFx().setBypassAll(!engine_.regionFx().bypassAll());
+            engine_.loadSession(session_);   // re-time the regions (latency changes when bypassed)
+            break;
+        case cmd::batchRender: showBatchDialog(); break;
         case cmd::sourceIn: source_.markIn(); break;
         case cmd::sourceOut: source_.markOut(); break;
         case cmd::destIn: { auto s = timeline_.selection(); timeline_.setSelection({pos, juce::jmax(pos, s.getEnd())}); break; }
@@ -524,6 +533,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::importAudio, cmd::openSource});
             m.addSeparator();
+            add({cmd::batchRender});
+            m.addSeparator();
             add({cmd::exportDdp, cmd::exportTrackWavs, cmd::exportProgram24});
             break;
         case 1:
@@ -534,6 +545,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             add({cmd::insertEdit, cmd::overwriteEdit, cmd::replaceEdit, cmd::appendEdit});
             m.addSeparator();
             add({cmd::splitAtPlayhead, cmd::deleteClose, cmd::deleteLeave, cmd::muteRegion, cmd::selectRegionRange, cmd::clearSelection});
+            m.addSeparator();
+            add({cmd::regionEffects, cmd::bypassRegionFx});
             m.addSeparator();
             add({cmd::nudgeLeft, cmd::nudgeRight, cmd::nudgeLeftBig, cmd::nudgeRightBig});
             break;
@@ -630,6 +643,144 @@ void MainComponent::showKeyEditor() {
     o.launchAsync();
 }
 
+namespace {
+class FxWindow : public juce::DocumentWindow {
+public:
+    FxWindow(juce::Component* c, const juce::String& title) : DocumentWindow(title, colours::bg, DocumentWindow::closeButton) {
+        setUsingNativeTitleBar(true);
+        setContentOwned(c, true);
+        setResizable(true, false);
+        centreWithSize(getWidth(), getHeight());
+        setAlwaysOnTop(true);
+        setVisible(true);
+    }
+    std::function<void()> onClose;
+    void closeButtonPressed() override { if (onClose) onClose(); }
+};
+
+class BatchPanel : public juce::Component {
+public:
+    BatchPanel(double projectRate) {
+        auto hi = juce::String(projectRate / 1000.0, projectRate == std::round(projectRate / 1000.0) * 1000.0 ? 0 : 1) + " kHz";
+        ddp_.setButtonText("DDP image for replication (verified after writing)");
+        wav16_.setButtonText("WAV 16-bit / 44.1 kHz per track (bit-identical to the CD)");
+        flac16_.setButtonText("FLAC 16-bit / 44.1 kHz per track (tagged)");
+        wavHi_.setButtonText("WAV 24-bit / " + hi + " per track (hi-res / streaming masters)");
+        flacHi_.setButtonText("FLAC 24-bit / " + hi + " per track (tagged)");
+        prog_.setButtonText("Whole programme as one WAV, 24-bit / " + hi);
+        for (auto* t : {&ddp_, &wav16_, &flac16_, &wavHi_, &flacHi_, &prog_}) {
+            t->setColour(juce::ToggleButton::textColourId, colours::text);
+            t->setColour(juce::ToggleButton::tickColourId, colours::accent);
+            addAndMakeVisible(*t);
+        }
+        ddp_.setToggleState(true, juce::dontSendNotification);
+        wav16_.setToggleState(true, juce::dontSendNotification);
+        wavHi_.setToggleState(true, juce::dontSendNotification);
+        note_.setText("One render pass feeds the DDP and the 16-bit files, a second (at the project rate, no "
+                      "sample-rate conversion) feeds the hi-res files. A Render Report with QC and an MD5 for "
+                      "every file is written alongside. MP3/AAC aren't included (encoder licensing).",
+                      juce::dontSendNotification);
+        note_.setColour(juce::Label::textColourId, colours::dim);
+        note_.setFont(juce::FontOptions(12.0f));
+        note_.setJustificationType(juce::Justification::topLeft);
+        addAndMakeVisible(note_);
+        styleButton(render_, true);
+        styleButton(cancel_);
+        addAndMakeVisible(render_);
+        addAndMakeVisible(cancel_);
+        render_.onClick = [this] { if (onRender) onRender(settings()); };
+        cancel_.onClick = [this] { if (onCancel) onCancel(); };
+        setSize(560, 330);
+    }
+    BatchSettings settings() const {
+        BatchSettings b;
+        b.ddp = ddp_.getToggleState();
+        b.wav16 = wav16_.getToggleState();
+        b.flac16 = flac16_.getToggleState();
+        b.wavHi = wavHi_.getToggleState();
+        b.flacHi = flacHi_.getToggleState();
+        b.programme = prog_.getToggleState();
+        return b;
+    }
+    std::function<void(BatchSettings)> onRender;
+    std::function<void()> onCancel;
+    void paint(juce::Graphics& g) override { g.fillAll(colours::bg); }
+    void resized() override {
+        auto r = getLocalBounds().reduced(14);
+        for (auto* t : {&ddp_, &wav16_, &flac16_, &wavHi_, &flacHi_, &prog_}) { t->setBounds(r.removeFromTop(26)); r.removeFromTop(2); }
+        auto buttons = r.removeFromBottom(28);
+        render_.setBounds(buttons.removeFromRight(140));
+        buttons.removeFromRight(8);
+        cancel_.setBounds(buttons.removeFromRight(90));
+        r.removeFromBottom(8);
+        note_.setBounds(r);
+    }
+private:
+    juce::ToggleButton ddp_, wav16_, flac16_, wavHi_, flacHi_, prog_;
+    juce::Label note_;
+    juce::TextButton render_{"Choose Folder & Render"}, cancel_{"Cancel"};
+};
+}  // namespace
+
+void MainComponent::openRegionFx(int regionId) {
+    auto* r = session_.findRegion(regionId);
+    if (!r) return;
+    fxWindow_.reset();
+    auto* chain = engine_.regionFx().chainFor(regionId, true, r->name);
+    auto* panel = new ChainPanel(*chain, "Region effects: " + r->name);
+    panel->onChange = [this] {
+        sessionChanged();
+        engine_.loadSession(session_);   // pick up the new latency/plugins in playback
+    };
+    panel->onScan = [this] { showPluginScanner(); };
+    auto* w = new FxWindow(panel, "Region Effects - " + r->name);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { fxWindow_.reset(); }); };
+    fxWindow_.reset(w);
+    fxWindowRegion_ = regionId;
+}
+
+void MainComponent::showBatchDialog() {
+    if (session_.regions.isEmpty()) return;
+    auto* panel = new BatchPanel(session_.effectiveRate());
+    juce::DialogWindow::LaunchOptions o;
+    o.content.setOwned(panel);
+    o.dialogTitle = "Render Album";
+    o.dialogBackgroundColour = colours::bg;
+    o.useNativeTitleBar = true;
+    auto* dw = o.launchAsync();
+    juce::Component::SafePointer<juce::DialogWindow> safe(dw);
+    panel->onCancel = [safe] { if (safe) safe->exitModalState(0); };
+    panel->onRender = [this, safe](BatchSettings bs) {
+        if (safe) safe->exitModalState(0);
+        chooser_ = std::make_unique<juce::FileChooser>("Choose where to create the album folder",
+                                                       juce::File::getSpecialLocation(juce::File::userDesktopDirectory));
+        chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                              [this, bs](const juce::FileChooser& fc) {
+            auto parent = fc.getResult();
+            if (!parent.isDirectory()) return;
+            auto name = juce::File::createLegalFileName((session_.discTitle.isEmpty() ? juce::String("Lathe") : session_.discTitle) + " Masters");
+            auto folder = parent.getNonexistentChildFile(name, "", false);
+            engine_.regionFx().syncAndCapture(session_);
+            auto snapshot = std::make_shared<Session>(session_);
+            auto es = exportSettings();
+            auto res = std::make_shared<BatchResult>();
+            runJob("Rendering album...",
+                   [this, snapshot, bs, folder, es, res](Job& j) { *res = exporter_.batchRender(*snapshot, bs, folder, es, [&](double p) { return j.keep(p); }); },
+                   [this, res, folder](bool) {
+                       if (!res->ok && res->report.isEmpty()) {
+                           juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Render failed", res->error);
+                           return;
+                       }
+                       juce::String text;
+                       if (!res->ok) text << "WARNING: " << res->error << "\n\n";
+                       text << res->report;
+                       showText("Render complete", text);
+                       folder.revealToUser();
+                   });
+        });
+    };
+}
+
 void MainComponent::jumpToMarker(int dir) {
     double pos = engine_.positionSeconds();
     double best = dir < 0 ? -1.0 : 1e12;
@@ -675,6 +826,8 @@ void MainComponent::runNullTest() {
 // ---------------------------------------------------------------- session lifecycle
 
 void MainComponent::sessionChanged(bool undoable) {
+    engine_.regionFx().syncAndCapture(session_);
+    if (fxWindow_ && !session_.findRegion(fxWindowRegion_)) fxWindow_.reset();
     session_.pluginChainState = engine_.chain().getState();
     auto now = juce::JSON::toString(session_.toVar(), true);
     if (now == lastState_) { timeline_.repaint(); return; }
@@ -731,6 +884,11 @@ void MainComponent::refreshAll() {
     engineer_.setText(session_.engineer, false);
     updatingFields_ = false;
     xfadeWindow_.reset();
+    fxWindow_.reset();
+    {
+        juce::StringArray problems;
+        engine_.regionFx().loadFrom(session_, problems);
+    }
     applyFollowRate();
     engine_.loadSession(session_);
     timeline_.sessionUpdated();
@@ -792,6 +950,7 @@ void MainComponent::openSession() {
 }
 
 bool MainComponent::saveSession(bool saveAs) {
+    engine_.regionFx().syncAndCapture(session_);
     session_.pluginChainState = engine_.chain().getState();
     auto doSave = [this](const juce::File& f) {
         juce::String err;
@@ -813,6 +972,7 @@ bool MainComponent::saveSession(bool saveAs) {
 }
 
 void MainComponent::writeAutosave(const juce::File& f) {
+    engine_.regionFx().syncAndCapture(session_);
     session_.pluginChainState = engine_.chain().getState();
     juce::String err;
     auto keep = session_.file;
