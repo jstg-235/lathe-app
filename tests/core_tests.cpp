@@ -4,6 +4,7 @@
 #include "../core/ddp/Ddp.h"
 #include "../core/dsp/Analyzer.h"
 #include "../core/dsp/Meters.h"
+#include "../core/dsp/Restoration.h"
 #include "../core/util/Hash.h"
 
 #include <cmath>
@@ -380,7 +381,130 @@ static void testAnalyzer() {
     std::printf("analyser: %d problems found\n%s", int(res.problems.size()), res.summary().c_str());
 }
 
+// Program-like test signal: a few non-harmonic partials with slow amplitude movement.
+static std::vector<double> music(int n, double fs, unsigned seed) {
+    std::vector<double> x(static_cast<size_t>(n));
+    const double fr[5] = {221.0, 347.3, 523.1, 880.7, 1777.0};
+    for (int i = 0; i < n; ++i) {
+        double t = i / fs, v = 0;
+        for (int k = 0; k < 5; ++k) v += (0.06 / (k + 1)) * (1.0 + 0.3 * std::sin(2 * M_PI * (0.3 + k * 0.17) * t + seed)) * std::sin(2 * M_PI * fr[k] * t + k);
+        x[size_t(i)] = v;
+    }
+    return x;
+}
+
+static double rmsDiff(const std::vector<double>& a, const std::vector<double>& b, size_t from, size_t to) {
+    double s = 0;
+    for (size_t i = from; i < to; ++i) s += (a[i] - b[i]) * (a[i] - b[i]);
+    return std::sqrt(s / double(to - from));
+}
+
+static void testRestoration() {
+    const double fs = 44100;
+    const int n = int(fs * 4);
+
+    // Declick: 40 clicks of 1-12 samples added to music; repair should take the error down a lot.
+    {
+        auto clean = music(n, fs, 1);
+        dsp::Channels ch{clean, clean};
+        std::srand(3);
+        int planted = 0;
+        for (int c = 0; c < 40; ++c) {
+            int at = 4000 + (std::rand() % (n - 8000)), w = 1 + std::rand() % 12;
+            double amp = (std::rand() % 2 ? 1 : -1) * (0.2 + 0.4 * (std::rand() % 100) / 100.0);
+            for (int k = 0; k < w; ++k) { ch[0][size_t(at + k)] += amp * (1 - k / double(w)); ch[1][size_t(at + k)] += amp * 0.8 * (1 - k / double(w)); }
+            ++planted;
+        }
+        double before = rmsDiff(ch[0], clean, 0, size_t(n));
+        auto st = dsp::declick(ch, fs, 6, 1.0);
+        double after = rmsDiff(ch[0], clean, 0, size_t(n));
+        std::printf("declick: %d planted, %d repaired, error %.1f dB -> %.1f dB\n", planted, st.found,
+                    20 * std::log10(before), 20 * std::log10(after + 1e-15));
+        CHECK(st.found >= 35);
+        CHECK(20 * std::log10(after / before) < -20);   // at least 20 dB less error
+        // Clean audio is left alone.
+        dsp::Channels c2{clean, clean};
+        auto st2 = dsp::declick(c2, fs, 6, 1.0);
+        CHECK(st2.found <= 2);
+        CHECK(rmsDiff(c2[0], clean, 0, size_t(n)) < 1e-4);
+    }
+
+    // Denoise: white noise at -50 dBFS RMS over music; learn from a noise-only stretch.
+    {
+        auto clean = music(n, fs, 2);
+        std::srand(11);
+        std::vector<double> noiseL(static_cast<size_t>(n)), noiseR(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            noiseL[size_t(i)] = (std::rand() / double(RAND_MAX) - 0.5) * 0.0109;
+            noiseR[size_t(i)] = (std::rand() / double(RAND_MAX) - 0.5) * 0.0109;
+        }
+        dsp::Channels noisy{clean, clean};
+        for (int i = 0; i < n; ++i) { noisy[0][size_t(i)] += noiseL[size_t(i)]; noisy[1][size_t(i)] += noiseR[size_t(i)]; }
+        dsp::Channels noiseOnly{std::vector<double>(noiseL.begin(), noiseL.begin() + n / 4), std::vector<double>(noiseR.begin(), noiseR.begin() + n / 4)};
+        auto np = dsp::learnNoise(noiseOnly, fs);
+        CHECK(np.valid());
+        double before = rmsDiff(noisy[0], clean, 8192, size_t(n - 8192));
+        dsp::denoise(noisy, fs, np, 18, 1.5);
+        double after = rmsDiff(noisy[0], clean, 8192, size_t(n - 8192));
+        std::printf("denoise: error %.1f dB -> %.1f dB\n", 20 * std::log10(before), 20 * std::log10(after));
+        CHECK(20 * std::log10(after / before) < -6);
+        // Music level preserved within 1 dB.
+        double sc = 0, sp = 0;
+        for (int i = 8192; i < n - 8192; ++i) { sc += clean[size_t(i)] * clean[size_t(i)]; sp += noisy[0][size_t(i)] * noisy[0][size_t(i)]; }
+        CHECK(std::abs(10 * std::log10(sp / sc)) < 1.0);
+    }
+
+    // Hum: 60 Hz + harmonics, auto-detected and removed; music around it survives.
+    {
+        auto clean = music(n, fs, 3);
+        dsp::Channels ch{clean, clean};
+        for (int i = 0; i < n; ++i)
+            for (int h = 1; h <= 4; ++h) for (auto& x : ch) x[size_t(i)] += (0.01 / h) * std::sin(2 * M_PI * 60.0 * h * i / fs);
+        double before = rmsDiff(ch[0], clean, 0, size_t(n));
+        double f0 = dsp::removeHum(ch, fs, 0, 8, 30);
+        double after = rmsDiff(ch[0], clean, size_t(fs * 0.5), size_t(n - fs * 0.5));
+        std::printf("hum: detected %.0f Hz, error %.1f dB -> %.1f dB\n", f0, 20 * std::log10(before), 20 * std::log10(after));
+        CHECK(f0 == 60.0);
+        CHECK(20 * std::log10(after / before) < -20);
+        dsp::Channels quiet{clean, clean};
+        CHECK(dsp::removeHum(quiet, fs, 0, 8, 30) == 0.0);   // no hum: nothing done
+    }
+
+    // Spectral attenuate: a 0.3 s 6 kHz tone burst removed; outside the box unchanged.
+    {
+        auto clean = music(n, fs, 4);
+        dsp::Channels ch{clean, clean};
+        for (int i = int(fs * 1.5); i < int(fs * 1.8); ++i) for (auto& x : ch) x[size_t(i)] += 0.05 * std::sin(2 * M_PI * 6000.0 * i / fs);
+        dsp::Channels edited = ch;
+        dsp::spectralEdit(edited, fs, 1.45, 1.85, 5500, 6500, dsp::SpectralMode::Attenuate, -60);
+        double burstBefore = rmsDiff(ch[0], clean, size_t(fs * 1.55), size_t(fs * 1.75));
+        double burstAfter = rmsDiff(edited[0], clean, size_t(fs * 1.55), size_t(fs * 1.75));
+        std::printf("spectral attenuate: burst %.1f dB -> %.1f dB\n", 20 * std::log10(burstBefore), 20 * std::log10(burstAfter));
+        CHECK(20 * std::log10(burstAfter / burstBefore) < -25);
+        bool untouched = true;
+        for (size_t i = 0; i < size_t(fs * 1.0); ++i) untouched &= edited[0][i] == ch[0][i];
+        for (size_t i = size_t(fs * 2.5); i < size_t(n); ++i) untouched &= edited[0][i] == ch[0][i];
+        CHECK(untouched);   // bit-exact outside the edited span
+        // Heal does the same job without a hole.
+        dsp::Channels healed = ch;
+        dsp::spectralEdit(healed, fs, 1.45, 1.85, 5500, 6500, dsp::SpectralMode::Heal, 0);
+        double healAfter = rmsDiff(healed[0], clean, size_t(fs * 1.55), size_t(fs * 1.75));
+        std::printf("spectral heal: burst %.1f dB -> %.1f dB\n", 20 * std::log10(burstBefore), 20 * std::log10(healAfter));
+        CHECK(20 * std::log10(healAfter / burstBefore) < -15);
+        auto sg = dsp::spectrogram(ch, fs, 500);
+        CHECK(!sg.db.empty() && sg.db[0].size() == size_t(sg.fftSize / 2 + 1));
+    }
+
+    // DC removal.
+    {
+        dsp::Channels ch{std::vector<double>(1000, 0.02), std::vector<double>(1000, -0.01)};
+        dsp::removeDc(ch);
+        CHECK(std::abs(ch[0][500]) < 1e-12 && std::abs(ch[1][10]) < 1e-12);
+    }
+}
+
 int main() {
+    testRestoration();
     testAnalyzer();
     testNoiseShaping();
     testMsf();

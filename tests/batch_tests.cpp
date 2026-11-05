@@ -3,6 +3,7 @@
 #include "../app/Source/ControlSurface.h"
 #include "../app/Source/DdpFormat.h"
 #include "../app/Source/Exporter.h"
+#include "../app/Source/Restore.h"
 #include "../core/util/FlacTags.h"
 
 #include <cstdio>
@@ -129,6 +130,59 @@ int main() {
         auto report = out.getChildFile("Render Report.txt").loadFileAsString();
         CHECK(report.contains("written and verified") && report.contains("IMAGE.DAT") && report.contains("Integrated loudness"));
     }
+    // ---- Region restoration: clicks in the selection repaired, outside untouched, undo restores.
+    {
+        auto f = noiseFile(dir, "clicky.wav", 44100, 6.0, 31);
+        // Quieter base so planted clicks stand out: rewrite at -30 dB with clicks at 2 s and 4 s.
+        {
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(f));
+            juce::AudioBuffer<float> x(2, int(r->lengthInSamples));
+            r->read(&x, 0, x.getNumSamples(), 0, true, true);
+            r.reset();
+            for (int ch = 0; ch < 2; ++ch) {
+                // smooth it (one-pole) so it's predictable, like music
+                float z = 0;
+                for (int i = 0; i < x.getNumSamples(); ++i) { z = 0.97f * z + 0.03f * x.getSample(ch, i); x.setSample(ch, i, z * 0.3f); }
+                for (int at : {88200, 176400}) for (int k = 0; k < 6; ++k) x.setSample(ch, at + k, 0.6f);
+            }
+            juce::WavAudioFormat wav;
+            f.deleteFile();
+            std::unique_ptr<juce::OutputStream> os(f.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 44100, 2, 32, {}, 0));
+            os.release();
+            w->writeFromAudioSampleBuffer(x, 0, x.getNumSamples());
+        }
+        Session s;
+        std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(f));
+        int id = s.append(s.makeRegion(f, r->sampleRate, r->lengthInSamples), 2.0);
+        auto before = juce::JSON::toString(s.toVar());
+        RestoreSettings rs;   // declick on by default
+        // Only 3.5..4.5 s of the region (timeline 5.5..6.5): the click at 4 s is fixed, the one at 2 s isn't.
+        auto res = restoreRegion(fm, *s.findRegion(id), {5.5, 6.5}, rs, nullptr, dir.getChildFile("Processed"), {});
+        CHECK(res.ok);
+        applyProcessed(s, id, res, "restored");
+        auto* reg = s.findRegion(id);
+        CHECK(reg->file == res.file && reg->name.contains("(restored)") && reg->srcOut - reg->srcIn == r->lengthInSamples);
+        std::unique_ptr<juce::AudioFormatReader> pr(fm.createReaderFor(res.file));
+        juce::AudioBuffer<float> orig(2, int(r->lengthInSamples)), proc(2, int(r->lengthInSamples));
+        r->read(&orig, 0, orig.getNumSamples(), 0, true, true);
+        pr->read(&proc, 0, proc.getNumSamples(), reg->srcIn, true, true);
+        CHECK(proc.getSample(0, 88202) == orig.getSample(0, 88202));                 // outside: click kept, untouched
+        CHECK(std::abs(proc.getSample(0, 176402)) < 0.2f);                            // inside: click repaired
+        bool exactOutside = true;
+        for (int i = 0; i < 44100 * 3; ++i) exactOutside &= proc.getSample(1, i) == orig.getSample(1, i);
+        CHECK(exactOutside);
+        std::printf("restore: %s; click at 4 s %.3f -> %.3f\n", res.report.replace("\n", "; ").toRawUTF8(), orig.getSample(0, 176402), proc.getSample(0, 176402));
+        // "Undo" = the previous session state: the original file again.
+        Session undone;
+        juce::String e2;
+        undone.fromVar(juce::JSON::parse(before), e2);
+        CHECK(undone.findRegion(id)->file == f);
+        // Spectral edit on the same region writes a new file and keeps the length.
+        auto sres = spectralEditRegion(fm, *s.findRegion(id), 1.0, 1.5, 3000, 6000, dsp::SpectralMode::Attenuate, -30, dir.getChildFile("Processed"));
+        CHECK(sres.ok && sres.srcOut - sres.srcIn == r->lengthInSamples);
+    }
+
     // ---- Control surface: Mackie defaults, jog, MIDI learn, HUI zone/port learn.
     {
         CommandSpy spy;

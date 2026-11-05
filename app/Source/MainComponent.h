@@ -5,6 +5,7 @@
 #include "ControlSurface.h"
 #include "DdpFormat.h"
 #include "DdpPlayer.h"
+#include "Restore.h"
 #include "Commands.h"
 #include "EditPanels.h"
 #include "Exporter.h"
@@ -112,6 +113,10 @@ private:
     void openDdpPlayer();
     void showRecordDialog();
     void showControlSurfaces();
+    int targetRegion() const;
+    void showRestore(int regionId);
+    void showSpectral(int regionId);
+    juce::File processedFolder() const;
     void beginRecording();
     void finishRecording();
     juce::File recordingsFolder() const;
@@ -175,6 +180,8 @@ private:
     juce::Range<double> recPunch_;
     std::unique_ptr<juce::DocumentWindow> recWindow_, surfaceWindow_;
     std::unique_ptr<ControlSurface> surface_;
+    std::unique_ptr<juce::DocumentWindow> restoreWindow_, spectralWindow_;
+    std::shared_ptr<dsp::NoiseProfile> noise_;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };
