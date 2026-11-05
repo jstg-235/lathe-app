@@ -116,6 +116,60 @@ int main() {
         auto report = out.getChildFile("Render Report.txt").loadFileAsString();
         CHECK(report.contains("written and verified") && report.contains("IMAGE.DAT") && report.contains("Integrated loudness"));
     }
+    // ---- Programme analysis through the real master path (processed + unprocessed).
+    {
+        auto a = noiseFile(dir, "an.wav", 44100, 6.0, 9);
+        Session s;
+        std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(a));
+        s.append(s.makeRegion(a, r->sampleRate, r->lengthInSamples), 2.0);
+        s.regions.getReference(0).gainDb = -6.0;
+        Exporter ex(engine);
+        dsp::AnalysisResult proc, raw;
+        auto err = ex.analyseProgram(s, {}, [](double) { return true; }, proc, &raw);
+        CHECK(err.isEmpty());
+        CHECK(proc.tracks.size() == 1 && std::isfinite(proc.lufs));
+        CHECK(std::abs(proc.lufs - raw.lufs) < 0.01);   // no plugins: processed == unprocessed
+        CHECK(std::abs(proc.length - 8.0) < 0.05);
+        CHECK(proc.map.shortTerm.size() >= 79);
+        std::printf("analysis: %.2f LUFS, %d hops, %d problems\n", proc.lufs, int(proc.map.shortTerm.size()), int(proc.problems.size()));
+    }
+
+    // ---- Reference A/B in the audio callback: crossfades to the reference, at its gain.
+    {
+        auto ref = noiseFile(dir, "ref.wav", 44100, 3.0, 11);
+        engine.prepareToPlay(512, 44100);
+        Session empty;
+        engine.loadSession(empty);
+        CHECK(engine.loadReference(ref));
+        engine.setReferenceGainDb(-6.0206);
+        engine.setListenToReference(true);
+        engine.play();
+        juce::AudioBuffer<float> out(2, 512);
+        double sumOut = 0;
+        for (int b = 0; b < 40; ++b) {   // ~0.46 s; the 10 ms ramp is long done
+            out.clear();
+            juce::AudioSourceChannelInfo info(&out, 0, 512);
+            engine.getNextAudioBlock(info);
+            if (b > 10) sumOut += out.getRMSLevel(0, 0, 512);
+        }
+        std::unique_ptr<juce::AudioFormatReader> rr(fm.createReaderFor(ref));
+        juce::AudioBuffer<float> src(2, 44100);
+        rr->read(&src, 0, 44100, 0, true, true);
+        double srcRms = src.getRMSLevel(0, 0, 44100);
+        double ratio = (sumOut / 29.0) / srcRms;
+        std::printf("reference A/B level ratio %.3f (expect 0.500)\n", ratio);
+        CHECK(std::abs(ratio - 0.5) < 0.05);
+        engine.setListenToReference(false);
+        for (int b = 0; b < 4; ++b) { out.clear(); juce::AudioSourceChannelInfo info(&out, 0, 512); engine.getNextAudioBlock(info); }
+        out.clear();
+        juce::AudioSourceChannelInfo info(&out, 0, 512);
+        engine.getNextAudioBlock(info);
+        CHECK(out.getMagnitude(0, 0, 512) < 1e-6f);   // back to the (silent) master
+        engine.stop();
+        engine.clearReference();
+        engine.releaseResources();
+    }
+
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

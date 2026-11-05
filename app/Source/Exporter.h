@@ -7,6 +7,7 @@
 #include "Session.h"
 
 #include "../../core/ddp/Ddp.h"
+#include "../../core/dsp/Analyzer.h"
 #include "../../core/dsp/Meters.h"
 
 namespace lathe {
@@ -64,6 +65,10 @@ public:
     // Renders all selected deliverables into `folder` (created), with a QC + checksum report.
     BatchResult batchRender(const Session& s, const BatchSettings& bs, const juce::File& folder, const ExportSettings& es,
                             const Keep& keepGoing);
+    // Full programme analysis of the CD master (44.1 kHz, before dither): loudness map,
+    // per-track stats and problems. With `raw`, also analyses the unprocessed mix (no plugins).
+    juce::String analyseProgram(const Session& s, const ExportSettings& es, const Keep& keepGoing, dsp::AnalysisResult& processed,
+                                dsp::AnalysisResult* raw);
     // Loudness / true peak / overs for the CD master, without writing anything.
     juce::String analyse(const Session& s, const ExportSettings& es, const Keep& keepGoing, QcReport& qc);
 

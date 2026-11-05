@@ -465,6 +465,19 @@ juce::var Session::toVar() const {
         ml.add(o);
     }
     root->setProperty("markers", ml);
+    juce::Array<juce::var> refs;
+    for (auto& r : references) {
+        auto* o = new juce::DynamicObject();
+        o->setProperty("file", r.file.getFullPathName());
+        o->setProperty("name", r.name);
+        o->setProperty("lufs", r.lufs);
+        o->setProperty("trim", r.trimDb);
+        refs.add(o);
+    }
+    root->setProperty("references", refs);
+    root->setProperty("activeReference", activeReference);
+    root->setProperty("levelMatchReference", levelMatchReference);
+    root->setProperty("loudnessTarget", loudnessTarget);
     return root;
 }
 
@@ -556,6 +569,20 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             regions.add(r);
         }
     }
+    references.clear();
+    if (auto* arr = v["references"].getArray())
+        for (auto& o : *arr) {
+            Reference r;
+            r.file = juce::File(o["file"].toString());
+            r.name = o["name"].toString();
+            r.lufs = o.hasProperty("lufs") ? double(o["lufs"]) : -1000.0;
+            r.trimDb = double(o["trim"]);
+            references.add(r);
+        }
+    activeReference = v.hasProperty("activeReference") ? int(v["activeReference"]) : -1;
+    if (activeReference >= references.size()) activeReference = -1;
+    levelMatchReference = v.hasProperty("levelMatchReference") ? bool(v["levelMatchReference"]) : true;
+    loudnessTarget = v.hasProperty("loudnessTarget") ? double(v["loudnessTarget"]) : -14.0;
     if (auto* arr = v["markers"].getArray()) {
         for (auto& o : *arr) {
             Marker m;

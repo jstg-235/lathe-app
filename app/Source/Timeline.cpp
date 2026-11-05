@@ -99,6 +99,81 @@ void Timeline::setPlayhead(double sec, bool follow) {
     repaint();
 }
 
+void Timeline::setAnalysis(std::shared_ptr<const dsp::AnalysisResult> processed, std::shared_ptr<const dsp::AnalysisResult> raw) {
+    an_ = std::move(processed);
+    raw_ = std::move(raw);
+    stale_ = false;
+    repaint();
+}
+
+int Timeline::problemAt(juce::Point<int> p) const {
+    if (!an_ || p.y >= kRuler) return -1;
+    for (size_t i = 0; i < an_->problems.size(); ++i)
+        if (std::abs(timeToX(an_->problems[i].start) - float(p.x)) < 6) return int(i);
+    return -1;
+}
+
+void Timeline::paintLoudness(juce::Graphics& g) {
+    if (!an_ || !showLoudness_) return;
+    auto area = juce::Rectangle<float>(0, float(kRuler + kMarkers), float(getWidth()), float(getHeight() - kRuler - kMarkers - kScroll));
+    const float lo = -36.0f, hi = 0.0f;
+    auto yOf = [&](float lufs) { return area.getBottom() - (juce::jlimit(lo, hi, lufs) - lo) / (hi - lo) * area.getHeight(); };
+    const float alpha = stale_ ? 0.35f : 1.0f;
+
+    // Target line.
+    float ty = yOf(float(s_.loudnessTarget));
+    g.setColour(colours::ok.withAlpha(0.45f * alpha));
+    g.drawHorizontalLine(int(ty), 0, float(getWidth()));
+    g.setFont(10.0f);
+    g.drawText(juce::String(s_.loudnessTarget, 0) + " LUFS target", getWidth() - 120, int(ty) - 13, 116, 12, juce::Justification::right);
+
+    auto curve = [&](const dsp::LoudnessMap& m, juce::Colour c, float width, bool dashed) {
+        if (m.shortTerm.empty()) return;
+        juce::Path p;
+        bool started = false;
+        // Sample the map per pixel column so long programmes stay cheap to draw.
+        for (int x = 0; x < getWidth(); x += 2) {
+            double t = xToTime(float(x));
+            if (t < 0 || t > double(m.shortTerm.size()) * m.hopSec) { started = false; continue; }
+            float v = float(m.valueAt(m.shortTerm, t));
+            if (v < lo - 10) { started = false; continue; }
+            float y = yOf(v);
+            if (!started) { p.startNewSubPath(float(x), y); started = true; }
+            else p.lineTo(float(x), y);
+        }
+        g.setColour(c);
+        if (dashed) {
+            juce::Path d;
+            const float dashes[] = {4.0f, 4.0f};
+            juce::PathStrokeType(width).createDashedStroke(d, p, dashes, 2);
+            g.fillPath(d);
+        } else {
+            g.strokePath(p, juce::PathStrokeType(width));
+        }
+    };
+    if (raw_) curve(raw_->map, colours::text.withAlpha(0.35f * alpha), 1.0f, true);
+    curve(an_->map, colours::envelope.withAlpha(0.9f * alpha), 1.6f, false);
+
+    // Per-track integrated loudness and true peak.
+    g.setFont(11.0f);
+    for (size_t i = 0; i < an_->tracks.size(); ++i) {
+        auto& t = an_->tracks[i];
+        float x = timeToX(t.start);
+        if (x > getWidth() || timeToX(t.end) < 0) continue;
+        juce::String txt = std::isfinite(t.lufs) ? juce::String(t.lufs, 1) + " LUFS" : juce::String("--");
+        if (std::isfinite(t.truePeakDb)) txt << "  " << juce::String(t.truePeakDb, 1) << " dBTP";
+        g.setColour(colours::bg.withAlpha(0.7f));
+        g.fillRoundedRectangle(juce::Rectangle<float>(juce::jmax(2.0f, x + 4), area.getY() + 3, 150, 15), 3.0f);
+        g.setColour((t.truePeakDb > -1.0 ? colours::error : colours::envelope).withAlpha(alpha));
+        g.drawText(txt, juce::Rectangle<int>(int(juce::jmax(2.0f, x + 8)), int(area.getY() + 3), 146, 15), juce::Justification::left);
+    }
+    if (stale_) {
+        g.setColour(colours::accent);
+        g.drawText("Loudness overlay is out of date - Analyse again", int(area.getX()) + 8, int(area.getBottom()) - 18, 320, 14,
+                   juce::Justification::left);
+    }
+}
+
 void Timeline::zoomToFit() {
     double len = juce::jmax(10.0, s_.end() + 2.0);
     pps_ = juce::jmax(0.5, double(getWidth()) / len);
@@ -318,8 +393,19 @@ void Timeline::paint(juce::Graphics& g) {
         g.drawVerticalLine(int(a), float(kRuler), float(getHeight() - kScroll));
         g.drawVerticalLine(int(b), float(kRuler), float(getHeight() - kScroll));
     }
+    paintLoudness(g);
     paintRuler(g);
     paintMarkers(g);
+    // Problem ticks on the ruler (red = serious, amber = warning); click to jump.
+    if (an_ && showLoudness_)
+        for (auto& p : an_->problems) {
+            float x = timeToX(p.start);
+            if (x < -6 || x > getWidth() + 6) continue;
+            juce::Path tri;
+            tri.addTriangle(x - 5, 2, x + 5, 2, x, 11);
+            g.setColour((p.severe ? colours::error : colours::accent).withAlpha(stale_ ? 0.4f : 1.0f));
+            g.fillPath(tri);
+        }
 
     g.setColour(colours::text);
     float px = timeToX(playhead_);
@@ -356,6 +442,10 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
     dragT0_ = xToTime(float(e.x));
     auto p = e.getPosition();
 
+    if (int pi = problemAt(p); pi >= 0) {
+        if (onProblemClicked) onProblemClicked(an_->problems[size_t(pi)].start);
+        return;
+    }
     if (e.y < kRuler) {
         drag_ = Drag::Locate;
         if (onSeek) onSeek(juce::jmax(0.0, dragT0_));

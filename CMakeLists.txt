@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Lathe VERSION 0.4.0 LANGUAGES C CXX)
+project(Lathe VERSION 0.5.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,6 +14,7 @@ add_library(lathe_core STATIC
     core/cd/CdTextEncoder.cpp
     core/ddp/Ddp.cpp
     core/dsp/Meters.cpp
+    core/dsp/Analyzer.cpp
     core/util/Hash.cpp
     core/util/FlacTags.cpp)
 target_include_directories(lathe_core PUBLIC core)

@@ -6,6 +6,7 @@
 #pragma once
 
 #include "Session.h"
+#include "../../core/dsp/Analyzer.h"
 #include "Theme.h"
 
 #include <juce_audio_utils/juce_audio_utils.h>
@@ -48,6 +49,13 @@ public:
     bool envelopeMode() const { return envelopeMode_; }
     void setSnap(bool on) { snap_ = on; }
 
+    // Loudness overlay from the last analysis: processed (solid) and unprocessed (dim).
+    void setAnalysis(std::shared_ptr<const dsp::AnalysisResult> processed, std::shared_ptr<const dsp::AnalysisResult> raw);
+    void setAnalysisStale(bool stale) { stale_ = stale; repaint(); }
+    void setShowLoudness(bool b) { showLoudness_ = b; repaint(); }
+    bool showLoudness() const { return showLoudness_; }
+    std::function<void(double)> onProblemClicked;
+
     void zoomToFit();
     void zoomBy(double factor, double aroundSec);
     void sessionUpdated();   // after external changes (undo, load)
@@ -85,6 +93,8 @@ private:
     void paintRegion(juce::Graphics&, int index);
     void paintMarkers(juce::Graphics&);
     void paintRuler(juce::Graphics&);
+    void paintLoudness(juce::Graphics&);
+    int problemAt(juce::Point<int> p) const;   // index into processed problems, -1 = none
 
     Session& s_;
     ThumbPool& pool_;
@@ -100,6 +110,8 @@ private:
     double dragT0_ = 0, dragOrigStart_ = 0, dragOrigEnd_ = 0;
     int dragOrigLane_ = 0;
     bool changed_ = false;
+    std::shared_ptr<const dsp::AnalysisResult> an_, raw_;
+    bool stale_ = false, showLoudness_ = true;
 };
 
 }  // namespace lathe

@@ -316,6 +316,32 @@ juce::String Exporter::exportProgramWav(const Session& s, const juce::File& file
     return {};
 }
 
+juce::String Exporter::analyseProgram(const Session& s, const ExportSettings& es, const Keep& keep, dsp::AnalysisResult& processed,
+                                      dsp::AnalysisResult* raw) {
+    std::vector<std::pair<double, double>> ranges;
+    for (auto& r : s.trackRanges()) ranges.push_back({r.getStart(), r.getEnd()});
+    const juce::int64 total = juce::int64(std::ceil(s.end() * cd::kSampleRate));
+    const int passes = raw ? 2 : 1;
+    for (int pass = 0; pass < passes; ++pass) {
+        ExportSettings e = es;
+        e.runPlugins = pass == 0 ? es.runPlugins : false;
+        MasterStream ms(engine_, s, e, cd::kSampleRate);
+        dsp::ProgramAnalyzer an;
+        an.prepare(cd::kSampleRate, ranges);
+        std::vector<double> l(4096), r(4096);
+        juce::String err;
+        for (juce::int64 pos = 0; pos < total;) {
+            int n = int(juce::jmin<juce::int64>(4096, total - pos));
+            if (!ms.pull(l.data(), r.data(), n, err)) return err;
+            an.process(l.data(), r.data(), n);
+            pos += n;
+            if (!keep((pass + double(pos) / double(total)) / passes)) return "Cancelled.";
+        }
+        (pass == 0 ? processed : *raw) = an.finish();
+    }
+    return {};
+}
+
 juce::String Exporter::analyse(const Session& s, const ExportSettings& es, const Keep& keep, QcReport& qc) {
     MasterStream ms(engine_, s, es, cd::kSampleRate);
     QcRunner qr(s, cd::kSampleRate);

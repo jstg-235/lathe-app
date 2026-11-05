@@ -2,6 +2,7 @@
 #include "../core/cd/CdTextEncoder.h"
 #include "../core/cd/Disc.h"
 #include "../core/ddp/Ddp.h"
+#include "../core/dsp/Analyzer.h"
 #include "../core/dsp/Meters.h"
 #include "../core/util/Hash.h"
 
@@ -315,7 +316,58 @@ static void testNoiseShaping() {
     CHECK(worst < 64);   // within a few dozen LSB of the input even at the rails
 }
 
+static void testAnalyzer() {
+    // Two 5 s tracks of a 1 kHz tone at -20 dBFS, with planted faults:
+    //  2.000 s: 10 full-scale samples (clip + true-peak over)      track 1
+    //  6.000 s: 50 ms of digital silence (dropout)                 track 2
+    //  7-8 s:   right channel inverted (phase)                     track 2
+    //  track 2: +1 % DC offset
+    const double fs = 44100;
+    const int n = int(fs * 10);
+    std::vector<double> l(static_cast<size_t>(n)), r(static_cast<size_t>(n));
+    const double a = std::pow(10.0, -20.0 / 20.0);
+    for (int i = 0; i < n; ++i) {
+        double t = i / fs, v = a * std::sin(2 * M_PI * 1000 * t);
+        l[size_t(i)] = v;
+        r[size_t(i)] = (t >= 7.0 && t < 8.0) ? -v : v;
+        if (t >= 5.0) { l[size_t(i)] += 0.01; r[size_t(i)] += 0.01; }
+    }
+    for (int i = 0; i < 10; ++i) l[size_t(int(2.0 * fs) + i)] = r[size_t(int(2.0 * fs) + i)] = 1.0;
+    for (int i = 0; i < int(0.05 * fs); ++i) l[size_t(int(6.0 * fs) + i)] = r[size_t(int(6.0 * fs) + i)] = 0.0;
+
+    dsp::ProgramAnalyzer an;
+    an.prepare(fs, {{0.0, 5.0}, {5.0, 10.0}});
+    for (int off = 0; off < n; off += 1000) an.process(l.data() + off, r.data() + off, std::min(1000, n - off));
+    auto res = an.finish();
+
+    CHECK(res.tracks.size() == 2);
+    NEAR(res.tracks[0].lufs, -20.0, 0.3);
+    CHECK(std::abs(res.map.shortTerm.size() - 100.0) <= 1);
+    NEAR(res.map.hopSec, 0.1, 1e-9);
+    auto has = [&](dsp::Problem::Kind k, double at, int track) {
+        for (auto& p : res.problems)
+            if (p.kind == k && at >= p.start - 0.15 && at <= p.end + 0.15 && p.track == track) return true;
+        return false;
+    };
+    CHECK(has(dsp::Problem::Clip, 2.0, 1));
+    int clips = 0;
+    for (auto& p : res.problems) clips += p.kind == dsp::Problem::Clip;
+    CHECK(clips == 1);
+    CHECK(has(dsp::Problem::TruePeak, 2.0, 1));
+    CHECK(has(dsp::Problem::Dropout, 6.0, 2));
+    CHECK(has(dsp::Problem::Phase, 7.5, 2));
+    CHECK(has(dsp::Problem::DcOffset, 7.0, 2));
+    bool spurious = false;   // nothing should be flagged in track 1 apart from the clip
+    for (auto& p : res.problems) if (p.track == 1 && (p.start < 1.8 || p.start > 2.3)) spurious = true;
+    CHECK(!spurious);
+    NEAR(res.tracks[1].dcPercent, 1.0, 0.05);
+    CHECK(res.tracks[1].minCorrelation < -0.9);
+    NEAR(res.tracks[0].minCorrelation, 1.0, 0.01);
+    std::printf("analyser: %d problems found\n%s", int(res.problems.size()), res.summary().c_str());
+}
+
 int main() {
+    testAnalyzer();
     testNoiseShaping();
     testMsf();
     testValidation();

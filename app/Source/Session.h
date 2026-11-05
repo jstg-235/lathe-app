@@ -62,8 +62,20 @@ struct EffectiveFades {
     FadeShape inShape = FadeShape::EqualPower, outShape = FadeShape::EqualPower;
 };
 
+// A commercial or client reference for A/B comparison. Not part of the master.
+struct Reference {
+    juce::File file;
+    juce::String name;
+    double lufs = -1000;      // integrated loudness; -1000 = not measured yet
+    double trimDb = 0;        // manual trim on top of the level match
+};
+
 class Session {
 public:
+    juce::Array<Reference> references;
+    int activeReference = -1;
+    bool levelMatchReference = true;
+    double loudnessTarget = -14.0;   // drawn on the loudness overlay
     juce::Array<Region> regions;
     juce::Array<Marker> markers;
     int lanes = 2;

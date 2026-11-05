@@ -83,6 +83,25 @@ public:
     void setSourcePosition(double sec) { sourceTransport_.setPosition(sec); }
     double sourceLength() const { return sourceTransport_.getLengthInSeconds(); }
 
+    // ---- Reference track A/B (plays alongside the master; switching crossfades in 10 ms) ----
+    bool loadReference(const juce::File& f);
+    void clearReference();
+    bool hasReference() const { return refReader_ != nullptr; }
+    void setListenToReference(bool b) { listenRef_ = b; }
+    bool listeningToReference() const { return listenRef_; }
+    void setReferenceGainDb(double db) { refGain_ = float(juce::Decibels::decibelsToGain(db)); }
+    double referencePosition() const { return refTransport_.getCurrentPosition(); }
+    void setReferencePosition(double s) { refTransport_.setPosition(s); }
+    double referenceLength() const { return refTransport_.getLengthInSeconds(); }
+
+    // ---- Processed / unprocessed compare: bypasses the master chain (region effects are
+    // bypassed through the region bank) and applies a level-match gain. ----
+    void setCompareUnprocessed(bool b, double matchGainDb) {
+        bypassGain_ = float(juce::Decibels::decibelsToGain(matchGainDb));
+        bypassMaster_ = b;
+    }
+    bool comparingUnprocessed() const { return bypassMaster_; }
+
     // Switches the interface to `rate` when it supports it, so playback reaches the converters
     // with no sample-rate conversion anywhere (ours or the OS's). Returns a status message.
     juce::String matchDeviceRate(double rate);
@@ -104,6 +123,13 @@ private:
     std::unique_ptr<ProgramSource> program_;
     std::unique_ptr<juce::BufferingAudioSource> buffered_;
     juce::AudioTransportSource sourceTransport_;
+    juce::AudioTransportSource refTransport_;
+    std::unique_ptr<juce::AudioFormatReaderSource> refReader_;
+    juce::AudioBuffer<float> refBuf_;
+    std::atomic<bool> listenRef_{false}, bypassMaster_{false};
+    std::atomic<float> refGain_{1.0f}, bypassGain_{1.0f};
+    float refMix_ = 0.0f;   // audio thread only: 0 = master, 1 = reference
+    juce::CriticalSection refLock_;   // UI swaps the reference under this; audio thread only try-locks
     std::unique_ptr<juce::AudioFormatReaderSource> sourceReader_;
     juce::AudioBuffer<float> sourceBuf_;
     PluginHost host_;

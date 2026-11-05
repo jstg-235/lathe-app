@@ -105,6 +105,14 @@ private:
     void applyFollowRate();
     void saveKeyMappings();
     void openRegionFx(int regionId);
+    void runAnalysis();
+    void showAnalysisWindow();
+    void showReferences();
+    void selectReference(int index);
+    void measureReference(int index);
+    void toggleCompareUnprocessed();
+    double referenceGainDb(juce::String* explain = nullptr) const;
+    double masterLoudnessAt(double t) const;
     void showBatchDialog();
     int markerRowToTrackNumber(int row) const;
 
@@ -143,6 +151,11 @@ private:
     std::unique_ptr<juce::DocumentWindow> xfadeWindow_;
     std::unique_ptr<juce::DocumentWindow> fxWindow_;
     int fxWindowRegion_ = 0;
+    std::shared_ptr<dsp::AnalysisResult> analysis_, rawAnalysis_;
+    bool analysisStale_ = false;
+    bool compare_ = false, compareRestoreRegionBypass_ = false;
+    std::unique_ptr<juce::DocumentWindow> refWindow_, analysisWindow_;
+    juce::Label abDisplay_;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

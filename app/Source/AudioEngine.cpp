@@ -47,6 +47,8 @@ AudioEngine::~AudioEngine() {
     transport_.setSource(nullptr);
     sourceTransport_.setSource(nullptr);
     sourceReader_.reset();
+    refTransport_.setSource(nullptr);
+    refReader_.reset();
     buffered_.reset();
     program_.reset();
     readAhead_.stopThread(2000);
@@ -82,6 +84,31 @@ bool AudioEngine::loadSource(const juce::File& f) {
     return true;
 }
 
+bool AudioEngine::loadReference(const juce::File& f) {
+    bool playing = transport_.isPlaying();
+    auto* reader = formats_.createReaderFor(f);
+    if (!reader) return false;
+    double rate = reader->sampleRate;
+    auto src = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
+    src->setLooping(true);
+    const juce::ScopedLock sl(refLock_);
+    refTransport_.stop();
+    refTransport_.setSource(nullptr);
+    refReader_ = std::move(src);
+    refTransport_.setSource(refReader_.get(), int(rate * 2), &readAhead_, rate, 2);
+    refTransport_.prepareToPlay(block_, rate_);
+    if (playing) refTransport_.start();
+    return true;
+}
+
+void AudioEngine::clearReference() {
+    listenRef_ = false;
+    const juce::ScopedLock sl(refLock_);
+    refTransport_.stop();
+    refTransport_.setSource(nullptr);
+    refReader_.reset();
+}
+
 void AudioEngine::playSource() {
     transport_.stop();
     if (sourceTransport_.getCurrentPosition() >= sourceTransport_.getLengthInSeconds() - 0.01) sourceTransport_.setPosition(0);
@@ -108,9 +135,13 @@ void AudioEngine::play() {
     sourceTransport_.stop();
     if (transport_.getCurrentPosition() >= transport_.getLengthInSeconds() - 0.01) transport_.setPosition(0);
     transport_.start();
+    if (refReader_) refTransport_.start();
 }
 
-void AudioEngine::stop() { transport_.stop(); }
+void AudioEngine::stop() {
+    transport_.stop();
+    refTransport_.stop();
+}
 
 void AudioEngine::setPositionSeconds(double sec) {
     transport_.setPosition(juce::jlimit(0.0, juce::jmax(0.0, transport_.getLengthInSeconds()), sec));
@@ -129,7 +160,9 @@ void AudioEngine::prepareToPlay(int block, double rate) {
     block_ = block;
     transport_.prepareToPlay(block, rate);
     sourceTransport_.prepareToPlay(block, rate);
+    refTransport_.prepareToPlay(block, rate);
     sourceBuf_.setSize(2, juce::jmax(block, 8192));
+    refBuf_.setSize(2, juce::jmax(block, 8192));
     chain_.prepare(rate, block);
     juce::ignoreUnused(rateChanged);   // the UI reloads the session when the device rate changes
 }
@@ -137,6 +170,7 @@ void AudioEngine::prepareToPlay(int block, double rate) {
 void AudioEngine::releaseResources() {
     transport_.releaseResources();
     sourceTransport_.releaseResources();
+    refTransport_.releaseResources();
     chain_.release();
 }
 
@@ -149,7 +183,33 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
         return;
     }
     transport_.getNextAudioBlock(info);
-    chain_.process(*info.buffer, info.startSample, info.numSamples);
+    if (bypassMaster_) {
+        info.buffer->applyGain(info.startSample, info.numSamples, bypassGain_);   // level-matched unprocessed
+    } else {
+        chain_.process(*info.buffer, info.startSample, info.numSamples);
+    }
+
+    // Reference A/B: the reference runs alongside the master; a 10 ms ramp switches between them.
+    const juce::ScopedTryLock refSl(refLock_);
+    const bool haveRef = refSl.isLocked() && refReader_ != nullptr && refBuf_.getNumSamples() >= info.numSamples;
+    const float target = (haveRef && listenRef_) ? 1.0f : 0.0f;
+    if (haveRef && (refMix_ > 0.0f || target > 0.0f)) {
+        juce::AudioSourceChannelInfo ri(&refBuf_, 0, info.numSamples);
+        refTransport_.getNextAudioBlock(ri);
+        const float g = refGain_;
+        const float step = 1.0f / float(juce::jmax(1.0, rate_ * 0.010));
+        for (int i = 0; i < info.numSamples; ++i) {
+            refMix_ = target > refMix_ ? juce::jmin(target, refMix_ + step) : juce::jmax(target, refMix_ - step);
+            for (int ch = 0; ch < juce::jmin(2, info.buffer->getNumChannels()); ++ch) {
+                auto* d = info.buffer->getWritePointer(ch, info.startSample);
+                d[i] = d[i] * (1.0f - refMix_) + refBuf_.getSample(ch, i) * g * refMix_;
+            }
+        }
+    } else if (haveRef) {
+        // Keep the reference's clock running while not heard, so A/B stays in step.
+        juce::AudioSourceChannelInfo ri(&refBuf_, 0, info.numSamples);
+        refTransport_.getNextAudioBlock(ri);
+    }
     if (transport_.isPlaying()) tap_.push(*info.buffer, info.startSample, info.numSamples);
 }
 

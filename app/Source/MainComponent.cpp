@@ -203,7 +203,7 @@ MainComponent::MainComponent() {
     homeBtn_.onClick = [this] { engine_.setPositionSeconds(0); meters_->reset(); };
     pluginsBtn_.onClick = [this] { showPluginMenu(); };
     exportBtn_.onClick = [this] { showExportMenu(); };
-    analyseBtn_.onClick = [this] { analyse(); };
+    analyseBtn_.onClick = [this] { runAnalysis(); };
     verifyBtn_.onClick = [this] { verifyDdp(); };
     audioBtn_.onClick = [this] { showAudioSettings(); };
     zoomIn_.onClick = [this] { timeline_.zoomBy(1.5, engine_.positionSeconds()); };
@@ -235,6 +235,10 @@ MainComponent::MainComponent() {
     timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
     timeline_.onCrossfade = [this](int a, int b) { openCrossfade(a, b); };
     timeline_.onRegionFx = [this](int id) { openRegionFx(id); };
+    timeline_.onProblemClicked = [this](double t) { engine_.setPositionSeconds(juce::jmax(0.0, t - 1.0)); };
+    abDisplay_.setFont(juce::FontOptions(14.0f, juce::Font::bold));
+    abDisplay_.setColour(juce::Label::textColourId, colours::accent);
+    addAndMakeVisible(abDisplay_);
     timeline_.onMarkerSelected = [this](int id) {
         for (int i = 0; i < session_.markers.size(); ++i)
             if (session_.markers[i].id == id) { pqList_.selectRow(i); break; }
@@ -400,6 +404,7 @@ void MainComponent::resized() {
         b->setBounds(transport.removeFromRight(b == &xfadeBtn_ ? 86 : 64).reduced(0, 3));
         transport.removeFromRight(3);
     }
+    abDisplay_.setBounds(transport.removeFromLeft(juce::jmin(260, transport.getWidth() / 2)));
     selDisplay_.setBounds(transport.removeFromLeft(transport.getWidth() / 2));
     rateWarning_.setBounds(transport);
 
@@ -432,6 +437,10 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::selectRegionRange:
         case cmd::regionEffects: info.setActive(timeline_.selectedRegion() != 0); break;
         case cmd::bypassRegionFx: info.setTicked(engine_.regionFx().bypassAll()); break;
+        case cmd::listenReference: info.setTicked(engine_.listeningToReference()); info.setActive(engine_.hasReference()); break;
+        case cmd::compareUnprocessed: info.setTicked(compare_); break;
+        case cmd::toggleLoudness: info.setTicked(timeline_.showLoudness()); break;
+        case cmd::showAnalysis: info.setActive(analysis_ != nullptr); break;
         default: break;
     }
 }
@@ -504,7 +513,15 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::toggleEnvelope: envBtn_.triggerClick(); break;
         case cmd::toggleSnap: snapBtn_.triggerClick(); break;
         case cmd::crossfadeEditor: xfadeBtn_.onClick(); break;
-        case cmd::analyse: analyse(); break;
+        case cmd::analyse: runAnalysis(); break;
+        case cmd::showAnalysis: showAnalysisWindow(); break;
+        case cmd::references: showReferences(); break;
+        case cmd::listenReference:
+            if (engine_.hasReference()) engine_.setListenToReference(!engine_.listeningToReference());
+            else showReferences();
+            break;
+        case cmd::compareUnprocessed: toggleCompareUnprocessed(); break;
+        case cmd::toggleLoudness: timeline_.setShowLoudness(!timeline_.showLoudness()); break;
         case cmd::verifyDdp: verifyDdp(); break;
         case cmd::nullTest: runNullTest(); break;
         case cmd::pluginManager: showPluginScanner(); break;
@@ -553,16 +570,20 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
         case 2:
             add({cmd::playStop, cmd::playSource, cmd::playSourceInOut, cmd::playSelection, cmd::returnToStart});
             m.addSeparator();
+            add({cmd::listenReference, cmd::compareUnprocessed});
+            m.addSeparator();
             add({cmd::locateBackFrame, cmd::locateFwdFrame, cmd::locateBackSecond, cmd::locateFwdSecond, cmd::prevMarker, cmd::nextMarker});
             break;
         case 3: add({cmd::addTrackMarker, cmd::addIndexMarker, cmd::addPauseMarker, cmd::addEndMarker}); break;
         case 4:
             add({cmd::zoomIn, cmd::zoomOut, cmd::zoomFit});
             m.addSeparator();
-            add({cmd::toggleEnvelope, cmd::toggleSnap, cmd::crossfadeEditor});
+            add({cmd::toggleEnvelope, cmd::toggleSnap, cmd::crossfadeEditor, cmd::toggleLoudness});
             break;
         case 5:
-            add({cmd::analyse, cmd::verifyDdp, cmd::nullTest});
+            add({cmd::analyse, cmd::showAnalysis, cmd::references});
+            m.addSeparator();
+            add({cmd::verifyDdp, cmd::nullTest});
             m.addSeparator();
             add({cmd::pluginManager, cmd::audioSetup, cmd::followProjectRate});
             break;
@@ -781,6 +802,344 @@ void MainComponent::showBatchDialog() {
     };
 }
 
+// ---------------------------------------------------------------- analysis, references, A/B
+
+namespace {
+class AnalysisView : public juce::Component, private juce::ListBoxModel {
+public:
+    AnalysisView(std::shared_ptr<dsp::AnalysisResult> a, std::function<void(double)> locate) : a_(std::move(a)), locate_(std::move(locate)) {
+        summary_.setMultiLine(true);
+        summary_.setReadOnly(true);
+        summary_.setFont(juce::FontOptions(juce::Font::getDefaultMonospacedFontName(), 12.5f, juce::Font::plain));
+        auto s = juce::String(a_->summary());
+        summary_.setText(s.upToFirstOccurrenceOf("PROBLEMS:", false, false).trimEnd());
+        addAndMakeVisible(summary_);
+        list_.setRowHeight(22);
+        list_.setColour(juce::ListBox::backgroundColourId, colours::panel);
+        addAndMakeVisible(list_);
+        header_.setText(juce::String(int(a_->problems.size())) + " problem(s). Double-click one to go there.", juce::dontSendNotification);
+        header_.setColour(juce::Label::textColourId, colours::text);
+        addAndMakeVisible(header_);
+        setSize(820, 600);
+    }
+    void resized() override {
+        auto r = getLocalBounds().reduced(8);
+        summary_.setBounds(r.removeFromTop(r.getHeight() / 2));
+        r.removeFromTop(6);
+        header_.setBounds(r.removeFromTop(22));
+        list_.setBounds(r);
+    }
+private:
+    int getNumRows() override { return int(a_->problems.size()); }
+    void paintListBoxItem(int row, juce::Graphics& g, int w, int h, bool selected) override {
+        auto& p = a_->problems[size_t(row)];
+        g.fillAll(selected ? colours::accent.withAlpha(0.25f) : colours::panel);
+        g.setColour(p.severe ? colours::error : colours::accent);
+        g.fillEllipse(8, float(h) / 2 - 4, 8, 8);
+        g.setColour(colours::text);
+        g.setFont(13.0f);
+        g.drawText(msfString(p.start), 24, 0, 80, h, juce::Justification::centredLeft);
+        g.drawText(p.track ? "Track " + juce::String(p.track) : juce::String("-"), 110, 0, 70, h, juce::Justification::centredLeft);
+        g.drawText(juce::String(p.describe()), 186, 0, w - 190, h, juce::Justification::centredLeft);
+    }
+    void listBoxItemDoubleClicked(int row, const juce::MouseEvent&) override { if (locate_) locate_(a_->problems[size_t(row)].start); }
+
+    std::shared_ptr<dsp::AnalysisResult> a_;
+    std::function<void(double)> locate_;
+    juce::TextEditor summary_;
+    juce::Label header_;
+    juce::ListBox list_{"Problems", this};
+};
+
+class ReferencePanel : public juce::Component, private juce::ListBoxModel, private juce::Timer {
+public:
+    ReferencePanel(Session& s, AudioEngine& e, std::function<void(int)> select, std::function<void()> add, std::function<void(int)> remove,
+                   std::function<void()> changed, std::function<juce::String()> status)
+        : s_(s), e_(e), select_(std::move(select)), add_(std::move(add)), remove_(std::move(remove)), changed_(std::move(changed)),
+          status_(std::move(status)) {
+        list_.setRowHeight(24);
+        list_.setColour(juce::ListBox::backgroundColourId, colours::panel);
+        addAndMakeVisible(list_);
+        for (auto* b : {&addBtn_, &removeBtn_, &abBtn_}) { styleButton(*b, b == &abBtn_); addAndMakeVisible(*b); }
+        match_.setButtonText("Level-match to the master (integrated loudness)");
+        match_.setColour(juce::ToggleButton::textColourId, colours::text);
+        match_.setToggleState(s_.levelMatchReference, juce::dontSendNotification);
+        addAndMakeVisible(match_);
+        trim_.setSliderStyle(juce::Slider::LinearHorizontal);
+        trim_.setTextBoxStyle(juce::Slider::TextBoxRight, false, 70, 20);
+        trim_.setRange(-12.0, 12.0, 0.1);
+        trim_.setTextValueSuffix(" dB");
+        addAndMakeVisible(trim_);
+        trimLbl_.setText("Trim", juce::dontSendNotification);
+        trimLbl_.setColour(juce::Label::textColourId, colours::dim);
+        addAndMakeVisible(trimLbl_);
+        info_.setColour(juce::Label::textColourId, colours::text);
+        info_.setJustificationType(juce::Justification::topLeft);
+        addAndMakeVisible(info_);
+        addBtn_.onClick = [this] { if (add_) add_(); };
+        removeBtn_.onClick = [this] { int r = list_.getSelectedRow(); if (r >= 0 && remove_) remove_(r); };
+        abBtn_.onClick = [this] { e_.setListenToReference(!e_.listeningToReference()); };
+        match_.onClick = [this] { s_.levelMatchReference = match_.getToggleState(); if (changed_) changed_(); };
+        trim_.onValueChange = [this] {
+            if (juce::isPositiveAndBelow(s_.activeReference, s_.references.size())) {
+                s_.references.getReference(s_.activeReference).trimDb = trim_.getValue();
+                if (changed_) changed_();
+            }
+        };
+        refresh();
+        startTimerHz(10);
+        setSize(560, 400);
+    }
+    void refresh() {
+        list_.updateContent();
+        list_.selectRow(s_.activeReference, true, true);
+        if (juce::isPositiveAndBelow(s_.activeReference, s_.references.size()))
+            trim_.setValue(s_.references[s_.activeReference].trimDb, juce::dontSendNotification);
+        repaint();
+    }
+    void paint(juce::Graphics& g) override {
+        g.fillAll(colours::bg);
+        // Reference position bar: click to move the reference playhead.
+        auto bar = posBar();
+        g.setColour(colours::panel2);
+        g.fillRoundedRectangle(bar.toFloat(), 3);
+        if (e_.hasReference() && e_.referenceLength() > 0) {
+            float f = float(e_.referencePosition() / e_.referenceLength());
+            g.setColour(colours::accent);
+            g.fillRoundedRectangle(bar.toFloat().withWidth(bar.getWidth() * f), 3);
+            g.setColour(colours::text);
+            g.setFont(11.0f);
+            g.drawText(msfString(e_.referencePosition()) + " / " + msfString(e_.referenceLength()), bar, juce::Justification::centred);
+        }
+    }
+    void mouseDown(const juce::MouseEvent& ev) override {
+        auto bar = posBar();
+        if (bar.contains(ev.getPosition()) && e_.hasReference())
+            e_.setReferencePosition(e_.referenceLength() * double(ev.x - bar.getX()) / bar.getWidth());
+    }
+    void resized() override {
+        auto r = getLocalBounds().reduced(10);
+        auto top = r.removeFromTop(28);
+        addBtn_.setBounds(top.removeFromLeft(90));
+        top.removeFromLeft(6);
+        removeBtn_.setBounds(top.removeFromLeft(80));
+        abBtn_.setBounds(top.removeFromRight(170));
+        r.removeFromTop(8);
+        list_.setBounds(r.removeFromTop(150));
+        r.removeFromTop(8);
+        match_.setBounds(r.removeFromTop(24));
+        auto t = r.removeFromTop(26);
+        trimLbl_.setBounds(t.removeFromLeft(40));
+        trim_.setBounds(t);
+        r.removeFromTop(4);
+        bar_ = r.removeFromTop(18);
+        r.removeFromTop(8);
+        info_.setBounds(r);
+    }
+private:
+    juce::Rectangle<int> posBar() const { return bar_; }
+    int getNumRows() override { return s_.references.size(); }
+    void paintListBoxItem(int row, juce::Graphics& g, int w, int h, bool selected) override {
+        auto& r = s_.references.getReference(row);
+        g.fillAll(selected ? colours::accent.withAlpha(0.25f) : colours::panel);
+        g.setColour(r.file.existsAsFile() ? colours::text : colours::error);
+        g.setFont(13.0f);
+        g.drawText(r.name, 8, 0, w - 120, h, juce::Justification::centredLeft);
+        g.setColour(colours::dim);
+        g.drawText(r.lufs > -999 ? juce::String(r.lufs, 1) + " LUFS" : juce::String("measuring..."), w - 110, 0, 100, h, juce::Justification::centredRight);
+    }
+    void selectedRowsChanged(int row) override { if (row >= 0 && row != s_.activeReference && select_) select_(row); }
+    void timerCallback() override {
+        abBtn_.setButtonText(e_.listeningToReference() ? "Hearing REFERENCE (Q)" : "Hearing MASTER (Q)");
+        abBtn_.setToggleState(e_.listeningToReference(), juce::dontSendNotification);
+        if (status_) info_.setText(status_(), juce::dontSendNotification);
+        list_.repaint();
+        repaint(bar_);
+    }
+    Session& s_;
+    AudioEngine& e_;
+    std::function<void(int)> select_;
+    std::function<void()> add_;
+    std::function<void(int)> remove_;
+    std::function<void()> changed_;
+    std::function<juce::String()> status_;
+    juce::ListBox list_{"References", this};
+    juce::TextButton addBtn_{"Add..."}, removeBtn_{"Remove"}, abBtn_{"Hearing MASTER (Q)"};
+    juce::ToggleButton match_;
+    juce::Slider trim_;
+    juce::Label trimLbl_, info_;
+    juce::Rectangle<int> bar_;
+};
+
+class PlainWindow : public juce::DocumentWindow {
+public:
+    PlainWindow(juce::Component* c, const juce::String& title, bool onTop) : DocumentWindow(title, colours::bg, DocumentWindow::closeButton) {
+        setUsingNativeTitleBar(true);
+        setContentOwned(c, true);
+        setResizable(true, false);
+        centreWithSize(getWidth(), getHeight());
+        setAlwaysOnTop(onTop);
+        setVisible(true);
+    }
+    std::function<void()> onClose;
+    void closeButtonPressed() override { if (onClose) onClose(); }
+};
+}  // namespace
+
+double MainComponent::masterLoudnessAt(double t) const {
+    if (!analysis_) return -INFINITY;
+    for (auto& tr : analysis_->tracks)
+        if (t >= tr.start && t < tr.end && std::isfinite(tr.lufs)) return tr.lufs;
+    return analysis_->lufs;
+}
+
+double MainComponent::referenceGainDb(juce::String* explain) const {
+    if (!juce::isPositiveAndBelow(session_.activeReference, session_.references.size())) return 0;
+    auto& r = session_.references.getReference(session_.activeReference);
+    double g = r.trimDb;
+    if (!session_.levelMatchReference) { if (explain) *explain = "Level match off"; return g; }
+    double m = masterLoudnessAt(engine_.positionSeconds());
+    if (!std::isfinite(m) || r.lufs < -999) {
+        if (explain) *explain = r.lufs < -999 ? "Measuring the reference..." : "Analyse the master (Cmd+Shift+A) to level-match";
+        return g;
+    }
+    if (explain) *explain = "Reference " + juce::String(r.lufs, 1) + " LUFS, master here " + juce::String(m, 1) + " LUFS";
+    return g + (m - r.lufs);
+}
+
+void MainComponent::runAnalysis() {
+    if (session_.regions.isEmpty()) return;
+    engine_.regionFx().syncAndCapture(session_);
+    auto snapshot = std::make_shared<Session>(session_);
+    auto es = exportSettings();
+    auto proc = std::make_shared<dsp::AnalysisResult>();
+    auto raw = std::make_shared<dsp::AnalysisResult>();
+    auto err = std::make_shared<juce::String>();
+    runJob("Analysing the master and the unprocessed mix...",
+           [this, snapshot, es, proc, raw, err](Job& j) { *err = exporter_.analyseProgram(*snapshot, es, [&](double p) { return j.keep(p); }, *proc, raw.get()); },
+           [this, proc, raw, err](bool) {
+               if (err->isNotEmpty()) { juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Analyse", *err); return; }
+               analysis_ = proc;
+               rawAnalysis_ = raw;
+               analysisStale_ = false;
+               timeline_.setAnalysis(proc, raw);
+               timeline_.setShowLoudness(true);
+               commands_.commandStatusChanged();
+               if (compare_) engine_.setCompareUnprocessed(true, analysis_->lufs - rawAnalysis_->lufs);
+               showAnalysisWindow();
+           });
+}
+
+void MainComponent::showAnalysisWindow() {
+    if (!analysis_) return;
+    auto* v = new AnalysisView(analysis_, [this](double t) { engine_.setPositionSeconds(juce::jmax(0.0, t - 1.0)); });
+    auto title = juce::String("Analysis") + (analysisStale_ ? " (out of date: the session changed since)" : "");
+    auto* w = new PlainWindow(v, title, false);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { analysisWindow_.reset(); }); };
+    analysisWindow_.reset(w);
+}
+
+void MainComponent::measureReference(int index) {
+    if (!juce::isPositiveAndBelow(index, session_.references.size())) return;
+    auto file = session_.references[index].file;
+    auto result = std::make_shared<double>(-1000.0);
+    juce::Component::SafePointer<MainComponent> safe(this);
+    juce::Thread::launch([safe, file, index, result] {
+        juce::AudioFormatManager fm;   // own manager: this thread may outlive a window close
+        fm.registerBasicFormats();
+        std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(file));
+        if (r) {
+            dsp::LoudnessMeter m;
+            m.prepare(r->sampleRate, 2);
+            juce::AudioBuffer<float> b(2, 65536);
+            for (juce::int64 p = 0; p < r->lengthInSamples; p += 65536) {
+                int n = int(juce::jmin<juce::int64>(65536, r->lengthInSamples - p));
+                r->read(&b, 0, n, p, true, true);
+                if (r->numChannels == 1) b.copyFrom(1, 0, b, 0, 0, n);
+                const float* ch[2] = {b.getReadPointer(0), b.getReadPointer(1)};
+                m.process(ch, n);
+            }
+            *result = m.integratedLufs();
+        }
+        juce::MessageManager::callAsync([safe, index, file, result] {
+            if (!safe) return;
+            auto& refs = safe->session_.references;
+            if (juce::isPositiveAndBelow(index, refs.size()) && refs[index].file == file) {
+                refs.getReference(index).lufs = std::isfinite(*result) ? *result : -100.0;
+                safe->sessionChanged(false);
+            }
+        });
+    });
+}
+
+void MainComponent::selectReference(int index) {
+    if (!juce::isPositiveAndBelow(index, session_.references.size())) return;
+    session_.activeReference = index;
+    if (!engine_.loadReference(session_.references[index].file))
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Reference", "Couldn't open " + session_.references[index].file.getFullPathName());
+    sessionChanged(false);
+}
+
+void MainComponent::showReferences() {
+    juce::Component::SafePointer<MainComponent> safe(this);
+    auto* panel = new ReferencePanel(
+        session_, engine_, [this](int i) { selectReference(i); },
+        [this, safe] {
+            chooser_ = std::make_unique<juce::FileChooser>("Add reference tracks", juce::File(), engine_.formats().getWildcardForAllFormats());
+            chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectMultipleItems, [this, safe](const juce::FileChooser& fc) {
+                if (!safe) return;
+                for (auto& f : fc.getResults()) {
+                    Reference r;
+                    r.file = f;
+                    r.name = f.getFileNameWithoutExtension();
+                    session_.references.add(r);
+                    measureReference(session_.references.size() - 1);
+                }
+                if (session_.activeReference < 0 && !session_.references.isEmpty()) selectReference(0);
+                sessionChanged(false);
+                if (refWindow_) if (auto* p = dynamic_cast<ReferencePanel*>(refWindow_->getContentComponent())) p->refresh();
+            });
+        },
+        [this](int i) {
+            session_.references.remove(i);
+            if (session_.activeReference == i) { session_.activeReference = -1; engine_.clearReference(); }
+            else if (session_.activeReference > i) --session_.activeReference;
+            sessionChanged(false);
+            if (refWindow_) if (auto* p = dynamic_cast<ReferencePanel*>(refWindow_->getContentComponent())) p->refresh();
+        },
+        [this] { sessionChanged(false); },
+        [this] {
+            juce::String why;
+            double g = referenceGainDb(&why);
+            juce::String s;
+            if (session_.activeReference < 0) return juce::String("Add a reference and select it. Press Q (or the button) to switch between it and the master; both keep playing so you hear the same moment.");
+            s << why << "\nApplied to the reference: " << (g >= 0 ? "+" : "") << juce::String(g, 1) << " dB";
+            s << "\n\nThe reference plays without your master chain. Use W to hear your own mix unprocessed, level-matched.";
+            return s;
+        });
+    auto* w = new PlainWindow(panel, "References", true);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { refWindow_.reset(); }); };
+    refWindow_.reset(w);
+    if (session_.activeReference >= 0 && !engine_.hasReference()) selectReference(session_.activeReference);
+}
+
+void MainComponent::toggleCompareUnprocessed() {
+    compare_ = !compare_;
+    auto& bank = engine_.regionFx();
+    if (compare_) {
+        compareRestoreRegionBypass_ = bank.bypassAll();
+        bank.setBypassAll(true);
+        double match = (analysis_ && rawAnalysis_ && std::isfinite(analysis_->lufs) && std::isfinite(rawAnalysis_->lufs))
+                           ? analysis_->lufs - rawAnalysis_->lufs : 0.0;
+        engine_.setCompareUnprocessed(true, match);
+    } else {
+        bank.setBypassAll(compareRestoreRegionBypass_);
+        engine_.setCompareUnprocessed(false, 0.0);
+    }
+    engine_.loadSession(session_);   // region effects change latency, so re-time playback
+    commands_.commandStatusChanged();
+}
+
 void MainComponent::jumpToMarker(int dir) {
     double pos = engine_.positionSeconds();
     double best = dir < 0 ? -1.0 : 1e12;
@@ -838,6 +1197,7 @@ void MainComponent::sessionChanged(bool undoable) {
     }
     lastState_ = now;
     dirty_ = true;
+    if (analysis_ && !analysisStale_) { analysisStale_ = true; timeline_.setAnalysisStale(true); }
     applyFollowRate();
     engine_.loadSession(session_);
     timeline_.sessionUpdated();
@@ -903,6 +1263,13 @@ void MainComponent::refreshAll() {
 
 void MainComponent::newSession() {
     engine_.stop();
+    engine_.clearReference();
+    analysis_.reset();
+    rawAnalysis_.reset();
+    timeline_.setAnalysis(nullptr, nullptr);
+    if (compare_) toggleCompareUnprocessed();
+    refWindow_.reset();
+    analysisWindow_.reset();
     session_ = Session();
     juce::StringArray problems;
     engine_.chain().setState({}, problems);
@@ -922,9 +1289,17 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
         return false;
     }
     engine_.stop();
+    engine_.clearReference();
+    analysis_.reset();
+    rawAnalysis_.reset();
+    timeline_.setAnalysis(nullptr, nullptr);
+    if (compare_) toggleCompareUnprocessed();
+    refWindow_.reset();
+    analysisWindow_.reset();
     session_ = s;
     juce::StringArray problems;
     engine_.chain().setState(session_.pluginChainState, problems);
+    if (session_.activeReference >= 0) engine_.loadReference(session_.references[session_.activeReference].file);
     juce::StringArray missing;
     for (auto& r : session_.regions)
         if (!r.file.existsAsFile()) missing.addIfNotAlreadyThere(r.file.getFullPathName());
@@ -1473,6 +1848,18 @@ void MainComponent::timerCallback() {
                                                               "  (" + msfString(sel.getLength()) + ")",
                         juce::dontSendNotification);
     playBtn_.setButtonText(engine_.isPlaying() ? "Stop" : "Play");
+    {
+        juce::String why;
+        double g = referenceGainDb(&why);
+        engine_.setReferenceGainDb(g);
+        juce::String ab;
+        if (engine_.listeningToReference() && juce::isPositiveAndBelow(session_.activeReference, session_.references.size()))
+            ab = "REF: " + session_.references[session_.activeReference].name + "  " + (g >= 0 ? "+" : "") + juce::String(g, 1) + " dB";
+        else if (compare_)
+            ab = "UNPROCESSED" + juce::String(rawAnalysis_ && analysis_ && std::isfinite(rawAnalysis_->lufs) && std::isfinite(analysis_->lufs)
+                                                   ? "  (level-matched)" : "  (not level-matched)");
+        abDisplay_.setText(ab, juce::dontSendNotification);
+    }
     meters_->prepare(engine_.deviceRate());
     meters_->feed(engine_.meterTap());
 

@@ -26,7 +26,8 @@ enum : juce::CommandID {
     // View
     zoomIn = 0x1500, zoomOut, zoomFit, toggleEnvelope, toggleSnap, crossfadeEditor,
     // Tools
-    analyse = 0x1600, verifyDdp, nullTest, pluginManager, audioSetup, followProjectRate,
+    analyse = 0x1600, verifyDdp, nullTest, pluginManager, audioSetup, followProjectRate, showAnalysis, references,
+    listenReference, compareUnprocessed, toggleLoudness,
     // Help
     keyGuide = 0x1700, editKeyCommands,
 };
