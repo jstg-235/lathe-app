@@ -146,17 +146,20 @@ int main() {
         engine.play();
         juce::AudioBuffer<float> out(2, 512);
         double sumOut = 0;
-        for (int b = 0; b < 40; ++b) {   // ~0.46 s; the 10 ms ramp is long done
+        int measured = 0;
+        for (int b = 0; b < 60; ++b) {
+            // Pace the blocks like a real device so the read-ahead thread keeps up.
+            juce::Thread::sleep(b < 8 ? 60 : 5);
             out.clear();
             juce::AudioSourceChannelInfo info(&out, 0, 512);
             engine.getNextAudioBlock(info);
-            if (b > 10) sumOut += out.getRMSLevel(0, 0, 512);
+            if (b > 20) { sumOut += out.getRMSLevel(0, 0, 512); ++measured; }
         }
         std::unique_ptr<juce::AudioFormatReader> rr(fm.createReaderFor(ref));
         juce::AudioBuffer<float> src(2, 44100);
         rr->read(&src, 0, 44100, 0, true, true);
         double srcRms = src.getRMSLevel(0, 0, 44100);
-        double ratio = (sumOut / 29.0) / srcRms;
+        double ratio = (sumOut / measured) / srcRms;
         std::printf("reference A/B level ratio %.3f (expect 0.500)\n", ratio);
         CHECK(std::abs(ratio - 0.5) < 0.05);
         engine.setListenToReference(false);
