@@ -259,6 +259,20 @@ static void testDither() {
     NEAR(errMean, 0.0, 0.05);   // unbiased
     NEAR(errSq, 0.25, 0.08);    // TPDF + rounding: 1/12 + 2/12 ≈ 0.25 LSB²
 
+    // Already-16-bit audio and digital silence pass through untouched (every shape).
+    for (auto sh : {dsp::Ditherer::Shape::None, dsp::Ditherer::Shape::Psycho}) {
+        dsp::Ditherer d2;
+        d2.prepare(2, 16, sh, 7, 44100);
+        std::vector<float> a16(4096), b16(4096);
+        for (size_t i = 0; i < a16.size(); ++i) { a16[i] = float(int((i * 37) % 2001) - 1000) / 32768.0f; b16[i] = 0.0f; }
+        const float* p16[2] = {a16.data(), b16.data()};
+        std::vector<int16_t> o16(8192);
+        d2.process16(p16, 4096, o16.data());
+        bool exact = true;
+        for (size_t i = 0; i < a16.size(); ++i) exact &= o16[i * 2] == int(std::lround(a16[i] * 32768.0)) && o16[i * 2 + 1] == 0;
+        CHECK(exact);
+    }
+
     // Full-scale input must clamp, never wrap.
     std::vector<float> hot(64, 1.5f), neg(64, -1.5f);
     const float* hp[2] = {hot.data(), neg.data()};

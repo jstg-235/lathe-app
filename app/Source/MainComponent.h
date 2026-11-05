@@ -2,6 +2,9 @@
 
 #include "AudioEngine.h"
 #include "ChainPanel.h"
+#include "ControlSurface.h"
+#include "DdpFormat.h"
+#include "DdpPlayer.h"
 #include "Commands.h"
 #include "EditPanels.h"
 #include "Exporter.h"
@@ -106,6 +109,13 @@ private:
     void saveKeyMappings();
     void openRegionFx(int regionId);
     void runAnalysis();
+    void openDdpPlayer();
+    void showRecordDialog();
+    void showControlSurfaces();
+    void beginRecording();
+    void finishRecording();
+    juce::File recordingsFolder() const;
+    void openDdpAsSession(const juce::File& folder);
     void showAnalysisWindow();
     void showReferences();
     void selectReference(int index);
@@ -154,8 +164,17 @@ private:
     std::shared_ptr<dsp::AnalysisResult> analysis_, rawAnalysis_;
     bool analysisStale_ = false;
     bool compare_ = false, compareRestoreRegionBypass_ = false;
-    std::unique_ptr<juce::DocumentWindow> refWindow_, analysisWindow_;
+    std::unique_ptr<juce::DocumentWindow> refWindow_, analysisWindow_, playerWindow_;
     juce::Label abDisplay_;
+    juce::TextButton recordBtn_{"Rec"};
+    struct RecSettings {
+        int firstInput = 0, bits = 24, extraLatency = 0, measured = -1;
+        bool print = true, autoPunch = false, muteSources = true;
+    } rec_;
+    juce::File recFile_;
+    juce::Range<double> recPunch_;
+    std::unique_ptr<juce::DocumentWindow> recWindow_, surfaceWindow_;
+    std::unique_ptr<ControlSurface> surface_;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

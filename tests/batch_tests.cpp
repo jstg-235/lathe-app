@@ -1,5 +1,7 @@
 // End-to-end batch render: DDP + WAV/FLAC 16/44.1 + hi-res, then checks that the 16-bit
 // track files are bit-identical to the DDP image and the tags are present.
+#include "../app/Source/ControlSurface.h"
+#include "../app/Source/DdpFormat.h"
 #include "../app/Source/Exporter.h"
 #include "../core/util/FlacTags.h"
 
@@ -22,6 +24,17 @@ static juce::File noiseFile(const juce::File& dir, const juce::String& name, dou
     w->writeFromAudioSampleBuffer(b, 0, b.getNumSamples());
     return f;
 }
+
+// Records which commands a control surface triggers.
+struct CommandSpy : juce::ApplicationCommandTarget {
+    juce::Array<juce::CommandID> fired;
+    juce::ApplicationCommandTarget* getNextCommandTarget() override { return nullptr; }
+    void getAllCommands(juce::Array<juce::CommandID>& ids) override { for (auto& d : allCommands()) ids.add(d.id); }
+    void getCommandInfo(juce::CommandID id, juce::ApplicationCommandInfo& info) override {
+        if (auto* d = findCommand(id)) info.setInfo(d->name, d->description, d->category, 0);
+    }
+    bool perform(const InvocationInfo& i) override { fired.add(i.commandID); return true; }
+};
 
 int main() {
     juce::ScopedJuceInitialiser_GUI gui;
@@ -116,6 +129,141 @@ int main() {
         auto report = out.getChildFile("Render Report.txt").loadFileAsString();
         CHECK(report.contains("written and verified") && report.contains("IMAGE.DAT") && report.contains("Integrated loudness"));
     }
+    // ---- Control surface: Mackie defaults, jog, MIDI learn, HUI zone/port learn.
+    {
+        CommandSpy spy;
+        juce::ApplicationCommandManager cm;
+        cm.registerAllCommandsForTarget(&spy);
+        cm.setFirstCommandTarget(&spy);
+        juce::PropertiesFile::Options po;
+        po.applicationName = "LatheTest";
+        po.filenameSuffix = ".settings";
+        juce::PropertiesFile props(dir.getChildFile("surface.settings"), po);
+        ControlSurface cs(cm, props);
+        double jogged = 0;
+        cs.jog = [&](double d) { jogged += d; };
+        cs.isPlaying = [] { return true; };
+        cs.handle(juce::MidiMessage::noteOn(1, 0x5E, juce::uint8(127)));   // Play
+        cs.handle(juce::MidiMessage::noteOn(1, 0x5E, juce::uint8(0)));     // release: ignored
+        cs.handle(juce::MidiMessage::noteOn(1, 0x54, juce::uint8(127)));   // Marker
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x3C, 3));         // jog +3
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x3C, 0x42));      // jog -2
+        CHECK(spy.fired.size() == 2 && spy.fired[0] == cmd::playStop && spy.fired[1] == cmd::addTrackMarker);
+        CHECK(std::abs(jogged - 1.0 / 75.0) < 1e-9);
+        cs.learn(cmd::analyse);
+        cs.handle(juce::MidiMessage::controllerEvent(2, 20, 127));         // learned, not fired
+        CHECK(spy.fired.size() == 2 && cs.mappingFor(cmd::analyse).contains("CC 20"));
+        cs.handle(juce::MidiMessage::controllerEvent(2, 20, 127));
+        CHECK(spy.fired.getLast() == cmd::analyse);
+        // HUI: zone 0x0E, port 3 press (0x43) / release (0x03).
+        cs.configure({}, {}, ControlSurface::Protocol::Hui);
+        cs.learn(cmd::exportDdp);
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x0F, 0x0E));
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x2F, 0x43));
+        CHECK(cs.mappingFor(cmd::exportDdp).contains("zone 14 port 3"));
+        int before = spy.fired.size();
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x0F, 0x0E));
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x2F, 0x03));      // release: nothing
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x0F, 0x0E));
+        cs.handle(juce::MidiMessage::controllerEvent(1, 0x2F, 0x43));      // press: export
+        CHECK(spy.fired.size() == before + 1 && spy.fired.getLast() == cmd::exportDdp);
+        // Mappings persist.
+        ControlSurface cs2(cm, props);
+        CHECK(cs2.mappingFor(cmd::analyse).contains("CC 20"));
+        std::printf("control surface: %d commands fired\n", spy.fired.size());
+    }
+
+    // ---- DDP round trip: render -> open as session -> re-export is bit-identical, PQ preserved.
+    {
+        auto a = noiseFile(dir, "rt_a.wav", 44100, 5.0, 21);
+        auto b = noiseFile(dir, "rt_b.wav", 44100, 6.0, 22);
+        Session s;
+        s.discTitle = "Round Trip";
+        s.upcEan = "0123456789012";
+        for (auto& f : {a, b}) {
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(f));
+            s.append(s.makeRegion(f, r->sampleRate, r->lengthInSamples), 2.0);
+        }
+        s.addMarker(Marker::Index, 4.0);
+        s.markers.getReference(0).isrc = "USABC2600009";
+        Exporter ex(engine);
+        BatchSettings bs;
+        bs.ddp = true; bs.wav16 = bs.flac16 = bs.wavHi = bs.flacHi = bs.programme = false;
+        ExportSettings es;
+        es.shape = dsp::Ditherer::Shape::Psycho;
+        auto first = dir.getChildFile("rt1");
+        CHECK(ex.batchRender(s, bs, first, es, [](double) { return true; }).ok);
+
+        Session imported;
+        juce::String err;
+        juce::StringArray notes;
+        CHECK(sessionFromDdp(first.getChildFile("DDP"), imported, err, notes));
+        auto d1 = s.toDisc(), d2 = imported.toDisc();
+        CHECK(d2.tracks.size() == d1.tracks.size());
+        bool pqSame = d1.leadOutSector == d2.leadOutSector && d2.upcEan == d1.upcEan;
+        for (size_t t = 0; t < d1.tracks.size() && t < d2.tracks.size(); ++t) {
+            pqSame &= d1.tracks[t].indexes.size() == d2.tracks[t].indexes.size() && d1.tracks[t].isrc == d2.tracks[t].isrc;
+            for (size_t k = 0; k < d1.tracks[t].indexes.size() && k < d2.tracks[t].indexes.size(); ++k)
+                pqSame &= d1.tracks[t].indexes[k].sector == d2.tracks[t].indexes[k].sector && d1.tracks[t].indexes[k].number == d2.tracks[t].indexes[k].number;
+        }
+        CHECK(pqSame);
+        // The image plays through the DDP format reader.
+        std::unique_ptr<juce::AudioFormatReader> img(fm.createReaderFor(first.getChildFile("DDP/IMAGE.DAT")));
+        CHECK(img && img->lengthInSamples == d1.leadOutSector * 588);
+
+        auto second = dir.getChildFile("rt2");
+        CHECK(ex.batchRender(imported, bs, second, es, [](double) { return true; }).ok);
+        juce::MemoryBlock m1, m2;
+        first.getChildFile("DDP/IMAGE.DAT").loadFileAsData(m1);
+        second.getChildFile("DDP/IMAGE.DAT").loadFileAsData(m2);
+        CHECK(m1.getSize() == m2.getSize() && m1 == m2);
+        std::printf("DDP round trip: %s, %d tracks\n", m1 == m2 ? "bit-identical re-export" : "IMAGE DIFFERS", int(d2.tracks.size()));
+    }
+
+    // ---- Recording: input in the callback buffer lands in the file, sample for sample.
+    {
+        engine.prepareToPlay(512, 44100);
+        auto rf = dir.getChildFile("rec.wav");
+        juce::String err;
+        CHECK(engine.startRecording(rf, 0, 32, false, err));
+        juce::AudioBuffer<float> io(2, 512);
+        for (int b = 0; b < 20; ++b) {
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 512; ++i) io.setSample(ch, i, float((b * 512 + i) % 1000) / 1000.0f * (ch ? -0.5f : 0.5f));
+            juce::AudioSourceChannelInfo info(&io, 0, 512);
+            engine.getNextAudioBlock(info);
+        }
+        engine.stopRecording();
+        std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(rf));
+        CHECK(r && r->lengthInSamples == 20 * 512);
+        if (r) {
+            juce::AudioBuffer<float> got(2, 10240);
+            r->read(&got, 0, 10240, 0, true, true);
+            bool same = true;
+            for (int i = 0; i < 10240; ++i) same &= got.getSample(0, i) == float(i % 1000) / 1000.0f * 0.5f && got.getSample(1, i) == float(i % 1000) / 1000.0f * -0.5f;
+            CHECK(same);
+        }
+
+        // Loopback latency test finds a simulated 300-sample round trip.
+        engine.startLatencyTest(0);
+        std::vector<float> line(300 + 512, 0.0f);
+        std::vector<float> history;
+        for (int b = 0; b < 120 && engine.latencyTestResult() < 0; ++b) {
+            juce::AudioBuffer<float> blk(2, 512);
+            for (int i = 0; i < 512; ++i) {
+                int k = int(history.size()) + i - 300;
+                float v = k >= 0 && k < int(history.size()) ? history[size_t(k)] : 0.0f;
+                blk.setSample(0, i, v);
+                blk.setSample(1, i, v);
+            }
+            juce::AudioSourceChannelInfo info(&blk, 0, 512);
+            engine.getNextAudioBlock(info);
+            for (int i = 0; i < 512; ++i) history.push_back(blk.getSample(0, i));
+        }
+        std::printf("latency test measured %d samples (simulated 300)\n", engine.latencyTestResult());
+        CHECK(engine.latencyTestResult() == 300);
+        engine.releaseResources();
+    }
+
     // ---- Programme analysis through the real master path (processed + unprocessed).
     {
         auto a = noiseFile(dir, "an.wav", 44100, 6.0, 9);

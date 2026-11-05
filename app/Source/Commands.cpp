@@ -52,6 +52,7 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::prevMarker, "Previous Marker", "Transport", "Jump to the previous PQ marker", "cursor up"},
         {cmd::nextMarker, "Next Marker", "Transport", "Jump to the next PQ marker", "cursor down"},
         {cmd::playSelection, "Play Destination In-Out", "Transport", "Play the selected destination range", "command + spacebar"},
+        {cmd::record, "Record / Stop Recording", "Transport", "Record the inputs, or print the session through outboard and record the return", "shift + R"},
         // Markers
         {cmd::addTrackMarker, "Add Track Marker", "Markers", "New CD track (index 01) at the playhead", "M"},
         {cmd::addIndexMarker, "Add Index Marker", "Markers", "New sub-index in the current track at the playhead", "shift + M"},
@@ -72,8 +73,11 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::listenReference, "A/B: Listen to Reference", "Transport", "Switch between the master and the active reference (level-matched, 10 ms crossfade)", "Q"},
         {cmd::compareUnprocessed, "A/B: Compare Unprocessed", "Transport", "Hear the mix without master and region effects, level-matched to the master", "W"},
         {cmd::verifyDdp, "Verify DDP...", "Tools", "Check a DDP folder's checksums and read back its PQ", "command + shift + V"},
+        {cmd::ddpPlayer, "DDP Player...", "Tools", "Play and check a finished DDP exactly as the plant will read it", "command + shift + P"},
+        {cmd::openDdpSession, "Open DDP as Session...", "File", "Turn a DDP back into an editable session (PQ, CD-Text, ISRC) for revisions", "command + option + O"},
         {cmd::nullTest, "Null Test / Compare Files...", "Tools", "Align two renders and measure exactly how they differ", "command + shift + N"},
         {cmd::pluginManager, "Plugin Manager...", "Tools", "Scan for and manage AU / VST3 plugins", ""},
+        {cmd::controlSurfaces, "Control Surfaces / MIDI...", "Tools", "Mackie Control, HUI and MIDI-learn for any command", ""},
         {cmd::audioSetup, "Audio Setup...", "Tools", "Choose the audio interface and buffer size", "command + ,"},
         {cmd::followProjectRate, "Follow Project Sample Rate", "Tools", "Switch the interface to the project's rate so playback is never resampled", ""},
         // Help

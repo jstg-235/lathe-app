@@ -1,4 +1,5 @@
 #include "AudioEngine.h"
+#include "DdpFormat.h"
 
 namespace lathe {
 
@@ -27,11 +28,13 @@ int MeterTap::pull(juce::AudioBuffer<float>& dst) {
 
 AudioEngine::AudioEngine() {
     formats_.registerBasicFormats();   // WAV, AIFF, FLAC, Ogg, CoreAudio formats on Mac
+    formats_.registerFormat(new DdpImageFormat(), false);   // IMAGE.DAT from DDP filesets
     readAhead_.startThread(juce::Thread::Priority::high);
     auto saved = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
                      .getChildFile("Lathe").getChildFile("audio-device.xml");
     auto xml = juce::XmlDocument::parse(saved);
-    devices_.initialise(0, 2, xml.get(), true);
+    devices_.initialise(2, 2, xml.get(), true);   // stereo in for recording / printing
+    writerThread_.startThread();
     player_.setSource(this);
     devices_.addAudioCallback(&player_);
 }
@@ -42,13 +45,17 @@ AudioEngine::~AudioEngine() {
         f.createDirectory();
         xml->writeTo(f.getChildFile("audio-device.xml"));
     }
+    stopRecording();
     devices_.removeAudioCallback(&player_);
     player_.setSource(nullptr);
+    writerThread_.stopThread(2000);
     transport_.setSource(nullptr);
     sourceTransport_.setSource(nullptr);
     sourceReader_.reset();
     refTransport_.setSource(nullptr);
     refReader_.reset();
+    playerTransport_.setSource(nullptr);
+    playerReader_.reset();
     buffered_.reset();
     program_.reset();
     readAhead_.stopThread(2000);
@@ -101,6 +108,105 @@ bool AudioEngine::loadReference(const juce::File& f) {
     return true;
 }
 
+int AudioEngine::numInputChannels() const {
+    auto* d = devices_.getCurrentAudioDevice();
+    return d ? d->getActiveInputChannels().countNumberOfSetBits() : 0;
+}
+
+juce::StringArray AudioEngine::inputPairNames() const {
+    juce::StringArray out;
+    auto* d = devices_.getCurrentAudioDevice();
+    if (!d) return out;
+    auto names = d->getInputChannelNames();
+    for (int i = 0; i + 1 < names.size(); i += 2) out.add(juce::String(i + 1) + "-" + juce::String(i + 2) + "  (" + names[i] + " / " + names[i + 1] + ")");
+    if (names.size() == 1) out.add("1 (mono: " + names[0] + ")");
+    return out;
+}
+
+int AudioEngine::reportedRoundTrip() const {
+    auto* d = devices_.getCurrentAudioDevice();
+    return d ? d->getOutputLatencyInSamples() + d->getInputLatencyInSamples() : 0;
+}
+
+bool AudioEngine::startRecording(const juce::File& file, int firstInput, int bits, bool withPlayback, juce::String& error) {
+    stopRecording();
+    auto* d = devices_.getCurrentAudioDevice();
+    // Make sure the requested inputs are switched on (skipped with no device, e.g. tests).
+    auto setup = devices_.getAudioDeviceSetup();
+    juce::BigInteger want;
+    want.setRange(firstInput, 2, true);
+    if (d && (setup.inputChannels & want) != want) {
+        setup.useDefaultInputChannels = false;
+        setup.inputChannels |= want;
+        auto err = devices_.setAudioDeviceSetup(setup, true);
+        if (err.isNotEmpty()) { error = err; return false; }
+    }
+    file.getParentDirectory().createDirectory();
+    file.deleteFile();
+    std::unique_ptr<juce::OutputStream> os(file.createOutputStream().release());
+    if (!os) { error = "Couldn't create " + file.getFullPathName(); return false; }
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), rate_, 2, bits, {}, 0));
+    if (!w) { error = "Couldn't create a " + juce::String(bits) + "-bit WAV writer."; return false; }
+    os.release();
+    {
+        const juce::ScopedLock sl(recLock_);
+        recWriter_ = std::make_unique<juce::AudioFormatWriter::ThreadedWriter>(w.release(), writerThread_, 1 << 19);
+    }
+    // Input channel index within the callback buffer: count active inputs below firstInput.
+    auto active = devices_.getAudioDeviceSetup().inputChannels;
+    int idx = 0;
+    for (int i = 0; i < firstInput; ++i) idx += active[i] ? 1 : 0;
+    recFirstInput_ = d ? idx : firstInput;
+    recSamples_ = 0;
+    recStart_ = transport_.getCurrentPosition();
+    recWithPlayback_ = withPlayback;
+    recording_ = true;
+    if (withPlayback) play();
+    return true;
+}
+
+void AudioEngine::stopRecording() {
+    if (!recording_ && !recWriter_) return;
+    recording_ = false;
+    if (recWithPlayback_) stop();
+    const juce::ScopedLock sl(recLock_);
+    recWriter_.reset();   // flushes the FIFO and finalises the WAV header
+}
+
+void AudioEngine::startLatencyTest(int firstInput) {
+    auto active = devices_.getAudioDeviceSetup().inputChannels;
+    int idx = 0;
+    for (int i = 0; i < firstInput; ++i) idx += active[i] ? 1 : 0;
+    latFirstInput_ = devices_.getCurrentAudioDevice() ? idx : firstInput;
+    latPos_ = 0;
+    latBest_ = -1;
+    latPeak_ = 0;
+    latResult_ = -1;
+    latState_ = 1;
+}
+
+bool AudioEngine::loadPlayer(const juce::File& image) {
+    auto* reader = formats_.createReaderFor(image);
+    if (!reader) return false;
+    double rate = reader->sampleRate;
+    auto src = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
+    const juce::ScopedLock sl(playerLock_);
+    playerTransport_.stop();
+    playerTransport_.setSource(nullptr);
+    playerReader_ = std::move(src);
+    playerTransport_.setSource(playerReader_.get(), int(rate * 2), &readAhead_, rate, 2);
+    playerTransport_.prepareToPlay(block_, rate_);
+    return true;
+}
+
+void AudioEngine::clearPlayer() {
+    const juce::ScopedLock sl(playerLock_);
+    playerTransport_.stop();
+    playerTransport_.setSource(nullptr);
+    playerReader_.reset();
+}
+
 void AudioEngine::clearReference() {
     listenRef_ = false;
     const juce::ScopedLock sl(refLock_);
@@ -133,6 +239,7 @@ juce::String AudioEngine::matchDeviceRate(double rate) {
 
 void AudioEngine::play() {
     sourceTransport_.stop();
+    playerTransport_.stop();
     if (transport_.getCurrentPosition() >= transport_.getLengthInSeconds() - 0.01) transport_.setPosition(0);
     transport_.start();
     if (refReader_) refTransport_.start();
@@ -161,8 +268,10 @@ void AudioEngine::prepareToPlay(int block, double rate) {
     transport_.prepareToPlay(block, rate);
     sourceTransport_.prepareToPlay(block, rate);
     refTransport_.prepareToPlay(block, rate);
+    playerTransport_.prepareToPlay(block, rate);
     sourceBuf_.setSize(2, juce::jmax(block, 8192));
     refBuf_.setSize(2, juce::jmax(block, 8192));
+    inBuf_.setSize(2, juce::jmax(block, 8192));
     chain_.prepare(rate, block);
     juce::ignoreUnused(rateChanged);   // the UI reloads the session when the device rate changes
 }
@@ -171,11 +280,66 @@ void AudioEngine::releaseResources() {
     transport_.releaseResources();
     sourceTransport_.releaseResources();
     refTransport_.releaseResources();
+    playerTransport_.releaseResources();
     chain_.release();
 }
 
 void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
+    // AudioSourcePlayer hands us the input channels in the buffer: capture them first.
+    const bool rec = recording_;
+    const int latState = latState_;
+    if ((rec || latState) && inBuf_.getNumSamples() >= info.numSamples) {
+        const int first = rec ? recFirstInput_.load() : latFirstInput_;
+        const int nch = info.buffer->getNumChannels();
+        for (int ch = 0; ch < 2; ++ch) {
+            int src = juce::jmin(first + ch, nch - 1);
+            if (src >= 0) inBuf_.copyFrom(ch, 0, *info.buffer, src, info.startSample, info.numSamples);
+            else inBuf_.clear(ch, 0, info.numSamples);
+        }
+    }
+    if (latState) {
+        // Click at 100 ms, listen for 1 s, report the loudest arrival.
+        info.clearActiveBufferRegion();
+        const int clickAt = int(rate_ * 0.1);
+        for (int i = 0; i < info.numSamples; ++i) {
+            int p = latPos_ + i;
+            if (p == clickAt)
+                for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch) info.buffer->setSample(ch, info.startSample + i, 0.5f);
+            float v = std::abs(inBuf_.getSample(0, i));
+            if (p > clickAt && v > latPeak_) { latPeak_ = v; latBest_ = p - clickAt; }
+        }
+        latPos_ += info.numSamples;
+        if (latPos_ > int(rate_ * 1.1)) {
+            latResult_ = latPeak_ > 0.01f ? latBest_ : 0;
+            latState_ = 0;
+        }
+        return;
+    }
+    if (rec) {
+        const juce::ScopedTryLock sl(recLock_);
+        if (sl.isLocked() && recWriter_) {
+            if (recSamples_ == 0) recStart_ = transport_.getCurrentPosition();
+            const float* ch[2] = {inBuf_.getReadPointer(0), inBuf_.getReadPointer(1)};
+            recWriter_->write(ch, info.numSamples);
+            recSamples_ += info.numSamples;
+        }
+        if (!recWithPlayback_) {
+            info.clearActiveBufferRegion();   // no input monitoring (avoids feedback through outboard)
+            juce::AudioBuffer<float> view(inBuf_.getArrayOfWritePointers(), 2, info.numSamples);
+            tap_.push(view, 0, info.numSamples);
+            return;
+        }
+    }
     if (offline_) { info.clearActiveBufferRegion(); return; }
+    {
+        const juce::ScopedTryLock psl(playerLock_);
+        if (psl.isLocked() && playerReader_ && playerTransport_.isPlaying()) {
+            // DDP player: the image exactly as the plant will press it.
+            playerTransport_.getNextAudioBlock(info);
+            tap_.push(*info.buffer, info.startSample, info.numSamples);
+            return;
+        }
+    }
     if (sourceTransport_.isPlaying()) {
         // Source audition: raw file, no processing, still metered.
         sourceTransport_.getNextAudioBlock(info);
