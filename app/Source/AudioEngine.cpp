@@ -45,6 +45,8 @@ AudioEngine::~AudioEngine() {
     devices_.removeAudioCallback(&player_);
     player_.setSource(nullptr);
     transport_.setSource(nullptr);
+    sourceTransport_.setSource(nullptr);
+    sourceReader_.reset();
     buffered_.reset();
     program_.reset();
     readAhead_.stopThread(2000);
@@ -68,7 +70,28 @@ void AudioEngine::loadSession(const Session& s) {
     if (wasPlaying) transport_.start();
 }
 
+bool AudioEngine::loadSource(const juce::File& f) {
+    sourceTransport_.stop();
+    sourceTransport_.setSource(nullptr);
+    sourceReader_.reset();
+    auto* reader = formats_.createReaderFor(f);
+    if (!reader) return false;
+    double rate = reader->sampleRate;
+    sourceReader_ = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
+    sourceTransport_.setSource(sourceReader_.get(), int(rate * 2), &readAhead_, rate, 2);
+    return true;
+}
+
+void AudioEngine::playSource() {
+    transport_.stop();
+    if (sourceTransport_.getCurrentPosition() >= sourceTransport_.getLengthInSeconds() - 0.01) sourceTransport_.setPosition(0);
+    sourceTransport_.start();
+}
+
+void AudioEngine::stopSource() { sourceTransport_.stop(); }
+
 void AudioEngine::play() {
+    sourceTransport_.stop();
     if (transport_.getCurrentPosition() >= transport_.getLengthInSeconds() - 0.01) transport_.setPosition(0);
     transport_.start();
 }
@@ -91,17 +114,26 @@ void AudioEngine::prepareToPlay(int block, double rate) {
     rate_ = rate;
     block_ = block;
     transport_.prepareToPlay(block, rate);
+    sourceTransport_.prepareToPlay(block, rate);
+    sourceBuf_.setSize(2, juce::jmax(block, 8192));
     chain_.prepare(rate, block);
     juce::ignoreUnused(rateChanged);   // the UI reloads the session when the device rate changes
 }
 
 void AudioEngine::releaseResources() {
     transport_.releaseResources();
+    sourceTransport_.releaseResources();
     chain_.release();
 }
 
 void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
     if (offline_) { info.clearActiveBufferRegion(); return; }
+    if (sourceTransport_.isPlaying()) {
+        // Source audition: raw file, no processing, still metered.
+        sourceTransport_.getNextAudioBlock(info);
+        tap_.push(*info.buffer, info.startSample, info.numSamples);
+        return;
+    }
     transport_.getNextAudioBlock(info);
     chain_.process(*info.buffer, info.startSample, info.numSamples);
     if (transport_.isPlaying()) tap_.push(*info.buffer, info.startSample, info.numSamples);

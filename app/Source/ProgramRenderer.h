@@ -36,7 +36,8 @@ public:
 
 private:
     juce::AudioFormatManager& formats_;
-    juce::Array<Clip> clips_;
+    juce::Array<Region> regions_;
+    juce::Array<EffectiveFades> fades_;
     juce::Array<juce::int64> starts_, ends_;
     std::vector<std::unique_ptr<ClipStream>> streams_;
     double rate_ = 44100;

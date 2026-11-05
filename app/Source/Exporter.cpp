@@ -81,11 +81,9 @@ private:
 struct QcRunner {
     QcRunner(const Session& s, double rate) {
         whole.prepare(rate, 2);
-        auto lay = s.layout();
-        for (int i = 0; i < lay.clips.size(); ++i) {
-            starts.add(juce::int64(lay.clips[i].start * rate));
-            ends.add(i + 1 < lay.clips.size() ? juce::int64(lay.clips[i + 1].start * rate)
-                                               : juce::int64(lay.total * rate));
+        for (auto& tr : s.trackRanges()) {
+            starts.add(juce::int64(tr.getStart() * rate));
+            ends.add(juce::int64(tr.getEnd() * rate));
             auto* m = per.add(new dsp::LoudnessMeter());
             m->prepare(rate, 2);
         }
@@ -246,7 +244,7 @@ juce::String Exporter::exportProgramWav(const Session& s, const juce::File& file
                                         const Keep& keep) {
     const double rate = s.effectiveRate();
     MasterStream ms(engine_, s, es, rate);
-    const juce::int64 total = juce::int64(std::ceil(s.layout().total * rate));
+    const juce::int64 total = juce::int64(std::ceil(s.end() * rate));
     juce::WavAudioFormat wav;
     file.deleteFile();
     std::unique_ptr<juce::OutputStream> os(file.createOutputStream().release());
@@ -282,7 +280,7 @@ juce::String Exporter::exportProgramWav(const Session& s, const juce::File& file
 juce::String Exporter::analyse(const Session& s, const ExportSettings& es, const Keep& keep, QcReport& qc) {
     MasterStream ms(engine_, s, es, cd::kSampleRate);
     QcRunner qr(s, cd::kSampleRate);
-    const juce::int64 total = juce::int64(std::ceil(s.layout().total * cd::kSampleRate));
+    const juce::int64 total = juce::int64(std::ceil(s.end() * cd::kSampleRate));
     std::vector<float> l(4096), r(4096);
     juce::String err;
     for (juce::int64 pos = 0; pos < total;) {

@@ -61,6 +61,15 @@ public:
     double lengthSeconds() const { return transport_.getLengthInSeconds(); }
     double deviceRate() const { return rate_; }
 
+    // ---- Source window audition (raw file, bypasses the chain) ----
+    bool loadSource(const juce::File& f);
+    void playSource();
+    void stopSource();
+    bool isSourcePlaying() const { return sourceTransport_.isPlaying(); }
+    double sourcePosition() const { return sourceTransport_.getCurrentPosition(); }
+    void setSourcePosition(double sec) { sourceTransport_.setPosition(sec); }
+    double sourceLength() const { return sourceTransport_.getLengthInSeconds(); }
+
     // While exporting, the chain is used offline, so playback is suspended.
     void suspendForOffline(bool suspend);
 
@@ -77,6 +86,9 @@ private:
     juce::AudioTransportSource transport_;
     std::unique_ptr<ProgramSource> program_;
     std::unique_ptr<juce::BufferingAudioSource> buffered_;
+    juce::AudioTransportSource sourceTransport_;
+    std::unique_ptr<juce::AudioFormatReaderSource> sourceReader_;
+    juce::AudioBuffer<float> sourceBuf_;
     PluginChain chain_;
     MeterTap tap_;
     double rate_ = 44100;

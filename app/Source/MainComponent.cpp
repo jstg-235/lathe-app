@@ -1,96 +1,11 @@
 #include "MainComponent.h"
 
 #include "../../core/cd/CdTextEncoder.h"
+#include "Theme.h"
 
 namespace lathe {
 
-// ---------------------------------------------------------------- look
-
-namespace colours {
-const juce::Colour bg{0xff16181c}, panel{0xff1f2228}, line{0xff2c3038}, text{0xffd8dbe0}, dim{0xff8a909a},
-    accent{0xffe0a43a}, wave{0xff5d9cec}, marker{0xffe0a43a}, pause{0xff7a5c2a}, error{0xffe0605a}, ok{0xff6cc36a};
-}
-
-enum Col { cNum = 1, cTitle, cPerformer, cIsrc, cGap, cPause, cGain, cFadeIn, cFadeOut, cStart, cLength, cDcp, cPre };
-
-// ---------------------------------------------------------------- overview
-
-class Overview : public juce::Component, public juce::ChangeListener {
-public:
-    Overview(MainComponent& o, AudioEngine& e, juce::AudioThumbnailCache& cache) : owner_(o), engine_(e), cache_(cache) {}
-
-    void rebuild(const Session& s) {
-        thumbs_.clear();
-        layout_ = s.layout();
-        for (auto& c : s.clips) {
-            auto* t = thumbs_.add(new juce::AudioThumbnail(512, engine_.formats(), cache_));
-            t->addChangeListener(this);
-            t->setSource(new juce::FileInputSource(c.file));
-        }
-        clips_ = s.clips;
-        repaint();
-    }
-    void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
-
-    void setPlayhead(double sec) {
-        if (std::abs(sec - playhead_) * pxPerSec() >= 1.0) { playhead_ = sec; repaint(); }
-    }
-
-    void paint(juce::Graphics& g) override {
-        g.fillAll(colours::panel);
-        auto r = getLocalBounds().toFloat();
-        const double pps = pxPerSec();
-        g.setFont(11.0f);
-        for (int i = 0; i < thumbs_.size() && i < layout_.clips.size(); ++i) {
-            const auto& c = clips_.getReference(i);
-            const auto& p = layout_.clips.getReference(i);
-            float x0 = float(p.start * pps), x1 = float(p.end * pps);
-            auto area = juce::Rectangle<float>(x0, 18.0f, x1 - x0, r.getHeight() - 22.0f);
-            // pause region before index 01
-            double pauseStart = i == 0 ? 0.0 : juce::jmax(layout_.clips[i - 1].end, p.start - c.pauseSec);
-            if (pauseStart < p.start) {
-                g.setColour(colours::pause.withAlpha(0.35f));
-                g.fillRect(juce::Rectangle<float>(float(pauseStart * pps), 18.0f, float((p.start - pauseStart) * pps), area.getHeight()));
-            }
-            g.setColour(colours::wave.withAlpha(0.85f));
-            double t0 = double(c.trimStart) / c.fileRate, t1 = double(c.fileLength - c.trimEnd) / c.fileRate;
-            thumbs_[i]->drawChannels(g, area.toNearestInt(), t0, t1, float(juce::Decibels::decibelsToGain(c.gainDb)));
-            g.setColour(colours::marker);
-            g.drawLine(x0, 14.0f, x0, r.getHeight(), 1.5f);
-            g.drawText(juce::String(i + 1), juce::Rectangle<float>(x0 + 3, 1, 40, 14), juce::Justification::left);
-            for (double s : c.subIndexSec) {
-                float xs = float((p.start + s) * pps);
-                g.setColour(colours::marker.withAlpha(0.6f));
-                g.drawLine(xs, 18.0f, xs, r.getHeight(), 1.0f);
-            }
-        }
-        g.setColour(colours::text);
-        float xp = float(playhead_ * pps);
-        g.drawLine(xp, 0, xp, r.getHeight(), 1.5f);
-        if (layout_.clips.isEmpty()) {
-            g.setColour(colours::dim);
-            g.drawText("Drag WAV, AIFF or FLAC files here, or press Add Audio", getLocalBounds(), juce::Justification::centred);
-        }
-    }
-
-    void mouseDown(const juce::MouseEvent& e) override { seek(e); }
-    void mouseDrag(const juce::MouseEvent& e) override { seek(e); }
-
-private:
-    double pxPerSec() const { return layout_.total > 0 ? double(getWidth()) / (layout_.total * 1.02) : 1.0; }
-    void seek(const juce::MouseEvent& e) {
-        engine_.setPositionSeconds(juce::jmax(0.0, double(e.x) / pxPerSec()));
-        setPlayhead(engine_.positionSeconds());
-    }
-
-    MainComponent& owner_;
-    AudioEngine& engine_;
-    juce::AudioThumbnailCache& cache_;
-    juce::OwnedArray<juce::AudioThumbnail> thumbs_;
-    juce::Array<Clip> clips_;
-    Layout layout_;
-    double playhead_ = 0;
-};
+enum PqCol { pTrack = 1, pType, pTime, pLength, pTitle, pPerformer, pIsrc, pDcp, pPre };
 
 // ---------------------------------------------------------------- meters
 
@@ -120,21 +35,18 @@ public:
         g.fillAll(colours::panel);
         auto r = getLocalBounds().reduced(6);
         auto bars = r.removeFromLeft(44);
+        auto norm = [](float lin) { float db = juce::Decibels::gainToDecibels(lin, -60.0f); return (db + 60.0f) / 60.0f; };
         for (int c = 0; c < 2; ++c) {
             auto b = bars.removeFromLeft(18).toFloat();
             bars.removeFromLeft(4);
             g.setColour(colours::line);
             g.fillRect(b);
-            auto norm = [](float lin) { float db = juce::Decibels::gainToDecibels(lin, -60.0f); return (db + 60.0f) / 60.0f; };
-            float h = b.getHeight() * norm(peak_[c]);
             g.setColour(hold_[c] >= 0.99997f ? colours::error : colours::ok);
-            g.fillRect(b.withTop(b.getBottom() - h));
-            float hy = b.getBottom() - b.getHeight() * norm(hold_[c]);
+            g.fillRect(b.withTop(b.getBottom() - b.getHeight() * norm(peak_[c])));
             g.setColour(colours::text);
-            g.drawHorizontalLine(int(hy), b.getX(), b.getRight());
+            g.drawHorizontalLine(int(b.getBottom() - b.getHeight() * norm(hold_[c])), b.getX(), b.getRight());
         }
         r.removeFromLeft(8);
-        g.setColour(colours::text);
         g.setFont(juce::FontOptions(13.0f));
         auto line = [&](const juce::String& k, double v, const char* unit) {
             auto row = r.removeFromTop(19);
@@ -154,7 +66,7 @@ public:
         g.setColour(meter_.clippedSamples() ? colours::error : colours::text);
         g.drawText(juce::String(meter_.clippedSamples()), row, juce::Justification::right);
     }
-    void mouseDown(const juce::MouseEvent&) override { reset(); }   // click to reset
+    void mouseDown(const juce::MouseEvent&) override { reset(); }
 
 private:
     dsp::LoudnessMeter meter_;
@@ -163,7 +75,7 @@ private:
     juce::AudioBuffer<float> scratch_{2, 1 << 17};
 };
 
-// ---------------------------------------------------------------- editable table cell
+// ---------------------------------------------------------------- editable cell
 
 class Cell : public juce::Label {
 public:
@@ -178,12 +90,13 @@ public:
         row_ = row;
         col_ = col;
         setText(owner_.cellText(row, col), juce::dontSendNotification);
-        setJustificationType(col >= cGap ? juce::Justification::centredRight : juce::Justification::centredLeft);
     }
     void textWasEdited() override { owner_.setCellText(row_, col_, getText()); }
     void mouseDown(const juce::MouseEvent& e) override {
-        // Single click selects the row; double click edits (handled by Label).
-        if (auto* t = findParentComponentOfClass<juce::TableListBox>()) t->selectRowsBasedOnModifierKeys(row_, e.mods, false);
+        if (auto* t = findParentComponentOfClass<juce::TableListBox>()) {
+            t->selectRowsBasedOnModifierKeys(row_, e.mods, false);
+            if (auto* m = t->getTableListBoxModel()) m->cellClicked(row_, col_, e);
+        }
         Label::mouseDown(e);
     }
 private:
@@ -191,28 +104,45 @@ private:
     int row_ = 0, col_ = 0;
 };
 
-// ---------------------------------------------------------------- helpers
+// ---------------------------------------------------------------- background jobs
 
-static juce::String msf(double sec) { return juce::String(cd::Msf::fromSectors(int64_t(std::llround(sec * 75))).str()); }
-
-static double parseTime(const juce::String& s, double fallback) {
-    // Accepts seconds ("2.5") or MM:SS:FF CD time ("00:02:00").
-    auto t = s.trim();
-    if (t.containsChar(':')) {
-        auto parts = juce::StringArray::fromTokens(t, ":", "");
-        if (parts.size() == 3) return parts[0].getIntValue() * 60.0 + parts[1].getIntValue() + parts[2].getIntValue() / 75.0;
-        if (parts.size() == 2) return parts[0].getIntValue() * 60.0 + parts[1].getDoubleValue();
-        return fallback;
+namespace {
+struct Job : juce::ThreadWithProgressWindow {
+    std::function<void(Job&)> work;
+    std::function<void(bool)> done;
+    explicit Job(const juce::String& t) : ThreadWithProgressWindow(t, true, true) {}
+    void run() override { work(*this); }
+    void threadComplete(bool cancelled) override {
+        auto d = std::move(done);
+        delete this;
+        if (d) d(cancelled);
     }
-    return t.isEmpty() ? fallback : t.getDoubleValue();
+    bool keep(double p) { setProgress(p); return !threadShouldExit(); }
+};
+
+void runJob(const juce::String& title, std::function<void(Job&)> work, std::function<void(bool)> done) {
+    auto* j = new Job(title);
+    j->work = std::move(work);
+    j->done = std::move(done);
+    j->launchThread();
 }
 
-static void styleButton(juce::TextButton& b) {
-    b.setColour(juce::TextButton::buttonColourId, colours::panel);
-    b.setColour(juce::TextButton::textColourOffId, colours::text);
-}
+class XfadeWindow : public juce::DocumentWindow {
+public:
+    XfadeWindow(juce::Component* c) : DocumentWindow("Crossfade Editor", colours::bg, DocumentWindow::closeButton) {
+        setUsingNativeTitleBar(true);
+        setContentOwned(c, true);
+        setResizable(true, false);
+        centreWithSize(getWidth(), getHeight());
+        setAlwaysOnTop(true);
+        setVisible(true);
+    }
+    std::function<void()> onClose;
+    void closeButtonPressed() override { if (onClose) onClose(); }
+};
+}  // namespace
 
-// ---------------------------------------------------------------- MainComponent
+// ---------------------------------------------------------------- construction
 
 MainComponent::MainComponent() {
     juce::PropertiesFile::Options o;
@@ -223,48 +153,70 @@ MainComponent::MainComponent() {
     props_.setStorageParameters(o);
 
     getLookAndFeel().setColour(juce::ResizableWindow::backgroundColourId, colours::bg);
-    overview_ = std::make_unique<Overview>(*this, engine_, thumbCache_);
     meters_ = std::make_unique<LevelMeters>();
-    addAndMakeVisible(*overview_);
     addAndMakeVisible(*meters_);
+    addAndMakeVisible(source_);
+    addAndMakeVisible(timeline_);
 
-    for (auto* b : {&newBtn_, &openBtn_, &saveBtn_, &addBtn_, &removeBtn_, &upBtn_, &downBtn_, &idxBtn_, &playBtn_, &homeBtn_,
-                    &pluginsBtn_, &exportBtn_, &analyseBtn_, &verifyBtn_, &audioBtn_, &chainAdd_, &chainRemove_,
-                    &chainBypass_, &chainUp_, &chainDown_}) {
-        styleButton(*b);
+    for (auto* b : {&newBtn_, &openBtn_, &saveBtn_, &importBtn_, &envBtn_, &snapBtn_, &lanesBtn_, &xfadeBtn_, &trackMk_, &indexMk_,
+                    &pauseMk_, &splitBtn_, &playBtn_, &homeBtn_, &pluginsBtn_, &exportBtn_, &analyseBtn_, &verifyBtn_, &audioBtn_,
+                    &chainAdd_, &chainRemove_, &chainBypass_, &chainUp_, &chainDown_, &zoomIn_, &zoomOut_, &zoomFit_}) {
+        styleButton(*b, b == &exportBtn_);
         addAndMakeVisible(*b);
     }
-    exportBtn_.setColour(juce::TextButton::buttonColourId, colours::accent.darker(0.4f));
+    envBtn_.setClickingTogglesState(true);
+    snapBtn_.setClickingTogglesState(true);
+    snapBtn_.setToggleState(true, juce::dontSendNotification);
 
     newBtn_.onClick = [this] { newSession(); };
     openBtn_.onClick = [this] { openSession(); };
     saveBtn_.onClick = [this] { saveSession(false); };
-    addBtn_.onClick = [this] {
-        chooser_ = std::make_unique<juce::FileChooser>("Add audio", juce::File(), engine_.formats().getWildcardForAllFormats());
+    importBtn_.onClick = [this] {
+        chooser_ = std::make_unique<juce::FileChooser>("Import audio as tracks", juce::File(), engine_.formats().getWildcardForAllFormats());
         chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectMultipleItems,
-                              [this](const juce::FileChooser& fc) { addFiles(fc.getResults()); });
+                              [this](const juce::FileChooser& fc) { importFiles(fc.getResults()); });
     };
-    removeBtn_.onClick = [this] { removeSelected(); };
-    upBtn_.onClick = [this] { moveSelected(-1); };
-    downBtn_.onClick = [this] { moveSelected(1); };
-    idxBtn_.onClick = [this] { addSubIndexAtPlayhead(); };
-    idxBtn_.setTooltip("Add a sub-index (index 02, 03...) at the playhead");
-    playBtn_.onClick = [this] { engine_.isPlaying() ? engine_.stop() : engine_.play(); };
+    envBtn_.onClick = [this] { timeline_.setEnvelopeMode(envBtn_.getToggleState()); };
+    snapBtn_.onClick = [this] { timeline_.setSnap(snapBtn_.getToggleState()); };
+    lanesBtn_.onClick = [this] {
+        juce::PopupMenu m;
+        for (int n : {1, 2, 4, 8, 16}) m.addItem(n, juce::String(n) + (n == 1 ? " track" : " tracks"), true, session_.lanes == n);
+        m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&lanesBtn_), [this](int n) {
+            if (n <= 0) return;
+            int maxLane = 0;
+            for (auto& r : session_.regions) maxLane = juce::jmax(maxLane, r.lane);
+            session_.lanes = juce::jmax(n, maxLane + 1);
+            sessionChanged();
+            timeline_.resized();
+        });
+    };
+    xfadeBtn_.onClick = [this] {
+        auto p = timeline_.crossfadeNear(engine_.positionSeconds());
+        if (p.first) openCrossfade(p.first, p.second);
+    };
+    trackMk_.onClick = [this] { addMarkerAtPlayhead(Marker::TrackStart); };
+    indexMk_.onClick = [this] { addMarkerAtPlayhead(Marker::Index); };
+    pauseMk_.onClick = [this] { addMarkerAtPlayhead(Marker::PauseStart); };
+    splitBtn_.onClick = [this] { splitAtPlayhead(); };
+    playBtn_.onClick = [this] { auditionEnd_ = -1; engine_.isPlaying() ? engine_.stop() : engine_.play(); };
     homeBtn_.onClick = [this] { engine_.setPositionSeconds(0); meters_->reset(); };
     pluginsBtn_.onClick = [this] { showPluginMenu(); };
     exportBtn_.onClick = [this] { showExportMenu(); };
     analyseBtn_.onClick = [this] { analyse(); };
     verifyBtn_.onClick = [this] { verifyDdp(); };
     audioBtn_.onClick = [this] { showAudioSettings(); };
+    zoomIn_.onClick = [this] { timeline_.zoomBy(1.5, engine_.positionSeconds()); };
+    zoomOut_.onClick = [this] { timeline_.zoomBy(1 / 1.5, engine_.positionSeconds()); };
+    zoomFit_.onClick = [this] { timeline_.zoomToFit(); };
 
     chainAdd_.onClick = [this] { showPluginMenu(); };
     chainRemove_.onClick = [this] {
         int i = chainList_.getSelectedRow();
-        if (i >= 0) { engine_.chain().remove(i); session_.pluginChainState = engine_.chain().getState(); sessionChanged(); }
+        if (i >= 0) { engine_.chain().remove(i); chainList_.updateContent(); sessionChanged(); }
     };
     chainBypass_.onClick = [this] {
         int i = chainList_.getSelectedRow();
-        if (i >= 0) { engine_.chain().setBypassed(i, !engine_.chain().isBypassed(i)); chainList_.repaint(); }
+        if (i >= 0) { engine_.chain().setBypassed(i, !engine_.chain().isBypassed(i)); chainList_.repaint(); sessionChanged(); }
     };
     chainUp_.onClick = [this] {
         int i = chainList_.getSelectedRow();
@@ -275,26 +227,35 @@ MainComponent::MainComponent() {
         if (i >= 0 && i + 1 < engine_.chain().size()) { engine_.chain().move(i, i + 1); chainList_.selectRow(i + 1); chainList_.updateContent(); sessionChanged(); }
     };
 
-    auto& h = table_.getHeader();
-    h.addColumn("#", cNum, 32, 32, 40);
-    h.addColumn("Title", cTitle, 200, 80, 600);
-    h.addColumn("Performer", cPerformer, 140, 60, 400);
-    h.addColumn("ISRC", cIsrc, 120, 80, 160);
-    h.addColumn("Gap", cGap, 64);
-    h.addColumn("Pause", cPause, 64);
-    h.addColumn("Gain dB", cGain, 64);
-    h.addColumn("Fade in", cFadeIn, 64);
-    h.addColumn("Fade out", cFadeOut, 64);
-    h.addColumn("Start", cStart, 84);
-    h.addColumn("Length", cLength, 84);
-    h.addColumn("DCP", cDcp, 40);
-    h.addColumn("Pre", cPre, 40);
-    table_.setColour(juce::ListBox::backgroundColourId, colours::panel);
-    table_.setRowHeight(24);
-    table_.setMultipleSelectionEnabled(false);
+    source_.onEdit = [this](Session::EditMode m) { sourceEdit(m); };
+    source_.onAppend = [this] { appendSource(); };
+
+    timeline_.onEdit = [this] { sessionChanged(); };
+    timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
+    timeline_.onCrossfade = [this](int a, int b) { openCrossfade(a, b); };
+    timeline_.onMarkerSelected = [this](int id) {
+        for (int i = 0; i < session_.markers.size(); ++i)
+            if (session_.markers[i].id == id) { pqList_.selectRow(i); break; }
+    };
+    timeline_.onMarkerDoubleClicked = [this](int id) {
+        if (auto* m = session_.findMarker(id)) engine_.setPositionSeconds(m->t);
+    };
+
+    auto& h = pqList_.getHeader();
+    h.addColumn("Trk", pTrack, 36);
+    h.addColumn("Type", pType, 70);
+    h.addColumn("Time", pTime, 78);
+    h.addColumn("Length", pLength, 74);
+    h.addColumn("Title", pTitle, 200, 80, 600);
+    h.addColumn("Performer", pPerformer, 150, 60, 400);
+    h.addColumn("ISRC", pIsrc, 118);
+    h.addColumn("DCP", pDcp, 40);
+    h.addColumn("Pre", pPre, 40);
+    pqList_.setColour(juce::ListBox::backgroundColourId, colours::panel);
+    pqList_.setRowHeight(22);
     h.setColour(juce::TableHeaderComponent::backgroundColourId, colours::bg);
     h.setColour(juce::TableHeaderComponent::textColourId, colours::dim);
-    addAndMakeVisible(table_);
+    addAndMakeVisible(pqList_);
 
     chainList_.setColour(juce::ListBox::backgroundColourId, colours::panel);
     chainList_.setRowHeight(24);
@@ -307,12 +268,13 @@ MainComponent::MainComponent() {
     issues_.setColour(juce::TextEditor::outlineColourId, colours::line);
     addAndMakeVisible(issues_);
 
-    for (auto* l : {&timeDisplay_, &trackDisplay_, &rateWarning_}) {
+    for (auto* l : {&timeDisplay_, &trackDisplay_, &rateWarning_, &selDisplay_}) {
         l->setColour(juce::Label::textColourId, colours::text);
         addAndMakeVisible(*l);
     }
     timeDisplay_.setFont(juce::FontOptions(juce::Font::getDefaultMonospacedFontName(), 26.0f, juce::Font::plain));
     rateWarning_.setColour(juce::Label::textColourId, colours::accent);
+    selDisplay_.setColour(juce::Label::textColourId, colours::dim);
 
     auto field = [this](juce::Label& lbl, const char* name, juce::TextEditor& ed, std::function<void(const juce::String&)> set) {
         lbl.setText(name, juce::dontSendNotification);
@@ -344,38 +306,37 @@ MainComponent::MainComponent() {
     engine_.devices().addChangeListener(this);
     lastDeviceRate_ = engine_.deviceRate();
     setWantsKeyboardFocus(true);
-    setSize(1280, 800);
+    setSize(1440, 900);
     newSession();
     startTimerHz(30);
 }
 
 MainComponent::~MainComponent() {
+    xfadeWindow_.reset();
     engine_.devices().removeChangeListener(this);
     engine_.chain().closeAllEditors();
-    table_.setModel(nullptr);
+    pqList_.setModel(nullptr);
     chainList_.setModel(nullptr);
 }
 
 void MainComponent::paint(juce::Graphics& g) { g.fillAll(colours::bg); }
 
 void MainComponent::resized() {
-    auto r = getLocalBounds().reduced(10);
-    auto top = r.removeFromTop(30);
-    for (auto* b : {&newBtn_, &openBtn_, &saveBtn_}) { b->setBounds(top.removeFromLeft(64)); top.removeFromLeft(4); }
-    top.removeFromLeft(12);
-    for (auto* b : {&addBtn_, &removeBtn_, &upBtn_, &downBtn_, &idxBtn_}) { b->setBounds(top.removeFromLeft(b == &addBtn_ ? 90 : 64)); top.removeFromLeft(4); }
-    audioBtn_.setBounds(top.removeFromRight(100));
+    auto r = getLocalBounds().reduced(8);
+    auto top = r.removeFromTop(28);
+    for (auto* b : {&newBtn_, &openBtn_, &saveBtn_, &importBtn_}) { b->setBounds(top.removeFromLeft(62)); top.removeFromLeft(4); }
+    audioBtn_.setBounds(top.removeFromRight(96));
     top.removeFromRight(4);
-    exportBtn_.setBounds(top.removeFromRight(90));
+    exportBtn_.setBounds(top.removeFromRight(84));
     top.removeFromRight(4);
-    verifyBtn_.setBounds(top.removeFromRight(90));
+    verifyBtn_.setBounds(top.removeFromRight(86));
     top.removeFromRight(4);
-    analyseBtn_.setBounds(top.removeFromRight(80));
+    analyseBtn_.setBounds(top.removeFromRight(74));
     top.removeFromRight(4);
-    pluginsBtn_.setBounds(top.removeFromRight(90));
+    pluginsBtn_.setBounds(top.removeFromRight(84));
 
-    r.removeFromTop(8);
-    auto fields = r.removeFromTop(26);
+    r.removeFromTop(6);
+    auto fields = r.removeFromTop(24);
     auto place = [&](juce::Label& l, juce::Component& c, int lw, int w) {
         l.setBounds(fields.removeFromLeft(lw));
         c.setBounds(fields.removeFromLeft(w));
@@ -388,67 +349,115 @@ void MainComponent::resized() {
     place(engLbl_, engineer_, 60, 120);
     place(ditherLbl_, dither_, 46, juce::jmax(140, fields.getWidth()));
 
-    r.removeFromTop(8);
-    auto transport = r.removeFromTop(40);
-    homeBtn_.setBounds(transport.removeFromLeft(44).reduced(0, 4));
-    transport.removeFromLeft(4);
-    playBtn_.setBounds(transport.removeFromLeft(80).reduced(0, 4));
-    transport.removeFromLeft(12);
-    timeDisplay_.setBounds(transport.removeFromLeft(170));
-    trackDisplay_.setBounds(transport.removeFromLeft(220));
-    rateWarning_.setBounds(transport);
-
     r.removeFromTop(6);
     auto right = r.removeFromRight(300);
-    r.removeFromRight(10);
+    r.removeFromRight(8);
     meters_->setBounds(right.removeFromTop(150));
-    right.removeFromTop(10);
-    auto chainButtons = right.removeFromBottom(28);
+    right.removeFromTop(8);
+    auto chainButtons = right.removeFromBottom(26);
     for (auto* b : {&chainAdd_, &chainRemove_, &chainBypass_, &chainUp_, &chainDown_}) {
         b->setBounds(chainButtons.removeFromLeft(56));
         chainButtons.removeFromLeft(4);
     }
     right.removeFromBottom(6);
+    issues_.setBounds(right.removeFromBottom(160));
+    right.removeFromBottom(6);
     chainList_.setBounds(right);
 
-    overview_->setBounds(r.removeFromTop(150));
-    r.removeFromTop(8);
-    issues_.setBounds(r.removeFromBottom(90));
-    r.removeFromBottom(8);
-    table_.setBounds(r);
+    source_.setBounds(r.removeFromTop(150));
+    r.removeFromTop(6);
+
+    auto transport = r.removeFromTop(34);
+    homeBtn_.setBounds(transport.removeFromLeft(40).reduced(0, 3));
+    transport.removeFromLeft(4);
+    playBtn_.setBounds(transport.removeFromLeft(70).reduced(0, 3));
+    transport.removeFromLeft(10);
+    timeDisplay_.setBounds(transport.removeFromLeft(150));
+    trackDisplay_.setBounds(transport.removeFromLeft(170));
+    for (auto* b : {&zoomFit_, &zoomIn_, &zoomOut_}) { b->setBounds(transport.removeFromRight(b == &zoomFit_ ? 40 : 28).reduced(0, 3)); transport.removeFromRight(3); }
+    transport.removeFromRight(6);
+    for (auto* b : {&xfadeBtn_, &lanesBtn_, &snapBtn_, &envBtn_, &splitBtn_, &pauseMk_, &indexMk_, &trackMk_}) {
+        b->setBounds(transport.removeFromRight(b == &xfadeBtn_ ? 86 : 64).reduced(0, 3));
+        transport.removeFromRight(3);
+    }
+    selDisplay_.setBounds(transport.removeFromLeft(transport.getWidth() / 2));
+    rateWarning_.setBounds(transport);
+
+    pqList_.setBounds(r.removeFromBottom(200));
+    r.removeFromBottom(6);
+    timeline_.setBounds(r);
 }
 
+// ---------------------------------------------------------------- keys
+
 bool MainComponent::keyPressed(const juce::KeyPress& k) {
-    if (k == juce::KeyPress::spaceKey) { playBtn_.onClick(); return true; }
-    if (k == juce::KeyPress::homeKey || k == juce::KeyPress::returnKey) { homeBtn_.onClick(); return true; }
-    if (k == juce::KeyPress('z', juce::ModifierKeys::commandModifier, 0)) { undo(); return true; }
-    if (k == juce::KeyPress('z', juce::ModifierKeys::commandModifier | juce::ModifierKeys::shiftModifier, 0)) { redo(); return true; }
-    if (k == juce::KeyPress('s', juce::ModifierKeys::commandModifier, 0)) { saveSession(false); return true; }
-    if (k == juce::KeyPress('i', 0, 0) || k == juce::KeyPress('m', 0, 0)) { addSubIndexAtPlayhead(); return true; }
-    if (k == juce::KeyPress::deleteKey || k == juce::KeyPress::backspaceKey) { removeSelected(); return true; }
+    const auto mods = k.getModifiers();
+    const int code = k.getKeyCode();
+    const bool cmd = mods.isCommandDown(), shift = mods.isShiftDown(), alt = mods.isAltDown();
+    auto is = [&](int c) { return code == c || code == int(juce::CharacterFunctions::toUpperCase(juce::juce_wchar(c))); };
+
+    if (code == juce::KeyPress::spaceKey) {
+        if (shift) source_.togglePlay();
+        else playBtn_.onClick();
+        return true;
+    }
+    if (cmd && is('z')) { shift ? redo() : undo(); return true; }
+    if (cmd && is('s')) { saveSession(shift); return true; }
+    if (cmd && is('o')) { openSession(); return true; }
+    if (cmd && (code == '=' || code == '+')) { zoomIn_.onClick(); return true; }
+    if (cmd && code == '-') { zoomOut_.onClick(); return true; }
+    if (cmd && code == '0') { timeline_.zoomToFit(); return true; }
+    if (cmd) return false;
+
+    if (code == juce::KeyPress::homeKey || code == juce::KeyPress::returnKey) { homeBtn_.onClick(); return true; }
+    if (code == juce::KeyPress::leftKey || code == juce::KeyPress::rightKey) {
+        double dir = code == juce::KeyPress::leftKey ? -1.0 : 1.0;
+        if (alt) nudgeSelectedRegion(dir * (shift ? 0.1 : 1.0 / 75));
+        else engine_.setPositionSeconds(juce::jmax(0.0, engine_.positionSeconds() + dir * (shift ? 1.0 : 1.0 / 75)));
+        return true;
+    }
+    // Source in/out (I/O); destination in/out (Shift+I/O).
+    if (is('i')) {
+        if (shift) { auto s = timeline_.selection(); double t = engine_.positionSeconds(); timeline_.setSelection({t, juce::jmax(t, s.getEnd())}); }
+        else source_.markIn();
+        return true;
+    }
+    if (is('o')) {
+        if (shift) { auto s = timeline_.selection(); double t = engine_.positionSeconds(); timeline_.setSelection({juce::jmin(t, s.isEmpty() ? t : s.getStart()), t}); }
+        else source_.markOut();
+        return true;
+    }
+    if (is('b')) { splitAtPlayhead(); return true; }
+    if (is('m')) { addMarkerAtPlayhead(shift ? Marker::Index : Marker::TrackStart); return true; }
+    if (is('p')) { addMarkerAtPlayhead(Marker::PauseStart); return true; }
+    if (is('e')) { addMarkerAtPlayhead(Marker::EndOfDisc); return true; }
+    if (is('x')) { xfadeBtn_.onClick(); return true; }
+    if (is('g')) { envBtn_.triggerClick(); return true; }
+    if (is('r')) { sourceEdit(Session::EditMode::Replace); return true; }
+    if (code == juce::KeyPress::deleteKey || code == juce::KeyPress::backspaceKey) { deleteSelection(!shift); return true; }
+    if (code == juce::KeyPress::escapeKey) { timeline_.setSelection({}); timeline_.selectRegion(0); return true; }
     return false;
 }
 
 // ---------------------------------------------------------------- session lifecycle
 
-void MainComponent::pushUndo() {
-    undo_.add(lastState_);
-    if (undo_.size() > 200) undo_.remove(0);
-    redo_.clear();
-}
-
 void MainComponent::sessionChanged(bool undoable) {
     session_.pluginChainState = engine_.chain().getState();
     auto now = juce::JSON::toString(session_.toVar(), true);
-    if (now == lastState_) return;
-    if (undoable && lastState_.isNotEmpty()) pushUndo();
+    if (now == lastState_) { timeline_.repaint(); return; }
+    if (undoable && lastState_.isNotEmpty()) {
+        undo_.add(lastState_);
+        if (undo_.size() > 300) undo_.remove(0);
+        redo_.clear();
+    }
     lastState_ = now;
     dirty_ = true;
     engine_.loadSession(session_);
-    overview_->rebuild(session_);
-    table_.updateContent();
-    table_.repaint();
+    timeline_.sessionUpdated();
+    pqList_.updateContent();
+    pqList_.repaint();
     refreshIssues();
+    if (xfadeEditor_) xfadeEditor_->repaint();
     if (auto* w = findParentComponentOfClass<juce::DocumentWindow>())
         w->setName("Lathe - " + (session_.file.existsAsFile() ? session_.file.getFileNameWithoutExtension() : juce::String("Untitled")) + " *");
 }
@@ -487,10 +496,12 @@ void MainComponent::refreshAll() {
     client_.setText(session_.client, false);
     engineer_.setText(session_.engineer, false);
     updatingFields_ = false;
+    xfadeWindow_.reset();
     engine_.loadSession(session_);
-    overview_->rebuild(session_);
-    table_.updateContent();
-    table_.repaint();
+    timeline_.sessionUpdated();
+    timeline_.resized();
+    pqList_.updateContent();
+    pqList_.repaint();
     chainList_.updateContent();
     chainList_.repaint();
     refreshIssues();
@@ -506,6 +517,7 @@ void MainComponent::newSession() {
     redo_.clear();
     lastState_ = juce::JSON::toString(session_.toVar(), true);
     refreshAll();
+    timeline_.zoomToFit();
     dirty_ = false;
 }
 
@@ -521,12 +533,13 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
     juce::StringArray problems;
     engine_.chain().setState(session_.pluginChainState, problems);
     juce::StringArray missing;
-    for (auto& c : session_.clips)
-        if (!c.file.existsAsFile()) missing.add(c.file.getFullPathName());
+    for (auto& r : session_.regions)
+        if (!r.file.existsAsFile()) missing.addIfNotAlreadyThere(r.file.getFullPathName());
     undo_.clear();
     redo_.clear();
     lastState_ = juce::JSON::toString(session_.toVar(), true);
     refreshAll();
+    timeline_.zoomToFit();
     dirty_ = false;
     if (!problems.isEmpty() || !missing.isEmpty()) {
         juce::String msg;
@@ -540,9 +553,7 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
 void MainComponent::openSession() {
     chooser_ = std::make_unique<juce::FileChooser>("Open session", juce::File(), "*.lathe");
     chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                          [this](const juce::FileChooser& fc) {
-                              if (fc.getResult().existsAsFile()) loadSessionFile(fc.getResult());
-                          });
+                          [this](const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) loadSessionFile(fc.getResult()); });
 }
 
 bool MainComponent::saveSession(bool saveAs) {
@@ -562,9 +573,7 @@ bool MainComponent::saveSession(bool saveAs) {
                                                        .getChildFile((session_.discTitle.isEmpty() ? juce::String("Untitled") : session_.discTitle) + ".lathe"),
                                                    "*.lathe");
     chooser_->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting,
-                          [doSave](const juce::FileChooser& fc) {
-                              if (fc.getResult() != juce::File()) doSave(fc.getResult().withFileExtension("lathe"));
-                          });
+                          [doSave](const juce::FileChooser& fc) { if (fc.getResult() != juce::File()) doSave(fc.getResult().withFileExtension("lathe")); });
     return true;
 }
 
@@ -573,143 +582,211 @@ void MainComponent::writeAutosave(const juce::File& f) {
     juce::String err;
     auto keep = session_.file;
     session_.save(f, err);
-    session_.file = keep;   // autosave never becomes "the" file
+    session_.file = keep;
 }
 
 // ---------------------------------------------------------------- editing
 
-void MainComponent::addFiles(const juce::Array<juce::File>& files) {
+void MainComponent::importFiles(const juce::Array<juce::File>& files) {
     juce::StringArray bad;
     for (auto& f : files) {
         std::unique_ptr<juce::AudioFormatReader> r(engine_.formats().createReaderFor(f));
         if (!r) { bad.add(f.getFileName()); continue; }
-        Clip c;
-        c.file = f;
-        c.name = f.getFileNameWithoutExtension();
-        c.fileRate = r->sampleRate;
-        c.fileLength = r->lengthInSamples;
-        c.text.title = c.name.toStdString();
-        c.text.performer = session_.discPerformer.toStdString();
-        if (session_.clips.isEmpty()) { c.gapBeforeSec = 2.0; c.pauseSec = 2.0; }
-        else { c.gapBeforeSec = 2.0; c.pauseSec = 2.0; }
-        // Pick up an ISRC from the file's metadata if the mix engineer embedded one.
+        Region reg = session_.makeRegion(f, r->sampleRate, r->lengthInSamples);
+        reg.lane = 0;
+        int id = session_.append(reg, 2.0);
+        // ISRC embedded by the mix engineer is carried onto the track marker.
         auto isrc = r->metadataValues.getValue("ISRC", r->metadataValues.getValue("isrc", ""));
-        if (isrc.isNotEmpty()) c.isrc = cd::normaliseIsrc(isrc.toStdString());
-        session_.clips.add(c);
+        if (isrc.isNotEmpty())
+            for (auto& m : session_.markers)
+                if (m.attachedRegion == id && m.type == Marker::TrackStart) m.isrc = cd::normaliseIsrc(isrc.toStdString());
     }
     sessionChanged();
+    timeline_.zoomToFit();
     if (!bad.isEmpty())
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Some files couldn't be read",
-                                               bad.joinIntoString("\n"));
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Some files couldn't be read", bad.joinIntoString("\n"));
 }
 
-int MainComponent::selectedRow() const { return table_.getSelectedRow(); }
-
-void MainComponent::removeSelected() {
-    int i = selectedRow();
-    if (i < 0 || i >= session_.clips.size()) return;
-    session_.clips.remove(i);
+void MainComponent::appendSource() {
+    if (!source_.hasSource()) return;
+    auto io = source_.inOut();
+    Region reg = session_.makeRegion(source_.file(), source_.rate(), source_.lengthSamples());
+    reg.srcIn = juce::int64(io.getStart() * source_.rate());
+    reg.srcOut = juce::jmin(source_.lengthSamples(), juce::int64(io.getEnd() * source_.rate()));
+    session_.append(reg, 2.0);
     sessionChanged();
 }
 
-void MainComponent::moveSelected(int d) {
-    int i = selectedRow(), j = i + d;
-    if (i < 0 || j < 0 || j >= session_.clips.size()) return;
-    session_.clips.swap(i, j);
+void MainComponent::sourceEdit(Session::EditMode mode) {
+    if (!source_.hasSource()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "No source", "Open a file in the Source window first.");
+        return;
+    }
+    auto io = source_.inOut();
+    auto sel = timeline_.selection();
+    double dIn = sel.isEmpty() ? engine_.positionSeconds() : sel.getStart();
+    double dOut = sel.isEmpty() ? -1.0 : sel.getEnd();
+    if (mode == Session::EditMode::Replace && sel.isEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Replace needs a destination range",
+                                               "Drag across the timeline (or use Shift+I / Shift+O) to mark the destination In and Out, "
+                                               "and mark the source In and Out, then Replace.");
+        return;
+    }
+    const double rate = source_.rate();
+    auto sIn = juce::int64(io.getStart() * rate), sOut = juce::jmin(source_.lengthSamples(), juce::int64(io.getEnd() * rate));
+    int id = session_.sourceEdit(source_.file(), rate, source_.lengthSamples(), sIn, sOut, timeline_.selectedLane(), dIn, dOut, mode);
+    timeline_.selectRegion(id);
+    timeline_.setSelection({});
     sessionChanged();
-    table_.selectRow(j);
 }
 
-void MainComponent::addSubIndexAtPlayhead() {
-    auto lay = session_.layout();
+void MainComponent::addMarkerAtPlayhead(Marker::Type t) {
+    int id = session_.addMarker(t, engine_.positionSeconds());
+    timeline_.selectMarker(id);
+    sessionChanged();
+}
+
+void MainComponent::splitAtPlayhead() {
     double t = engine_.positionSeconds();
-    for (int i = 0; i < lay.clips.size(); ++i) {
-        if (t > lay.clips[i].start + 0.05 && t < lay.clips[i].end - 0.05) {
-            auto& c = session_.clips.getReference(i);
-            c.subIndexSec.add(t - lay.clips[i].start);
-            std::sort(c.subIndexSec.begin(), c.subIndexSec.end());
-            sessionChanged();
-            return;
-        }
+    int sel = timeline_.selectedRegion();
+    bool any = false;
+    if (sel) any = session_.split(sel, t) != 0;
+    if (!any) {
+        juce::Array<int> ids;
+        for (auto& r : session_.regions)
+            if (t > r.start && t < r.end()) ids.add(r.id);
+        for (int id : ids) any |= session_.split(id, t) != 0;
+    }
+    if (any) sessionChanged();
+}
+
+void MainComponent::deleteSelection(bool ripple) {
+    if (int m = timeline_.selectedMarker(); m && session_.findMarker(m)) {
+        session_.removeMarker(m);
+        timeline_.selectMarker(0);
+        sessionChanged();
+        return;
+    }
+    if (int id = timeline_.selectedRegion()) {
+        session_.deleteRegion(id, ripple);
+        timeline_.selectRegion(0);
+        sessionChanged();
     }
 }
 
-int MainComponent::getNumRows() { return session_.clips.size(); }
+void MainComponent::nudgeSelectedRegion(double dt) {
+    if (auto* r = session_.findRegion(timeline_.selectedRegion())) {
+        session_.moveRegion(r->id, r->start + dt, r->lane);
+        sessionChanged();
+    }
+}
+
+void MainComponent::openCrossfade(int out, int in) {
+    xfadeWindow_.reset();
+    auto* ed = new CrossfadeEditor(session_, thumbs_, out, in);
+    ed->onChange = [this] { sessionChanged(); };
+    ed->onAudition = [this](double a, double b) { auditionRange(a, b); };
+    xfadeEditor_ = ed;
+    auto* w = new XfadeWindow(ed);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { xfadeWindow_.reset(); }); };
+    xfadeWindow_.reset(w);
+}
+
+void MainComponent::auditionRange(double from, double to) {
+    engine_.setPositionSeconds(juce::jmax(0.0, from));
+    auditionEnd_ = to;
+    engine_.play();
+}
+
+// ---------------------------------------------------------------- PQ list
+
+int MainComponent::getNumRows() { return session_.markers.size(); }
+
+int MainComponent::markerRowToTrackNumber(int row) const {
+    int n = 0;
+    for (int i = 0; i <= row && i < session_.markers.size(); ++i)
+        if (session_.markers[i].type == Marker::TrackStart) ++n;
+    return n;
+}
 
 void MainComponent::paintRowBackground(juce::Graphics& g, int row, int, int, bool selected) {
-    g.fillAll(selected ? colours::accent.withAlpha(0.25f) : (row % 2 ? colours::panel : colours::panel.brighter(0.03f)));
+    bool track = row < session_.markers.size() && session_.markers[row].type == Marker::TrackStart;
+    g.fillAll(selected ? colours::accent.withAlpha(0.25f) : track ? colours::panel2 : colours::panel);
 }
 
 void MainComponent::paintCell(juce::Graphics& g, int row, int col, int w, int h, bool) {
-    g.setColour(colours::text);
+    g.setColour(col == pType || col == pTrack ? colours::dim : colours::text);
     g.setFont(13.0f);
-    g.drawText(cellText(row, col), 4, 0, w - 8, h, col >= cGap ? juce::Justification::centredRight : juce::Justification::centredLeft);
+    g.drawText(cellText(row, col), 4, 0, w - 8, h, juce::Justification::centredLeft);
 }
 
 juce::Component* MainComponent::refreshComponentForCell(int row, int col, bool, juce::Component* existing) {
-    const bool editable = col == cTitle || col == cPerformer || col == cIsrc || col == cGap || col == cPause ||
-                          col == cGain || col == cFadeIn || col == cFadeOut;
-    if (!editable || row >= session_.clips.size()) { delete existing; return nullptr; }
+    bool isTrack = row < session_.markers.size() && session_.markers[row].type == Marker::TrackStart;
+    bool editable = col == pTime || (isTrack && (col == pTitle || col == pPerformer || col == pIsrc));
+    if (!editable) { delete existing; return nullptr; }
     auto* c = dynamic_cast<Cell*>(existing);
     if (!c) { delete existing; c = new Cell(*this); }
     c->set(row, col);
     return c;
 }
 
-void MainComponent::cellDoubleClicked(int row, int col, const juce::MouseEvent&) {
-    if (row >= session_.clips.size()) return;
-    auto& c = session_.clips.getReference(row);
-    if (col == cDcp) { c.copyPermitted = !c.copyPermitted; if (c.copyPermitted) c.scms = false; sessionChanged(); }
-    if (col == cPre) { c.preEmphasis = !c.preEmphasis; sessionChanged(); }
-    if (col == cStart || col == cNum) engine_.setPositionSeconds(juce::jmax(0.0, session_.layout().clips[row].start - 1.0));
+void MainComponent::cellClicked(int row, int, const juce::MouseEvent&) {
+    if (row >= session_.markers.size()) return;
+    timeline_.selectMarker(session_.markers[row].id);
+    engine_.setPositionSeconds(session_.markers[row].t);
 }
 
-void MainComponent::selectedRowsChanged(int) {}
+void MainComponent::cellDoubleClicked(int row, int col, const juce::MouseEvent&) {
+    if (row >= session_.markers.size()) return;
+    auto& m = session_.markers.getReference(row);
+    if (m.type != Marker::TrackStart) return;
+    if (col == pDcp) { m.copyPermitted = !m.copyPermitted; if (m.copyPermitted) m.scms = false; sessionChanged(); }
+    if (col == pPre) { m.preEmphasis = !m.preEmphasis; sessionChanged(); }
+}
+
+void MainComponent::deleteKeyPressed(int row) {
+    if (row < session_.markers.size()) { session_.removeMarker(session_.markers[row].id); sessionChanged(); }
+}
 
 juce::String MainComponent::cellText(int row, int col) const {
-    if (row < 0 || row >= session_.clips.size()) return {};
-    const auto& c = session_.clips.getReference(row);
-    auto lay = session_.layout();
+    if (row < 0 || row >= session_.markers.size()) return {};
+    const auto& m = session_.markers.getReference(row);
+    const bool track = m.type == Marker::TrackStart;
     switch (col) {
-        case cNum: return juce::String(row + 1);
-        case cTitle: return juce::String::fromUTF8(c.text.title.c_str());
-        case cPerformer: return juce::String::fromUTF8(c.text.performer.c_str());
-        case cIsrc: return juce::String(c.isrc);
-        case cGap: return juce::String(c.gapBeforeSec, 2);
-        case cPause: return juce::String(c.pauseSec, 2);
-        case cGain: return juce::String(c.gainDb, 1);
-        case cFadeIn: return juce::String(c.fadeInSec, 2);
-        case cFadeOut: return juce::String(c.fadeOutSec, 2);
-        case cStart: return msf(lay.clips[row].start);
-        case cLength: {
-            double next = row + 1 < lay.clips.size() ? lay.clips[row + 1].start : lay.total;
-            return msf(next - lay.clips[row].start);
+        case pTrack: return track ? juce::String(markerRowToTrackNumber(row)) : juce::String();
+        case pType: return track ? "Track" : m.type == Marker::Index ? "Index" : m.type == Marker::PauseStart ? "Pause" : "End";
+        case pTime: return msfString(m.t);
+        case pLength: {
+            if (!track) return {};
+            double next = session_.end();
+            for (int i = row + 1; i < session_.markers.size(); ++i)
+                if (session_.markers[i].type == Marker::TrackStart) { next = session_.markers[i].t; break; }
+            return msfString(next - m.t);
         }
-        case cDcp: return c.copyPermitted ? "Yes" : "-";
-        case cPre: return c.preEmphasis ? "Yes" : "-";
+        case pTitle: return track ? juce::String::fromUTF8(m.text.title.c_str()) : juce::String();
+        case pPerformer: return track ? juce::String::fromUTF8(m.text.performer.c_str()) : juce::String();
+        case pIsrc: return track ? juce::String(m.isrc) : juce::String();
+        case pDcp: return track ? (m.copyPermitted ? "Yes" : "-") : juce::String();
+        case pPre: return track ? (m.preEmphasis ? "Yes" : "-") : juce::String();
         default: return {};
     }
 }
 
 void MainComponent::setCellText(int row, int col, const juce::String& t) {
-    if (row < 0 || row >= session_.clips.size()) return;
-    auto& c = session_.clips.getReference(row);
+    if (row < 0 || row >= session_.markers.size()) return;
+    auto& m = session_.markers.getReference(row);
     switch (col) {
-        case cTitle: c.text.title = t.toStdString(); c.name = t; break;
-        case cPerformer: c.text.performer = t.toStdString(); break;
-        case cIsrc: c.isrc = cd::normaliseIsrc(t.toStdString()); break;
-        case cGap: c.gapBeforeSec = parseTime(t, c.gapBeforeSec); break;
-        case cPause: c.pauseSec = juce::jmax(0.0, parseTime(t, c.pauseSec)); break;
-        case cGain: c.gainDb = juce::jlimit(-60.0, 24.0, t.getDoubleValue()); break;
-        case cFadeIn: c.fadeInSec = juce::jlimit(0.0, c.durationSec(), parseTime(t, c.fadeInSec)); break;
-        case cFadeOut: c.fadeOutSec = juce::jlimit(0.0, c.durationSec(), parseTime(t, c.fadeOutSec)); break;
+        case pTime: session_.moveMarker(m.id, parseTimeString(t, m.t)); break;
+        case pTitle: m.text.title = t.toStdString(); break;
+        case pPerformer: m.text.performer = t.toStdString(); break;
+        case pIsrc: m.isrc = cd::normaliseIsrc(t.toStdString()); break;
         default: return;
     }
     sessionChanged();
 }
 
 void MainComponent::refreshIssues() {
-    if (session_.clips.isEmpty()) { issues_.setText("No tracks yet."); return; }
+    if (session_.regions.isEmpty()) { issues_.setText("No audio yet."); return; }
     juce::StringArray adj;
     auto disc = session_.toDisc(&adj);
     auto issues = cd::validate(disc);
@@ -718,14 +795,16 @@ void MainComponent::refreshIssues() {
     int errors = 0;
     for (auto& i : issues) {
         if (i.level == cd::Issue::Error) ++errors;
-        s << (i.level == cd::Issue::Error ? "ERROR    " : "Warning  ") << juce::String::fromUTF8(i.message.c_str()) << "\n";
+        s << (i.level == cd::Issue::Error ? "ERROR  " : "Warn   ") << juce::String::fromUTF8(i.message.c_str()) << "\n";
     }
-    if (!cdt.error.empty()) { ++errors; s << "ERROR    " << juce::String::fromUTF8(cdt.error.c_str()) << "\n"; }
-    for (auto& a : adj) s << "Note     " << a << "\n";
-    for (auto& c : session_.clips)
-        if (!c.file.existsAsFile()) { ++errors; s << "ERROR    Missing file: " << c.file.getFullPathName() << "\n"; }
-    auto head = juce::String(session_.clips.size()) + " tracks, " + msf(session_.layout().total) + " total. ";
-    head << (errors ? juce::String(errors) + " problem(s) to fix before export.\n" : "Ready for DDP export.\n");
+    if (!cdt.error.empty()) { ++errors; s << "ERROR  " << juce::String::fromUTF8(cdt.error.c_str()) << "\n"; }
+    for (auto& a : adj) s << "Note   " << a << "\n";
+    juce::StringArray missing;
+    for (auto& r : session_.regions)
+        if (!r.file.existsAsFile()) missing.addIfNotAlreadyThere(r.file.getFileName());
+    for (auto& m : missing) { ++errors; s << "ERROR  Missing file: " << m << "\n"; }
+    juce::String head = juce::String(int(disc.tracks.size())) + " tracks, " + msfString(session_.end()) + ". ";
+    head << (errors ? juce::String(errors) + " problem(s) to fix before DDP.\n" : "Ready for DDP.\n");
     issues_.setText(head + s);
 }
 
@@ -750,7 +829,7 @@ void MainComponent::showPluginScanner() {
     list->setSize(700, 500);
     juce::DialogWindow::LaunchOptions o;
     o.content.setOwned(list);
-    o.dialogTitle = "Plugins (press Options > Scan to find new ones)";
+    o.dialogTitle = "Plugins (Options > Scan to find new ones)";
     o.dialogBackgroundColour = colours::bg;
     o.useNativeTitleBar = true;
     o.resizable = true;
@@ -791,30 +870,6 @@ ExportSettings MainComponent::exportSettings() const {
     return es;
 }
 
-namespace {
-// Runs `work` on a background thread behind a progress window, then calls `done` on the
-// message thread. The window deletes itself; shared state lives in the lambdas' captures.
-struct Job : juce::ThreadWithProgressWindow {
-    std::function<void(Job&)> work;
-    std::function<void(bool cancelled)> done;
-    explicit Job(const juce::String& t) : ThreadWithProgressWindow(t, true, true) {}
-    void run() override { work(*this); }
-    void threadComplete(bool cancelled) override {
-        auto d = std::move(done);
-        delete this;
-        if (d) d(cancelled);
-    }
-    bool keep(double p) { setProgress(p); return !threadShouldExit(); }
-};
-
-void runJob(const juce::String& title, std::function<void(Job&)> work, std::function<void(bool)> done) {
-    auto* j = new Job(title);
-    j->work = std::move(work);
-    j->done = std::move(done);
-    j->launchThread();
-}
-}  // namespace
-
 void MainComponent::showExportMenu() {
     juce::PopupMenu m;
     m.addItem(1, "DDP image for replication (CD master)");
@@ -836,9 +891,7 @@ void MainComponent::showExportMenu() {
                 auto snapshot = std::make_shared<Session>(session_);
                 auto err = std::make_shared<juce::String>();
                 runJob("Exporting programme WAV...",
-                       [this, snapshot, err, f, bits, es](Job& j) {
-                           *err = exporter_.exportProgramWav(*snapshot, f, bits, es, [&](double p) { return j.keep(p); });
-                       },
+                       [this, snapshot, err, f, bits, es](Job& j) { *err = exporter_.exportProgramWav(*snapshot, f, bits, es, [&](double p) { return j.keep(p); }); },
                        [err, f](bool) {
                            if (err->isNotEmpty()) juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Export", *err);
                            else f.revealToUser();
@@ -852,14 +905,11 @@ void MainComponent::exportDdp() {
     juce::StringArray adj;
     auto disc = session_.toDisc(&adj);
     if (cd::hasErrors(cd::validate(disc)) || !cd::encodeCdText(disc).error.empty()) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Not ready",
-                                               "Fix the errors listed at the bottom of the window first.");
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Not ready", "Fix the errors listed in the issues panel first.");
         return;
     }
-    chooser_ = std::make_unique<juce::FileChooser>("Choose where to create the DDP folder",
-                                                   juce::File::getSpecialLocation(juce::File::userDesktopDirectory));
-    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
-                          [this](const juce::FileChooser& fc) {
+    chooser_ = std::make_unique<juce::FileChooser>("Choose where to create the DDP folder", juce::File::getSpecialLocation(juce::File::userDesktopDirectory));
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories, [this](const juce::FileChooser& fc) {
         auto parent = fc.getResult();
         if (!parent.isDirectory()) return;
         auto name = juce::File::createLegalFileName((session_.discTitle.isEmpty() ? juce::String("Lathe") : session_.discTitle) + " DDP");
@@ -869,9 +919,7 @@ void MainComponent::exportDdp() {
         auto res = std::make_shared<ddp::WriteResult>();
         auto qc = std::make_shared<QcReport>();
         runJob("Writing DDP image...",
-               [this, snapshot, folder, es, res, qc](Job& j) {
-                   *res = exporter_.exportDdp(*snapshot, folder, es, [&](double p) { return j.keep(p); }, *qc);
-               },
+               [this, snapshot, folder, es, res, qc](Job& j) { *res = exporter_.exportDdp(*snapshot, folder, es, [&](double p) { return j.keep(p); }, *qc); },
                [this, res, qc, folder](bool) {
             if (!res->ok) {
                 juce::String msg = juce::String::fromUTF8(res->error.c_str());
@@ -879,12 +927,9 @@ void MainComponent::exportDdp() {
                 juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "DDP export failed", msg);
                 return;
             }
-            // Re-read and checksum what was written: catches disk/USB faults now, not at the plant.
             auto check = std::make_shared<ddp::ReadResult>();
             runJob("Verifying DDP...",
-                   [check, folder](Job& j) {
-                       *check = ddp::readDdp(folder.getFullPathName().toStdString(), [&](double p) { j.setProgress(p); });
-                   },
+                   [check, folder](Job& j) { *check = ddp::readDdp(folder.getFullPathName().toStdString(), [&](double p) { j.setProgress(p); }); },
                    [this, check, res, qc, folder](bool) {
                 juce::String msg;
                 msg << "DDP written to:\n" << folder.getFullPathName() << "\n\nImage MD5: " << res->imageMd5 << "\n";
@@ -899,19 +944,15 @@ void MainComponent::exportDdp() {
 }
 
 void MainComponent::exportTrackWavs() {
-    chooser_ = std::make_unique<juce::FileChooser>("Choose a folder for the track WAVs",
-                                                   juce::File::getSpecialLocation(juce::File::userDesktopDirectory));
-    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
-                          [this](const juce::FileChooser& fc) {
+    chooser_ = std::make_unique<juce::FileChooser>("Choose a folder for the track WAVs", juce::File::getSpecialLocation(juce::File::userDesktopDirectory));
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories, [this](const juce::FileChooser& fc) {
         auto folder = fc.getResult();
         if (!folder.isDirectory()) return;
         auto snapshot = std::make_shared<Session>(session_);
         auto es = exportSettings();
         auto err = std::make_shared<juce::String>();
         runJob("Exporting track WAVs...",
-               [this, snapshot, folder, es, err](Job& j) {
-                   *err = exporter_.exportTrackWavs(*snapshot, folder, es, [&](double p) { return j.keep(p); });
-               },
+               [this, snapshot, folder, es, err](Job& j) { *err = exporter_.exportTrackWavs(*snapshot, folder, es, [&](double p) { return j.keep(p); }); },
                [err, folder](bool) {
                    if (err->isNotEmpty()) juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Export", *err);
                    else folder.revealToUser();
@@ -920,7 +961,7 @@ void MainComponent::exportTrackWavs() {
 }
 
 void MainComponent::analyse() {
-    if (session_.clips.isEmpty()) return;
+    if (session_.regions.isEmpty()) return;
     auto snapshot = std::make_shared<Session>(session_);
     auto es = exportSettings();
     auto qc = std::make_shared<QcReport>();
@@ -935,8 +976,7 @@ void MainComponent::analyse() {
 
 void MainComponent::verifyDdp() {
     chooser_ = std::make_unique<juce::FileChooser>("Choose a DDP folder to verify");
-    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
-                          [this](const juce::FileChooser& fc) {
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories, [this](const juce::FileChooser& fc) {
         auto folder = fc.getResult();
         if (!folder.isDirectory()) return;
         auto r = std::make_shared<ddp::ReadResult>();
@@ -993,7 +1033,7 @@ bool MainComponent::isInterestedInFileDrag(const juce::StringArray& files) {
     return false;
 }
 
-void MainComponent::filesDropped(const juce::StringArray& files, int, int) {
+void MainComponent::filesDropped(const juce::StringArray& files, int x, int y) {
     juce::Array<juce::File> audio;
     for (auto& f : files) {
         juce::File file(f);
@@ -1001,11 +1041,12 @@ void MainComponent::filesDropped(const juce::StringArray& files, int, int) {
         audio.add(file);
     }
     audio.sort();
-    addFiles(audio);
+    // Dropped on the source window: open the first file there. Anywhere else: import as tracks.
+    if (source_.getBounds().contains(x, y) && !audio.isEmpty()) { source_.open(audio.getFirst()); return; }
+    importFiles(audio);
 }
 
 void MainComponent::changeListenerCallback(juce::ChangeBroadcaster*) {
-    // Device changed (e.g. sample rate): rebuild the streaming source at the new rate.
     if (std::abs(engine_.deviceRate() - lastDeviceRate_) > 0.5) {
         lastDeviceRate_ = engine_.deviceRate();
         engine_.loadSession(session_);
@@ -1014,25 +1055,30 @@ void MainComponent::changeListenerCallback(juce::ChangeBroadcaster*) {
 
 void MainComponent::timerCallback() {
     double pos = engine_.positionSeconds();
-    overview_->setPlayhead(pos);
-    timeDisplay_.setText(msf(pos), juce::dontSendNotification);
-    auto lay = session_.layout();
+    if (auditionEnd_ >= 0 && engine_.isPlaying() && pos >= auditionEnd_) { engine_.stop(); auditionEnd_ = -1; }
+    timeline_.setPlayhead(pos, engine_.isPlaying());
+    if (xfadeEditor_) xfadeEditor_->setPlayhead(pos);
+    source_.tick();
+    timeDisplay_.setText(msfString(pos), juce::dontSendNotification);
+
     juce::String tr;
-    for (int i = 0; i < lay.clips.size(); ++i) {
-        if (pos >= lay.clips[i].start - session_.clips[i].pauseSec && (i + 1 >= lay.clips.size() || pos < lay.clips[i + 1].start - session_.clips[i + 1].pauseSec)) {
-            double rel = pos - lay.clips[i].start;
-            tr = "Track " + juce::String(i + 1) + "  " + (rel < 0 ? "-" + msf(-rel) : msf(rel));
-            break;
-        }
-    }
+    auto ranges = session_.trackRanges();
+    for (int i = 0; i < ranges.size(); ++i)
+        if (pos >= ranges[i].getStart() && pos < ranges[i].getEnd()) { tr = "Track " + juce::String(i + 1) + "  " + msfString(pos - ranges[i].getStart()); break; }
+    if (tr.isEmpty() && !ranges.isEmpty() && pos < ranges[0].getStart()) tr = "Pregap  -" + msfString(ranges[0].getStart() - pos);
     trackDisplay_.setText(tr, juce::dontSendNotification);
+
+    auto sel = timeline_.selection();
+    selDisplay_.setText(sel.isEmpty() ? juce::String() : "Dest In " + msfString(sel.getStart()) + "  Out " + msfString(sel.getEnd()) +
+                                                              "  (" + msfString(sel.getLength()) + ")",
+                        juce::dontSendNotification);
     playBtn_.setButtonText(engine_.isPlaying() ? "Stop" : "Play");
     meters_->prepare(engine_.deviceRate());
     meters_->feed(engine_.meterTap());
 
     double pr = session_.effectiveRate(), dr = engine_.deviceRate();
-    rateWarning_.setText(!session_.clips.isEmpty() && std::abs(pr - dr) > 0.5
-                             ? "Monitoring at " + juce::String(dr / 1000.0, 1) + " kHz; project is " + juce::String(pr / 1000.0, 1) + " kHz"
+    rateWarning_.setText(!session_.regions.isEmpty() && std::abs(pr - dr) > 0.5
+                             ? "Monitoring at " + juce::String(dr / 1000.0, 1) + " kHz; project " + juce::String(pr / 1000.0, 1) + " kHz"
                              : juce::String(),
                          juce::dontSendNotification);
 }

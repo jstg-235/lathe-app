@@ -2,31 +2,342 @@
 
 namespace lathe {
 
-double Session::effectiveRate() const {
-    if (projectRate > 0) return projectRate;
-    return clips.isEmpty() ? 44100.0 : clips.getReference(0).fileRate;
+static constexpr double kEps = 1e-9;
+
+juce::String fadeShapeName(FadeShape s) {
+    switch (s) {
+        case FadeShape::Linear: return "Linear";
+        case FadeShape::EqualPower: return "Equal power";
+        case FadeShape::SCurve: return "S-curve";
+        case FadeShape::Exponential: return "Exponential";
+        case FadeShape::Logarithmic: return "Logarithmic";
+    }
+    return {};
 }
 
-Layout Session::layout() const {
-    Layout l;
-    double cursor = 0;
-    for (int i = 0; i < clips.size(); ++i) {
-        const Clip& c = clips.getReference(i);
-        double gap = c.gapBeforeSec;
-        if (i == 0) gap = juce::jmax(0.0, gap);
-        // An overlap can't be longer than either clip.
-        if (i > 0 && gap < 0) {
-            double prevLen = l.clips.getReference(i - 1).end - l.clips.getReference(i - 1).start;
-            gap = juce::jmax(gap, -juce::jmin(prevLen, c.durationSec()) * 0.95);
-        }
-        ClipPlacement p;
-        p.start = cursor + gap;
-        p.end = p.start + c.durationSec();
-        l.clips.add(p);
-        cursor = p.end;
-        l.total = juce::jmax(l.total, p.end);
+double fadeGain(FadeShape s, double x) {
+    x = juce::jlimit(0.0, 1.0, x);
+    switch (s) {
+        case FadeShape::Linear: return x;
+        case FadeShape::EqualPower: return std::sin(juce::MathConstants<double>::halfPi * x);
+        case FadeShape::SCurve: return 0.5 - 0.5 * std::cos(juce::MathConstants<double>::pi * x);
+        case FadeShape::Exponential: return x * x;
+        case FadeShape::Logarithmic: return std::sqrt(x);
     }
-    return l;
+    return x;
+}
+
+double Region::envelopeDb(double t) const {
+    if (envelope.isEmpty()) return 0;
+    if (t <= envelope.getFirst().t) return envelope.getFirst().db;
+    if (t >= envelope.getLast().t) return envelope.getLast().db;
+    for (int i = 1; i < envelope.size(); ++i) {
+        const auto& a = envelope.getReference(i - 1);
+        const auto& b = envelope.getReference(i);
+        if (t <= b.t) {
+            double f = b.t > a.t ? (t - a.t) / (b.t - a.t) : 1.0;
+            return a.db + (b.db - a.db) * f;
+        }
+    }
+    return envelope.getLast().db;
+}
+
+// ---- queries ----------------------------------------------------------------------
+
+double Session::effectiveRate() const {
+    if (projectRate > 0) return projectRate;
+    return regions.isEmpty() ? 44100.0 : regions.getReference(0).fileRate;
+}
+
+double Session::end() const {
+    double e = 0;
+    for (auto& r : regions)
+        if (!r.mute) e = juce::jmax(e, r.end());
+    for (auto& m : markers)
+        if (m.type == Marker::EndOfDisc) e = m.t;
+    return e;
+}
+
+Region* Session::findRegion(int id) {
+    for (auto& r : regions)
+        if (r.id == id) return &r;
+    return nullptr;
+}
+
+const Region* Session::findRegion(int id) const {
+    for (auto& r : regions)
+        if (r.id == id) return &r;
+    return nullptr;
+}
+
+int Session::indexOfRegion(int id) const {
+    for (int i = 0; i < regions.size(); ++i)
+        if (regions.getReference(i).id == id) return i;
+    return -1;
+}
+
+Marker* Session::findMarker(int id) {
+    for (auto& m : markers)
+        if (m.id == id) return &m;
+    return nullptr;
+}
+
+void Session::sortMarkers() {
+    std::stable_sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) {
+        if (std::abs(a.t - b.t) > kEps) return a.t < b.t;
+        // At the same time: pause before track start before index.
+        auto rank = [](Marker::Type t) { return t == Marker::PauseStart ? 0 : t == Marker::TrackStart ? 1 : t == Marker::Index ? 2 : 3; };
+        return rank(a.type) < rank(b.type);
+    });
+}
+
+EffectiveFades Session::fadesFor(int i) const {
+    const Region& r = regions.getReference(i);
+    EffectiveFades f{r.fadeIn, r.fadeOut, r.fadeInShape, r.fadeOutShape};
+    for (int j = 0; j < regions.size(); ++j) {
+        if (j == i) continue;
+        const Region& o = regions.getReference(j);
+        if (o.lane != r.lane || o.mute) continue;
+        if (o.start < r.start - kEps && o.end() > r.start + kEps)   // o fades out into r
+            f.in = juce::jmax(f.in, juce::jmin(o.end(), r.end()) - r.start);
+        if (o.start > r.start + kEps && o.start < r.end() - kEps)   // r fades out into o
+            f.out = juce::jmax(f.out, r.end() - o.start);
+    }
+    f.in = juce::jmin(f.in, r.length());
+    f.out = juce::jmin(f.out, r.length());
+    return f;
+}
+
+juce::Array<juce::Range<double>> Session::trackRanges() const {
+    juce::Array<double> starts;
+    for (auto& m : markers)
+        if (m.type == Marker::TrackStart) starts.add(m.t);
+    std::sort(starts.begin(), starts.end());
+    juce::Array<juce::Range<double>> out;
+    for (int i = 0; i < starts.size(); ++i)
+        out.add({starts[i], i + 1 < starts.size() ? starts[i + 1] : end()});
+    return out;
+}
+
+// ---- editing ----------------------------------------------------------------------
+
+Region Session::makeRegion(const juce::File& f, double rate, juce::int64 length) {
+    Region r;
+    r.id = nextId++;
+    r.file = f;
+    r.name = f.getFileNameWithoutExtension();
+    r.fileRate = rate > 0 ? rate : 44100;
+    r.fileLength = length;
+    r.srcIn = 0;
+    r.srcOut = length;
+    return r;
+}
+
+void Session::regionMoved(int id, double dt) {
+    if (std::abs(dt) < kEps) return;
+    for (auto& m : markers)
+        if (m.attachedRegion == id) m.t += dt;
+    sortMarkers();
+}
+
+int Session::append(Region r, double gap, bool addTrackMarker) {
+    double laneEnd = 0;
+    bool any = false;
+    for (auto& o : regions)
+        if (o.lane == r.lane) { laneEnd = juce::jmax(laneEnd, o.end()); any = true; }
+    if (!any) gap = juce::jmax(gap, 2.0);   // Red Book: at least 2 s before track 1
+    r.start = laneEnd + gap;
+    if (r.id == 0) r.id = nextId++;
+    regions.add(r);
+    if (addTrackMarker) {
+        int m = addMarker(Marker::TrackStart, r.start, r.id);
+        if (auto* mk = findMarker(m)) {
+            mk->text.title = r.name.toStdString();
+            mk->text.performer = discPerformer.toStdString();
+        }
+        if (any && gap > 0) addMarker(Marker::PauseStart, laneEnd, r.id);
+    }
+    return r.id;
+}
+
+void Session::moveRegion(int id, double newStart, int newLane) {
+    auto* r = findRegion(id);
+    if (!r) return;
+    newStart = juce::jmax(0.0, newStart);
+    double dt = newStart - r->start;
+    r->start = newStart;
+    r->lane = juce::jlimit(0, lanes - 1, newLane);
+    regionMoved(id, dt);
+}
+
+void Session::trimRegionStart(int id, double newStart) {
+    auto* r = findRegion(id);
+    if (!r) return;
+    double earliest = r->start - double(r->srcIn) / r->fileRate;
+    newStart = juce::jlimit(juce::jmax(0.0, earliest), r->end() - 0.01, newStart);
+    auto delta = juce::int64(std::llround((newStart - r->start) * r->fileRate));
+    r->srcIn = juce::jlimit<juce::int64>(0, r->srcOut - 1, r->srcIn + delta);
+    double shift = double(delta) / r->fileRate;
+    r->start += shift;
+    for (auto& p : r->envelope) p.t -= shift;
+}
+
+void Session::trimRegionEnd(int id, double newEnd) {
+    auto* r = findRegion(id);
+    if (!r) return;
+    double latest = r->start + double(r->fileLength - r->srcIn) / r->fileRate;
+    newEnd = juce::jlimit(r->start + 0.01, latest, newEnd);
+    r->srcOut = juce::jlimit<juce::int64>(r->srcIn + 1, r->fileLength, r->srcIn + juce::int64(std::llround((newEnd - r->start) * r->fileRate)));
+}
+
+void Session::deleteRegion(int id, bool rippleAfter) {
+    int i = indexOfRegion(id);
+    if (i < 0) return;
+    Region r = regions[i];
+    regions.remove(i);
+    for (int k = markers.size(); --k >= 0;)
+        if (markers.getReference(k).attachedRegion == id) markers.remove(k);
+    if (rippleAfter) ripple(r.end() - kEps * 10, -r.length());
+}
+
+int Session::split(int id, double t) {
+    auto* r = findRegion(id);
+    if (!r || t <= r->start + 0.001 || t >= r->end() - 0.001) return 0;
+    Region b = *r;
+    b.id = nextId++;
+    auto cut = r->srcIn + juce::int64(std::llround((t - r->start) * r->fileRate));
+    b.srcIn = cut;
+    b.start = r->start + double(cut - r->srcIn) / r->fileRate;
+    b.fadeIn = 0;
+    b.envelope.clear();
+    for (auto& p : r->envelope)
+        if (p.t >= t - r->start) b.envelope.add({p.t - (b.start - r->start), p.db});
+    if (!r->envelope.isEmpty()) {
+        double dbAtCut = r->envelopeDb(t - r->start);
+        b.envelope.insert(0, {0.0, dbAtCut});
+        juce::Array<GainPoint> keep;
+        for (auto& p : r->envelope)
+            if (p.t < t - r->start) keep.add(p);
+        keep.add({t - r->start, dbAtCut});
+        r->envelope = keep;
+    }
+    r->srcOut = cut;
+    r->fadeOut = 0;
+    const int aId = r->id;
+    for (auto& m : markers)
+        if (m.attachedRegion == aId && m.t >= b.start - kEps) m.attachedRegion = b.id;
+    regions.add(b);
+    return b.id;
+}
+
+void Session::ripple(double t, double dt, int except) {
+    if (std::abs(dt) < kEps) return;
+    for (auto& r : regions)
+        if (r.id != except && r.start >= t - kEps) r.start = juce::jmax(0.0, r.start + dt);
+    for (auto& m : markers)
+        if (m.t >= t - kEps && (except == 0 || m.attachedRegion != except)) m.t = juce::jmax(0.0, m.t + dt);
+    sortMarkers();
+}
+
+int Session::sourceEdit(const juce::File& f, double rate, juce::int64 len, juce::int64 sIn, juce::int64 sOut, int lane,
+                        double dIn, double dOut, EditMode mode) {
+    sIn = juce::jlimit<juce::int64>(0, len, sIn);
+    sOut = juce::jlimit<juce::int64>(sIn + 1, len, sOut);
+    const double srcLen = double(sOut - sIn) / rate;
+    dIn = juce::jmax(0.0, dIn);
+
+    auto clearRange = [this, lane](double a, double b) {
+        for (int i = regions.size(); --i >= 0;) {
+            Region r = regions[i];
+            if (r.lane != lane || r.end() <= a + kEps || r.start >= b - kEps) continue;
+            if (r.start >= a - kEps && r.end() <= b + kEps) { regions.remove(i); continue; }
+            if (r.start < a && r.end() > b) {
+                int tail = split(r.id, b);
+                trimRegionEnd(r.id, a);
+                juce::ignoreUnused(tail);
+                continue;
+            }
+            if (r.start < a) trimRegionEnd(r.id, a);
+            else trimRegionStart(r.id, b);
+        }
+    };
+
+    if (mode == EditMode::Insert || (mode == EditMode::Replace && dOut <= dIn)) {
+        for (auto& r : regions)
+            if (r.lane == lane && r.start < dIn - kEps && r.end() > dIn + kEps) { split(r.id, dIn); break; }
+        ripple(dIn, srcLen);
+    } else if (mode == EditMode::Overwrite) {
+        clearRange(dIn, dIn + srcLen);
+    } else {   // Replace: 4-point
+        clearRange(dIn, dOut);
+        ripple(dOut, srcLen - (dOut - dIn));
+    }
+
+    Region r = makeRegion(f, rate, len);
+    r.srcIn = sIn;
+    r.srcOut = sOut;
+    r.lane = lane;
+    r.start = dIn;
+    regions.add(r);
+    return r.id;
+}
+
+void Session::setCrossfadeLength(int outgoing, int incoming, double len, bool rippleAfter) {
+    auto* a = findRegion(outgoing);
+    auto* b = findRegion(incoming);
+    if (!a || !b) return;
+    len = juce::jlimit(0.0, juce::jmin(a->length(), b->length()) * 0.95, len);
+    double newStart = a->end() - len;
+    double oldStart = b->start;
+    double dt = newStart - oldStart;
+    b->start = newStart;
+    regionMoved(b->id, dt);
+    if (rippleAfter) {
+        ripple(oldStart + 1e-6, dt, b->id);
+        a = findRegion(outgoing);
+        b = findRegion(incoming);
+    }
+    a->fadeOut = juce::jmin(a->fadeOut, len);
+    b->fadeIn = juce::jmin(b->fadeIn, len);
+}
+
+void Session::slip(int id, double dt) {
+    auto* r = findRegion(id);
+    if (!r) return;
+    auto d = juce::int64(std::llround(dt * r->fileRate));
+    d = juce::jlimit(-r->srcIn, r->fileLength - r->srcOut, d);
+    r->srcIn += d;
+    r->srcOut += d;
+}
+
+int Session::addMarker(Marker::Type type, double t, int attachTo) {
+    Marker m;
+    m.id = nextId++;
+    m.type = type;
+    m.t = juce::jmax(0.0, t);
+    if (attachTo < 0) {
+        attachTo = 0;
+        for (auto& r : regions)
+            if (t >= r.start - kEps && t < r.end() && (attachTo == 0 || r.lane < findRegion(attachTo)->lane)) attachTo = r.id;
+    }
+    m.attachedRegion = attachTo;
+    if (type == Marker::TrackStart) {
+        if (auto* r = findRegion(attachTo)) m.text.title = r->name.toStdString();
+        m.text.performer = discPerformer.toStdString();
+    }
+    markers.add(m);
+    sortMarkers();
+    return m.id;
+}
+
+void Session::removeMarker(int id) {
+    for (int i = 0; i < markers.size(); ++i)
+        if (markers.getReference(i).id == id) { markers.remove(i); return; }
+}
+
+void Session::moveMarker(int id, double t) {
+    if (auto* m = findMarker(id)) m->t = juce::jmax(0.0, t);
+    sortMarkers();
 }
 
 static int64_t toSector(double sec) { return int64_t(std::llround(sec * cd::kFramesPerSecond)); }
@@ -37,36 +348,42 @@ cd::Disc Session::toDisc(juce::StringArray* adj) const {
     d.masterId = masterId.toStdString();
     d.text.title = discTitle.toStdString();
     d.text.performer = discPerformer.toStdString();
-    auto lay = layout();
-    d.leadOutSector = int64_t(std::ceil(lay.total * cd::kFramesPerSecond - 1e-9));
+    d.leadOutSector = int64_t(std::ceil(end() * cd::kFramesPerSecond - 1e-6));
 
-    int64_t prevEndSector = 0;
-    for (int i = 0; i < clips.size(); ++i) {
-        const Clip& c = clips.getReference(i);
-        const auto& p = lay.clips.getReference(i);
-        cd::Track t;
-        int64_t start = toSector(p.start);
-        int64_t pauseLen = toSector(juce::jmax(0.0, c.pauseSec));
-        int64_t idx0 = i == 0 ? 0 : juce::jmax(prevEndSector, start - pauseLen);
-        if (i > 0 && c.gapBeforeSec < 0) idx0 = start;    // crossfade: no pause possible
-        if (idx0 < start) t.indexes.push_back({0, idx0});
-        else if (i == 0) t.indexes.push_back({0, 0});
-        t.indexes.push_back({1, start});
-        int n = 2;
-        for (double off : c.subIndexSec) {
-            int64_t s = toSector(p.start + off);
-            if (s > t.indexes.back().sector && s < toSector(p.end)) t.indexes.push_back({n++, s});
-            else if (adj) adj->add("Track " + juce::String(i + 1) + ": a sub-index outside the track was skipped.");
+    Session s = *this;
+    s.sortMarkers();
+    double pendingPause = -1;
+    int skippedIndexes = 0;
+    for (auto& m : s.markers) {
+        if (m.type == Marker::PauseStart) { pendingPause = m.t; continue; }
+        if (m.type == Marker::EndOfDisc) continue;
+        if (m.type == Marker::Index) {
+            if (d.tracks.empty()) { ++skippedIndexes; continue; }
+            auto& t = d.tracks.back();
+            int64_t sec = toSector(m.t);
+            if (sec > t.indexes.back().sector && t.indexes.size() < 100) t.indexes.push_back({t.indexes.back().number + 1, sec});
+            else ++skippedIndexes;
+            continue;
         }
-        t.isrc = cd::normaliseIsrc(c.isrc);
-        t.copyPermitted = c.copyPermitted;
-        t.preEmphasis = c.preEmphasis;
-        t.scms = c.scms;
-        t.text = c.text;
-        if (t.text.title.empty()) t.text.title = c.name.toStdString();
+        cd::Track t;
+        int64_t start = toSector(m.t);
+        int64_t prev = d.tracks.empty() ? -1 : d.tracks.back().indexes.back().sector;
+        if (d.tracks.empty()) t.indexes.push_back({0, 0});
+        else if (pendingPause >= 0) {
+            int64_t p = toSector(pendingPause);
+            if (p > prev && p < start) t.indexes.push_back({0, p});
+        }
+        pendingPause = -1;
+        if (!t.indexes.empty() && t.indexes.back().sector >= start) t.indexes.pop_back();
+        t.indexes.push_back({1, start});
+        t.isrc = cd::normaliseIsrc(m.isrc);
+        t.copyPermitted = m.copyPermitted;
+        t.preEmphasis = m.preEmphasis;
+        t.scms = m.scms;
+        t.text = m.text;
         d.tracks.push_back(t);
-        prevEndSector = toSector(p.end);
     }
+    if (adj && skippedIndexes) adj->add(juce::String(skippedIndexes) + " index marker(s) outside a track were skipped.");
     return d;
 }
 
@@ -74,12 +391,12 @@ cd::Disc Session::toDisc(juce::StringArray* adj) const {
 
 static juce::var textToVar(const cd::CdText& t) {
     auto* o = new juce::DynamicObject();
-    o->setProperty("title", juce::String(t.title));
-    o->setProperty("performer", juce::String(t.performer));
-    o->setProperty("songwriter", juce::String(t.songwriter));
-    o->setProperty("composer", juce::String(t.composer));
-    o->setProperty("arranger", juce::String(t.arranger));
-    o->setProperty("message", juce::String(t.message));
+    o->setProperty("title", juce::String::fromUTF8(t.title.c_str()));
+    o->setProperty("performer", juce::String::fromUTF8(t.performer.c_str()));
+    o->setProperty("songwriter", juce::String::fromUTF8(t.songwriter.c_str()));
+    o->setProperty("composer", juce::String::fromUTF8(t.composer.c_str()));
+    o->setProperty("arranger", juce::String::fromUTF8(t.arranger.c_str()));
+    o->setProperty("message", juce::String::fromUTF8(t.message.c_str()));
     return o;
 }
 
@@ -97,7 +414,7 @@ static cd::CdText textFromVar(const juce::var& v) {
 juce::var Session::toVar() const {
     auto* root = new juce::DynamicObject();
     root->setProperty("format", "lathe-session");
-    root->setProperty("version", 1);
+    root->setProperty("version", 2);
     root->setProperty("discTitle", discTitle);
     root->setProperty("discPerformer", discPerformer);
     root->setProperty("upcEan", upcEan);
@@ -105,32 +422,48 @@ juce::var Session::toVar() const {
     root->setProperty("client", client);
     root->setProperty("engineer", engineer);
     root->setProperty("projectRate", projectRate);
+    root->setProperty("lanes", lanes);
+    root->setProperty("nextId", nextId);
     root->setProperty("pluginChain", pluginChainState.toBase64Encoding());
-    juce::Array<juce::var> list;
-    for (auto& c : clips) {
+    juce::Array<juce::var> rl;
+    for (auto& r : regions) {
         auto* o = new juce::DynamicObject();
-        o->setProperty("file", c.file.getFullPathName());
-        o->setProperty("name", c.name);
-        o->setProperty("fileRate", c.fileRate);
-        o->setProperty("fileLength", c.fileLength);
-        o->setProperty("trimStart", c.trimStart);
-        o->setProperty("trimEnd", c.trimEnd);
-        o->setProperty("gainDb", c.gainDb);
-        o->setProperty("fadeIn", c.fadeInSec);
-        o->setProperty("fadeOut", c.fadeOutSec);
-        o->setProperty("gapBefore", c.gapBeforeSec);
-        o->setProperty("pause", c.pauseSec);
-        juce::Array<juce::var> subs;
-        for (double s : c.subIndexSec) subs.add(s);
-        o->setProperty("subIndexes", subs);
-        o->setProperty("isrc", juce::String(c.isrc));
-        o->setProperty("dcp", c.copyPermitted);
-        o->setProperty("pre", c.preEmphasis);
-        o->setProperty("scms", c.scms);
-        o->setProperty("text", textToVar(c.text));
-        list.add(o);
+        o->setProperty("id", r.id);
+        o->setProperty("file", r.file.getFullPathName());
+        o->setProperty("name", r.name);
+        o->setProperty("fileRate", r.fileRate);
+        o->setProperty("fileLength", r.fileLength);
+        o->setProperty("srcIn", r.srcIn);
+        o->setProperty("srcOut", r.srcOut);
+        o->setProperty("lane", r.lane);
+        o->setProperty("start", r.start);
+        o->setProperty("gainDb", r.gainDb);
+        o->setProperty("mute", r.mute);
+        o->setProperty("fadeIn", r.fadeIn);
+        o->setProperty("fadeOut", r.fadeOut);
+        o->setProperty("fadeInShape", int(r.fadeInShape));
+        o->setProperty("fadeOutShape", int(r.fadeOutShape));
+        juce::Array<juce::var> env;
+        for (auto& p : r.envelope) env.add(juce::Array<juce::var>{p.t, p.db});
+        o->setProperty("envelope", env);
+        rl.add(o);
     }
-    root->setProperty("clips", list);
+    root->setProperty("regions", rl);
+    juce::Array<juce::var> ml;
+    for (auto& m : markers) {
+        auto* o = new juce::DynamicObject();
+        o->setProperty("id", m.id);
+        o->setProperty("type", int(m.type));
+        o->setProperty("t", m.t);
+        o->setProperty("region", m.attachedRegion);
+        o->setProperty("isrc", juce::String(m.isrc));
+        o->setProperty("dcp", m.copyPermitted);
+        o->setProperty("pre", m.preEmphasis);
+        o->setProperty("scms", m.scms);
+        o->setProperty("text", textToVar(m.text));
+        ml.add(o);
+    }
+    root->setProperty("markers", ml);
     return root;
 }
 
@@ -145,32 +478,99 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     projectRate = double(v["projectRate"]);
     pluginChainState.reset();
     pluginChainState.fromBase64Encoding(v["pluginChain"].toString());
-    clips.clear();
-    if (auto* arr = v["clips"].getArray()) {
+    regions.clear();
+    markers.clear();
+    nextId = 1;
+
+    if (int(v["version"]) < 2) {
+        // v1 sessions: an ordered clip list with gaps. Lay them out and create markers.
+        lanes = 2;
+        double cursor = 0;
+        bool first = true;
+        if (auto* arr = v["clips"].getArray()) {
+            for (auto& o : *arr) {
+                Region r;
+                r.id = nextId++;
+                r.file = juce::File(o["file"].toString());
+                r.name = o["name"].toString();
+                r.fileRate = double(o["fileRate"]) > 0 ? double(o["fileRate"]) : 44100;
+                r.fileLength = juce::int64(o["fileLength"]);
+                r.srcIn = juce::int64(o["trimStart"]);
+                r.srcOut = r.fileLength - juce::int64(o["trimEnd"]);
+                r.gainDb = double(o["gainDb"]);
+                r.fadeIn = double(o["fadeIn"]);
+                r.fadeOut = double(o["fadeOut"]);
+                double gap = double(o["gapBefore"]);
+                if (first) gap = juce::jmax(0.0, gap);
+                r.start = juce::jmax(0.0, cursor + gap);
+                regions.add(r);
+                Marker m;
+                m.id = nextId++;
+                m.type = Marker::TrackStart;
+                m.t = r.start;
+                m.attachedRegion = r.id;
+                m.isrc = o["isrc"].toString().toStdString();
+                m.copyPermitted = bool(o["dcp"]);
+                m.preEmphasis = bool(o["pre"]);
+                m.scms = bool(o["scms"]);
+                m.text = textFromVar(o["text"]);
+                markers.add(m);
+                double pause = double(o["pause"]);
+                if (!first && pause > 0 && gap > 0)
+                    markers.add({nextId++, Marker::PauseStart, juce::jmax(cursor, r.start - pause), r.id});
+                if (auto* subs = o["subIndexes"].getArray())
+                    for (auto& s : *subs) markers.add({nextId++, Marker::Index, r.start + double(s), r.id});
+                cursor = r.end();
+                first = false;
+            }
+        }
+        sortMarkers();
+        return true;
+    }
+
+    lanes = juce::jlimit(1, 16, int(v["lanes"]));
+    nextId = juce::jmax(1, int(v["nextId"]));
+    if (auto* arr = v["regions"].getArray()) {
         for (auto& o : *arr) {
-            Clip c;
-            c.file = juce::File(o["file"].toString());
-            c.name = o["name"].toString();
-            c.fileRate = double(o["fileRate"]);
-            c.fileLength = juce::int64(o["fileLength"]);
-            c.trimStart = juce::int64(o["trimStart"]);
-            c.trimEnd = juce::int64(o["trimEnd"]);
-            c.gainDb = double(o["gainDb"]);
-            c.fadeInSec = double(o["fadeIn"]);
-            c.fadeOutSec = double(o["fadeOut"]);
-            c.gapBeforeSec = double(o["gapBefore"]);
-            c.pauseSec = double(o["pause"]);
-            if (auto* subs = o["subIndexes"].getArray())
-                for (auto& s : *subs) c.subIndexSec.add(double(s));
-            c.isrc = o["isrc"].toString().toStdString();
-            c.copyPermitted = bool(o["dcp"]);
-            c.preEmphasis = bool(o["pre"]);
-            c.scms = bool(o["scms"]);
-            c.text = textFromVar(o["text"]);
-            if (c.fileRate <= 0) c.fileRate = 44100;
-            clips.add(c);
+            Region r;
+            r.id = int(o["id"]);
+            r.file = juce::File(o["file"].toString());
+            r.name = o["name"].toString();
+            r.fileRate = double(o["fileRate"]) > 0 ? double(o["fileRate"]) : 44100;
+            r.fileLength = juce::int64(o["fileLength"]);
+            r.srcIn = juce::int64(o["srcIn"]);
+            r.srcOut = juce::int64(o["srcOut"]);
+            r.lane = juce::jlimit(0, lanes - 1, int(o["lane"]));
+            r.start = double(o["start"]);
+            r.gainDb = double(o["gainDb"]);
+            r.mute = bool(o["mute"]);
+            r.fadeIn = double(o["fadeIn"]);
+            r.fadeOut = double(o["fadeOut"]);
+            r.fadeInShape = FadeShape(juce::jlimit(0, 4, int(o["fadeInShape"])));
+            r.fadeOutShape = FadeShape(juce::jlimit(0, 4, int(o["fadeOutShape"])));
+            if (auto* env = o["envelope"].getArray())
+                for (auto& p : *env) r.envelope.add({double(p[0]), double(p[1])});
+            nextId = juce::jmax(nextId, r.id + 1);
+            regions.add(r);
         }
     }
+    if (auto* arr = v["markers"].getArray()) {
+        for (auto& o : *arr) {
+            Marker m;
+            m.id = int(o["id"]);
+            m.type = Marker::Type(juce::jlimit(0, 3, int(o["type"])));
+            m.t = double(o["t"]);
+            m.attachedRegion = int(o["region"]);
+            m.isrc = o["isrc"].toString().toStdString();
+            m.copyPermitted = bool(o["dcp"]);
+            m.preEmphasis = bool(o["pre"]);
+            m.scms = bool(o["scms"]);
+            m.text = textFromVar(o["text"]);
+            nextId = juce::jmax(nextId, m.id + 1);
+            markers.add(m);
+        }
+    }
+    sortMarkers();
     return true;
 }
 

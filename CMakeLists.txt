@@ -63,7 +63,9 @@ target_sources(Lathe PRIVATE
     app/Source/ProgramRenderer.cpp
     app/Source/AudioEngine.cpp
     app/Source/PluginChain.cpp
-    app/Source/Exporter.cpp)
+    app/Source/Exporter.cpp
+    app/Source/Timeline.cpp
+    app/Source/EditPanels.cpp)
 
 target_include_directories(Lathe PRIVATE ${r8b_SOURCE_DIR})
 
