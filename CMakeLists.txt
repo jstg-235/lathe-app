@@ -105,3 +105,15 @@ if(LATHE_BUILD_TESTS)
         juce::juce_recommended_config_flags)
     add_test(NAME render COMMAND lathe_render_tests)
 endif()
+
+if(LATHE_BUILD_TESTS)
+    juce_add_console_app(lathe_batch_tests PRODUCT_NAME "lathe_batch_tests")
+    target_sources(lathe_batch_tests PRIVATE tests/batch_tests.cpp app/Source/Exporter.cpp app/Source/AudioEngine.cpp
+        app/Source/PluginChain.cpp app/Source/RegionFx.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp)
+    target_include_directories(lathe_batch_tests PRIVATE ${r8b_SOURCE_DIR})
+    target_compile_definitions(lathe_batch_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1
+        JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)
+    target_link_libraries(lathe_batch_tests PRIVATE lathe_core juce::juce_audio_utils juce::juce_audio_processors
+        juce::juce_audio_formats juce::juce_audio_devices juce::juce_gui_extra juce::juce_recommended_config_flags)
+    add_test(NAME batch COMMAND lathe_batch_tests)
+endif()
