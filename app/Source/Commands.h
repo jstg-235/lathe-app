@@ -16,6 +16,7 @@ enum : juce::CommandID {
     // Edit
     undo = 0x1100, redo, splitAtPlayhead, deleteClose, deleteLeave, muteRegion, nudgeLeft, nudgeRight,
     nudgeLeftBig, nudgeRightBig, clearSelection, selectRegionRange, regionEffects, bypassRegionFx,
+    restoreRegion, spectralEditor,
     // Source / destination
     sourceIn = 0x1200, sourceOut, destIn, destOut, insertEdit, overwriteEdit, replaceEdit, appendEdit, playSourceInOut,
     // Transport

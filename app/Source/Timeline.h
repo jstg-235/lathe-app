@@ -35,6 +35,7 @@ public:
     std::function<void(int markerId)> onMarkerSelected;
     std::function<void(int markerId)> onMarkerDoubleClicked;
     std::function<void(int regionId)> onRegionFx;      // open the region's effects window
+    std::function<void(int regionId)> onRegionRestore, onRegionSpectral;
 
     void setPlayhead(double sec, bool follow);
     double playhead() const { return playhead_; }

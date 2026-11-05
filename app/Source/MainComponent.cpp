@@ -235,6 +235,8 @@ MainComponent::MainComponent() {
     timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
     timeline_.onCrossfade = [this](int a, int b) { openCrossfade(a, b); };
     timeline_.onRegionFx = [this](int id) { openRegionFx(id); };
+    timeline_.onRegionRestore = [this](int id) { showRestore(id); };
+    timeline_.onRegionSpectral = [this](int id) { showSpectral(id); };
     timeline_.onProblemClicked = [this](double t) { engine_.setPositionSeconds(juce::jmax(0.0, t - 1.0)); };
     recordBtn_.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff7a2622));
     recordBtn_.setColour(juce::TextButton::buttonOnColourId, colours::error);
@@ -537,6 +539,8 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::showAnalysis: showAnalysisWindow(); break;
         case cmd::ddpPlayer: openDdpPlayer(); break;
         case cmd::controlSurfaces: showControlSurfaces(); break;
+        case cmd::restoreRegion: showRestore(targetRegion()); break;
+        case cmd::spectralEditor: showSpectral(targetRegion()); break;
         case cmd::record:
             if (engine_.isRecording()) finishRecording();
             else showRecordDialog();
@@ -596,6 +600,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             add({cmd::splitAtPlayhead, cmd::deleteClose, cmd::deleteLeave, cmd::muteRegion, cmd::selectRegionRange, cmd::clearSelection});
             m.addSeparator();
             add({cmd::regionEffects, cmd::bypassRegionFx});
+            m.addSeparator();
+            add({cmd::restoreRegion, cmd::spectralEditor});
             m.addSeparator();
             add({cmd::nudgeLeft, cmd::nudgeRight, cmd::nudgeLeftBig, cmd::nudgeRightBig});
             break;
@@ -1519,6 +1525,122 @@ void MainComponent::showControlSurfaces() {
     surfaceWindow_.reset(w);
 }
 
+// ---------------------------------------------------------------- restoration / spectral
+
+juce::File MainComponent::processedFolder() const {
+    if (session_.file.existsAsFile())
+        return session_.file.getSiblingFile(session_.file.getFileNameWithoutExtension() + " Processed");
+    return juce::File::getSpecialLocation(juce::File::userMusicDirectory).getChildFile("Lathe Processed");
+}
+
+int MainComponent::targetRegion() const {
+    if (int id = timeline_.selectedRegion()) return id;
+    double t = engine_.positionSeconds();
+    for (auto& r : session_.regions)
+        if (r.lane == timeline_.selectedLane() && t >= r.start && t < r.end()) return r.id;
+    return 0;
+}
+
+void MainComponent::showRestore(int id) {
+    auto* r = session_.findRegion(id);
+    if (!r) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Restore", "Select a region first (click it on the timeline).");
+        return;
+    }
+    restoreWindow_.reset();
+    auto sel = timeline_.selection();
+    bool overlaps = !sel.isEmpty() && sel.getEnd() > r->start && sel.getStart() < r->end();
+    auto* p = new RestorePanel(r->name, noise_ && noise_->valid(), overlaps);
+    juce::Component::SafePointer<RestorePanel> safe(p);
+    p->onLearnNoise = [this, id, safe] {
+        auto* reg = session_.findRegion(id);
+        auto s = timeline_.selection();
+        if (!reg || s.isEmpty()) {
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Learn noise",
+                                                   "Drag across a stretch of the region that contains only the noise (a pause, the run-in), then press Learn.");
+            return;
+        }
+        Region part = *reg;
+        auto a = juce::jlimit<juce::int64>(reg->srcIn, reg->srcOut, reg->srcIn + juce::int64((s.getStart() - reg->start) * reg->fileRate));
+        auto b = juce::jlimit<juce::int64>(a, reg->srcOut, reg->srcIn + juce::int64((s.getEnd() - reg->start) * reg->fileRate));
+        part.srcIn = a;
+        part.srcOut = b;
+        dsp::Channels ch;
+        juce::int64 first = 0;
+        if (!readRegionAudio(engine_.formats(), part, ch, first, 0)) return;
+        auto np = std::make_shared<dsp::NoiseProfile>(dsp::learnNoise(ch, reg->fileRate));
+        if (!np->valid()) {
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Learn noise", "The selection is too short; use at least 0.2 s of noise.");
+            return;
+        }
+        noise_ = np;
+        if (safe) safe->setProfileStatus("Noise profile: learned from " + juce::String(s.getLength(), 2) + " s at " + msfString(s.getStart()));
+    };
+    p->onProcess = [this, id, safe] {
+        auto* reg = session_.findRegion(id);
+        if (!reg || !safe) return;
+        auto settings = safe->settings();
+        auto range = safe->selectionOnly() ? timeline_.selection() : juce::Range<double>();
+        auto snapshot = std::make_shared<Region>(*reg);
+        auto noise = noise_;
+        auto folder = processedFolder();
+        auto res = std::make_shared<RestoreResult>();
+        runJob("Restoring " + reg->name + "...",
+               [this, snapshot, range, settings, noise, folder, res](Job& j) {
+                   *res = restoreRegion(engine_.formats(), *snapshot, range, settings, noise.get(), folder, [&](double p) { return j.keep(p); });
+               },
+               [this, id, res](bool) {
+                   if (!res->ok) { juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Restore", res->error); return; }
+                   applyProcessed(session_, id, *res, "restored");
+                   sessionChanged();
+                   juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Restore",
+                                                          res->report + "\n\nPress Cmd+Z to compare with the original, Cmd+Shift+Z to come back.");
+               });
+    };
+    auto* w = new PlainWindow(p, "Restore", true);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { restoreWindow_.reset(); }); };
+    restoreWindow_.reset(w);
+}
+
+void MainComponent::showSpectral(int id) {
+    auto* r = session_.findRegion(id);
+    if (!r) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Spectral Editor", "Select a region first (click it on the timeline).");
+        return;
+    }
+    spectralWindow_.reset();
+    // Show the destination selection if it's inside this region, otherwise the 20 s around the playhead.
+    auto sel = timeline_.selection();
+    juce::Range<double> view;
+    if (!sel.isEmpty() && sel.getEnd() > r->start && sel.getStart() < r->end())
+        view = {juce::jmax(0.0, sel.getStart() - r->start), juce::jmin(r->length(), sel.getEnd() - r->start)};
+    else {
+        double c = juce::jlimit(0.0, r->length(), engine_.positionSeconds() - r->start);
+        view = {juce::jmax(0.0, c - 10.0), juce::jmin(r->length(), c + 10.0)};
+    }
+    auto* v = new SpectralView(engine_, session_, id, view);
+    juce::Component::SafePointer<SpectralView> safe(v);
+    v->onAudition = [this](double a, double b) { auditionRange(a, b); };
+    v->onApply = [this, id, safe](double t0, double t1, double f0, double f1, dsp::SpectralMode m, double g) {
+        auto* reg = session_.findRegion(id);
+        if (!reg) return;
+        auto snapshot = std::make_shared<Region>(*reg);
+        auto folder = processedFolder();
+        auto res = std::make_shared<RestoreResult>();
+        runJob("Spectral edit...",
+               [this, snapshot, t0, t1, f0, f1, m, g, folder, res](Job&) { *res = spectralEditRegion(engine_.formats(), *snapshot, t0, t1, f0, f1, m, g, folder); },
+               [this, id, res, safe](bool) {
+                   if (!res->ok) { juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Spectral edit", res->error); return; }
+                   applyProcessed(session_, id, *res, "spectral");
+                   sessionChanged();
+                   if (safe) safe->refresh();
+               });
+    };
+    auto* w = new PlainWindow(v, "Spectral Editor - " + r->name, false);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { spectralWindow_.reset(); }); };
+    spectralWindow_.reset(w);
+}
+
 void MainComponent::jumpToMarker(int dir) {
     double pos = engine_.positionSeconds();
     double best = dir < 0 ? -1.0 : 1e12;
@@ -1675,6 +1797,8 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
     if (compare_) toggleCompareUnprocessed();
     refWindow_.reset();
     analysisWindow_.reset();
+    restoreWindow_.reset();
+    spectralWindow_.reset();
     session_ = s;
     juce::StringArray problems;
     engine_.chain().setState(session_.pluginChainState, problems);

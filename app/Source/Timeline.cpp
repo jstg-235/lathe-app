@@ -496,10 +496,14 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
         menu.addItem(6, "Select region range");
         menu.addSeparator();
         menu.addItem(7, r->fxState.isNotEmpty() ? "Region effects... (active)" : "Region effects...");
+        menu.addItem(8, "Restore (declick, denoise, hum)...");
+        menu.addItem(9, "Spectral editor...");
         menu.showMenuAsync({}, [this, id](int c) {
             auto* rr = s_.findRegion(id);
             if (!rr || c == 0) return;
             if (c == 7) { if (onRegionFx) onRegionFx(id); return; }
+            if (c == 8) { selRegion_ = id; if (onRegionRestore) onRegionRestore(id); return; }
+            if (c == 9) { selRegion_ = id; if (onRegionSpectral) onRegionSpectral(id); return; }
             if (c == 1) s_.split(id, playhead_);
             if (c == 2) rr->mute = !rr->mute;
             if (c == 3) s_.deleteRegion(id, true);

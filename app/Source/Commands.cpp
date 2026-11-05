@@ -30,6 +30,8 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::clearSelection, "Clear Selection", "Edit", "Deselect regions and the destination range", "escape"},
         {cmd::selectRegionRange, "Select Region Range", "Edit", "Set the destination In/Out to the selected region", "command + A"},
         {cmd::regionEffects, "Region Effects...", "Edit", "Open the selected region's own plugin chain", "F"},
+        {cmd::restoreRegion, "Restore Region...", "Edit", "Declick, decrackle, denoise, hum and DC removal on the selected region (non-destructive)", "command + shift + D"},
+        {cmd::spectralEditor, "Spectral Editor...", "Edit", "See the selected region as a spectrogram and heal or attenuate any sound in it", "command + shift + F"},
         {cmd::bypassRegionFx, "Bypass All Region Effects", "Edit", "A/B every region's effects at once (the master chain stays on)", "shift + F"},
         // Source / destination
         {cmd::sourceIn, "Mark Source In", "Source / Destination", "Set the Source In point at the source playhead", "I"},

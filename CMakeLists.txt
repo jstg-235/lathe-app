@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Lathe VERSION 0.6.0 LANGUAGES C CXX)
+project(Lathe VERSION 0.7.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,6 +15,7 @@ add_library(lathe_core STATIC
     core/ddp/Ddp.cpp
     core/dsp/Meters.cpp
     core/dsp/Analyzer.cpp
+    core/dsp/Restoration.cpp
     core/util/Hash.cpp
     core/util/FlacTags.cpp)
 target_include_directories(lathe_core PUBLIC core)
@@ -74,7 +75,8 @@ target_sources(Lathe PRIVATE
     app/Source/ChainPanel.cpp
     app/Source/DdpFormat.cpp
     app/Source/DdpPlayer.cpp
-    app/Source/ControlSurface.cpp)
+    app/Source/ControlSurface.cpp
+    app/Source/Restore.cpp)
 
 target_include_directories(Lathe PRIVATE ${r8b_SOURCE_DIR})
 
@@ -114,7 +116,7 @@ if(LATHE_BUILD_TESTS)
     juce_add_console_app(lathe_batch_tests PRODUCT_NAME "lathe_batch_tests")
     target_sources(lathe_batch_tests PRIVATE tests/batch_tests.cpp app/Source/Exporter.cpp app/Source/AudioEngine.cpp
         app/Source/PluginChain.cpp app/Source/RegionFx.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp
-        app/Source/DdpFormat.cpp app/Source/ControlSurface.cpp app/Source/Commands.cpp)
+        app/Source/DdpFormat.cpp app/Source/ControlSurface.cpp app/Source/Commands.cpp app/Source/Restore.cpp)
     target_include_directories(lathe_batch_tests PRIVATE ${r8b_SOURCE_DIR})
     target_compile_definitions(lathe_batch_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1
         JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)
