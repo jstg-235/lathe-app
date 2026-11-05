@@ -20,14 +20,14 @@ enum : juce::CommandID {
     sourceIn = 0x1200, sourceOut, destIn, destOut, insertEdit, overwriteEdit, replaceEdit, appendEdit, playSourceInOut,
     // Transport
     playStop = 0x1300, playSource, returnToStart, locateBackFrame, locateFwdFrame, locateBackSecond, locateFwdSecond,
-    prevMarker, nextMarker, playSelection,
+    prevMarker, nextMarker, playSelection, record,
     // Markers
     addTrackMarker = 0x1400, addIndexMarker, addPauseMarker, addEndMarker,
     // View
     zoomIn = 0x1500, zoomOut, zoomFit, toggleEnvelope, toggleSnap, crossfadeEditor,
     // Tools
     analyse = 0x1600, verifyDdp, nullTest, pluginManager, audioSetup, followProjectRate, showAnalysis, references,
-    listenReference, compareUnprocessed, toggleLoudness,
+    listenReference, compareUnprocessed, toggleLoudness, ddpPlayer, openDdpSession,
     // Help
     keyGuide = 0x1700, editKeyCommands,
 };

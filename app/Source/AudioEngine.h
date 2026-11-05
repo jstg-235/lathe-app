@@ -83,6 +83,33 @@ public:
     void setSourcePosition(double sec) { sourceTransport_.setPosition(sec); }
     double sourceLength() const { return sourceTransport_.getLengthInSeconds(); }
 
+    // ---- Recording ----
+    // Records input channels [firstInput, firstInput+1] to `file` (24-bit or 32-bit float WAV).
+    // With withPlayback, the session plays at the same time (printing through outboard).
+    bool startRecording(const juce::File& file, int firstInput, int bits, bool withPlayback, juce::String& error);
+    void stopRecording();
+    bool isRecording() const { return recording_; }
+    double recordStartPosition() const { return recStart_; }   // timeline seconds at the first recorded sample
+    juce::int64 recordedSamples() const { return recSamples_; }
+    double recordRate() const { return rate_; }
+    // Round-trip latency the interface reports (output + input), in samples.
+    int reportedRoundTrip() const;
+    int numInputChannels() const;
+    juce::StringArray inputPairNames() const;
+    // Loopback latency test: plays a click on the outputs and listens on firstInput.
+    // Returns -1 while running; result in samples when done (0 = nothing heard).
+    void startLatencyTest(int firstInput);
+    int latencyTestResult() const { return latResult_; }
+
+    // ---- DDP player (plays a finished image straight to the outputs, no processing) ----
+    bool loadPlayer(const juce::File& image);
+    void playPlayer() { transport_.stop(); sourceTransport_.stop(); playerTransport_.start(); }
+    void stopPlayer() { playerTransport_.stop(); }
+    bool isPlayerPlaying() const { return playerTransport_.isPlaying(); }
+    double playerPosition() const { return playerTransport_.getCurrentPosition(); }
+    void setPlayerPosition(double s) { playerTransport_.setPosition(s); }
+    void clearPlayer();
+
     // ---- Reference track A/B (plays alongside the master; switching crossfades in 10 ms) ----
     bool loadReference(const juce::File& f);
     void clearReference();
@@ -124,10 +151,26 @@ private:
     std::unique_ptr<juce::BufferingAudioSource> buffered_;
     juce::AudioTransportSource sourceTransport_;
     juce::AudioTransportSource refTransport_;
+    juce::AudioTransportSource playerTransport_;
+    std::unique_ptr<juce::AudioFormatReaderSource> playerReader_;
+    juce::CriticalSection playerLock_;
     std::unique_ptr<juce::AudioFormatReaderSource> refReader_;
     juce::AudioBuffer<float> refBuf_;
     std::atomic<bool> listenRef_{false}, bypassMaster_{false};
     std::atomic<float> refGain_{1.0f}, bypassGain_{1.0f};
+    std::atomic<bool> recording_{false}, recWithPlayback_{false};
+    std::atomic<double> recStart_{0.0};
+    std::atomic<juce::int64> recSamples_{0};
+    std::atomic<int> recFirstInput_{0};
+    juce::TimeSliceThread writerThread_{"Lathe recorder"};
+    std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter> recWriter_;
+    juce::CriticalSection recLock_;
+    juce::AudioBuffer<float> inBuf_;
+    // latency test (audio thread)
+    std::atomic<int> latState_{0};   // 0 idle, 1 running
+    std::atomic<int> latResult_{0};
+    int latPos_ = 0, latFirstInput_ = 0, latBest_ = -1;
+    float latPeak_ = 0;
     float refMix_ = 0.0f;   // audio thread only: 0 = master, 1 = reference
     juce::CriticalSection refLock_;   // UI swaps the reference under this; audio thread only try-locks
     std::unique_ptr<juce::AudioFormatReaderSource> sourceReader_;

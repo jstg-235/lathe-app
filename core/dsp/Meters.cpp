@@ -241,6 +241,16 @@ void Ditherer::run(const T* const* in, int n, int32_t* out) {
             double fb = 0;
             for (int k = 0; k < taps_; ++k) fb += coef_[k] * e[size_t(k)];
             double v = x - fb;
+            // Already exactly at the target word length (untouched 16-bit audio, digital silence):
+            // there is no requantisation error to decorrelate, so pass it through bit-for-bit.
+            double rv = std::round(v);
+            if (std::abs(v - rv) < 1e-9 && rv <= maxV && rv >= minV) {
+                for (int k = taps_ - 1; k > 0; --k) e[size_t(k)] = e[size_t(k - 1)];
+                if (taps_) e[0] = 0.0;
+                nextUniform(); nextUniform();   // keep the noise sequence aligned
+                out[i * ch_ + c] = int32_t(rv);
+                continue;
+            }
             double tpdf = nextUniform() - nextUniform();   // triangular, +/-1 LSB
             double q = std::floor(v + tpdf + 0.5);
             bool clipped = q > maxV || q < minV;

@@ -236,6 +236,17 @@ MainComponent::MainComponent() {
     timeline_.onCrossfade = [this](int a, int b) { openCrossfade(a, b); };
     timeline_.onRegionFx = [this](int id) { openRegionFx(id); };
     timeline_.onProblemClicked = [this](double t) { engine_.setPositionSeconds(juce::jmax(0.0, t - 1.0)); };
+    recordBtn_.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff7a2622));
+    recordBtn_.setColour(juce::TextButton::buttonOnColourId, colours::error);
+    recordBtn_.setColour(juce::TextButton::textColourOffId, colours::text);
+    recordBtn_.onClick = [this] { commands_.invokeDirectly(cmd::record, true); };
+    addAndMakeVisible(recordBtn_);
+    rec_.firstInput = props_.getUserSettings()->getIntValue("recInput", 0);
+    rec_.bits = props_.getUserSettings()->getIntValue("recBits", 24);
+    rec_.extraLatency = props_.getUserSettings()->getIntValue("recExtraLatency", 0);
+    rec_.measured = props_.getUserSettings()->getIntValue("recMeasuredLatency", -1);
+    rec_.print = props_.getUserSettings()->getBoolValue("recPrint", true);
+    rec_.muteSources = props_.getUserSettings()->getBoolValue("recMute", true);
     abDisplay_.setFont(juce::FontOptions(14.0f, juce::Font::bold));
     abDisplay_.setColour(juce::Label::textColourId, colours::accent);
     addAndMakeVisible(abDisplay_);
@@ -395,6 +406,8 @@ void MainComponent::resized() {
     homeBtn_.setBounds(transport.removeFromLeft(40).reduced(0, 3));
     transport.removeFromLeft(4);
     playBtn_.setBounds(transport.removeFromLeft(70).reduced(0, 3));
+    transport.removeFromLeft(4);
+    recordBtn_.setBounds(transport.removeFromLeft(50).reduced(0, 3));
     transport.removeFromLeft(10);
     timeDisplay_.setBounds(transport.removeFromLeft(150));
     trackDisplay_.setBounds(transport.removeFromLeft(170));
@@ -515,6 +528,17 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::crossfadeEditor: xfadeBtn_.onClick(); break;
         case cmd::analyse: runAnalysis(); break;
         case cmd::showAnalysis: showAnalysisWindow(); break;
+        case cmd::ddpPlayer: openDdpPlayer(); break;
+        case cmd::record:
+            if (engine_.isRecording()) finishRecording();
+            else showRecordDialog();
+            break;
+        case cmd::openDdpSession: {
+            chooser_ = std::make_unique<juce::FileChooser>("Open a DDP folder as a session");
+            chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                                  [this](const juce::FileChooser& fc) { if (fc.getResult().isDirectory()) openDdpAsSession(fc.getResult()); });
+            break;
+        }
         case cmd::references: showReferences(); break;
         case cmd::listenReference:
             if (engine_.hasReference()) engine_.setListenToReference(!engine_.listeningToReference());
@@ -548,7 +572,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
         case 0:
             add({cmd::newSession, cmd::openSession, cmd::saveSession, cmd::saveSessionAs});
             m.addSeparator();
-            add({cmd::importAudio, cmd::openSource});
+            add({cmd::importAudio, cmd::openSource, cmd::openDdpSession});
             m.addSeparator();
             add({cmd::batchRender});
             m.addSeparator();
@@ -572,6 +596,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::listenReference, cmd::compareUnprocessed});
             m.addSeparator();
+            add({cmd::record});
+            m.addSeparator();
             add({cmd::locateBackFrame, cmd::locateFwdFrame, cmd::locateBackSecond, cmd::locateFwdSecond, cmd::prevMarker, cmd::nextMarker});
             break;
         case 3: add({cmd::addTrackMarker, cmd::addIndexMarker, cmd::addPauseMarker, cmd::addEndMarker}); break;
@@ -583,7 +609,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
         case 5:
             add({cmd::analyse, cmd::showAnalysis, cmd::references});
             m.addSeparator();
-            add({cmd::verifyDdp, cmd::nullTest});
+            add({cmd::ddpPlayer, cmd::verifyDdp, cmd::nullTest});
             m.addSeparator();
             add({cmd::pluginManager, cmd::audioSetup, cmd::followProjectRate});
             break;
@@ -1030,6 +1056,54 @@ void MainComponent::runAnalysis() {
            });
 }
 
+void MainComponent::openDdpPlayer() {
+    chooser_ = std::make_unique<juce::FileChooser>("Choose a DDP folder to play");
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories, [this](const juce::FileChooser& fc) {
+        auto folder = fc.getResult();
+        if (!folder.isDirectory()) return;
+        auto r = std::make_shared<ddp::ReadResult>();
+        runJob("Reading and verifying DDP...",
+               [r, folder](Job& j) { *r = ddp::readDdp(folder.getFullPathName().toStdString(), [&](double p) { j.setProgress(p); }); },
+               [this, r, folder](bool) {
+                   if (!r->ok) {
+                       juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "DDP Player",
+                                                              "This folder can't be read as a DDP:\n" + juce::String::fromUTF8(r->error.c_str()));
+                       return;
+                   }
+                   engine_.stop();
+                   playerWindow_.reset();
+                   auto* p = new DdpPlayer(engine_, folder, *r);
+                   p->onOpenAsSession = [this](const juce::File& f) {
+                       juce::MessageManager::callAsync([this, f] { playerWindow_.reset(); openDdpAsSession(f); });
+                   };
+                   auto* w = new PlainWindow(p, "DDP Player - " + folder.getFileName(), false);
+                   w->onClose = [this] { juce::MessageManager::callAsync([this] { playerWindow_.reset(); }); };
+                   playerWindow_.reset(w);
+               });
+    });
+}
+
+void MainComponent::openDdpAsSession(const juce::File& folder) {
+    Session s;
+    juce::String err;
+    juce::StringArray notes;
+    if (!sessionFromDdp(folder, s, err, notes)) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Open DDP", err);
+        return;
+    }
+    newSession();
+    session_ = s;
+    lastState_ = juce::JSON::toString(session_.toVar(), true);
+    refreshAll();
+    timeline_.zoomToFit();
+    dirty_ = true;
+    juce::String msg = "Opened " + folder.getFileName() + " as a session: " + juce::String(int(s.toDisc().tracks.size())) +
+                       " tracks with their PQ, CD-Text and ISRCs.\n\nThe audio is the DDP image itself (16-bit). Edit markers or metadata, "
+                       "or Replace sections from new mixes, then export a new DDP. Save the session to keep it.";
+    if (!notes.isEmpty()) msg << "\n\nNotes:\n" << notes.joinIntoString("\n");
+    showText("DDP opened as session", msg);
+}
+
 void MainComponent::showAnalysisWindow() {
     if (!analysis_) return;
     auto* v = new AnalysisView(analysis_, [this](double t) { engine_.setPositionSeconds(juce::jmax(0.0, t - 1.0)); });
@@ -1137,6 +1211,203 @@ void MainComponent::toggleCompareUnprocessed() {
         engine_.setCompareUnprocessed(false, 0.0);
     }
     engine_.loadSession(session_);   // region effects change latency, so re-time playback
+    commands_.commandStatusChanged();
+}
+
+// ---------------------------------------------------------------- recording
+
+namespace {
+class RecordPanel : public juce::Component, private juce::Timer {
+public:
+    RecordPanel(AudioEngine& e, bool haveSession, bool haveSelection, int firstInput, int bits, bool print, bool punch, bool mute, int extra, int measured)
+        : e_(e), measured_(measured) {
+        auto pairs = e_.inputPairNames();
+        for (int i = 0; i < pairs.size(); ++i) input_.addItem(pairs[i], i + 1);
+        input_.setSelectedId(juce::jlimit(1, juce::jmax(1, pairs.size()), firstInput / 2 + 1), juce::dontSendNotification);
+        bits_.addItem("24-bit", 24);
+        bits_.addItem("32-bit float", 32);
+        bits_.setSelectedId(bits == 32 ? 32 : 24, juce::dontSendNotification);
+        print_.setButtonText("Play the session while recording (print through outboard)");
+        print_.setToggleState(print && haveSession, juce::dontSendNotification);
+        print_.setEnabled(haveSession);
+        punch_.setButtonText("Auto-punch: keep only the destination In-Out (with pre-roll)");
+        punch_.setToggleState(punch && haveSelection, juce::dontSendNotification);
+        punch_.setEnabled(haveSelection);
+        mute_.setButtonText("Mute the source regions after printing");
+        mute_.setToggleState(mute, juce::dontSendNotification);
+        for (auto* t : {&print_, &punch_, &mute_}) { t->setColour(juce::ToggleButton::textColourId, colours::text); addAndMakeVisible(*t); }
+        for (auto* l : {&inLbl_, &bitsLbl_, &latLbl_, &latInfo_}) { l->setColour(juce::Label::textColourId, colours::dim); addAndMakeVisible(*l); }
+        inLbl_.setText("Inputs", juce::dontSendNotification);
+        bitsLbl_.setText("Format", juce::dontSendNotification);
+        latLbl_.setText("Extra offset (samples)", juce::dontSendNotification);
+        extra_.setText(juce::String(extra), false);
+        extra_.setInputRestrictions(7, "-0123456789");
+        extra_.setColour(juce::TextEditor::backgroundColourId, colours::panel);
+        extra_.setColour(juce::TextEditor::textColourId, colours::text);
+        addAndMakeVisible(input_);
+        addAndMakeVisible(bits_);
+        addAndMakeVisible(extra_);
+        for (auto* b : {&measure_, &record_, &cancel_}) { styleButton(*b, b == &record_); addAndMakeVisible(*b); }
+        record_.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff9a2a24));
+        measure_.onClick = [this] {
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Latency test",
+                "Patch the selected outputs straight back into the selected inputs (or through your outboard at unity), "
+                "then press OK. A single click will be played.",
+                "OK", this, juce::ModalCallbackFunction::create([this](int) {
+                    e_.startLatencyTest((input_.getSelectedId() - 1) * 2);
+                    testing_ = true;
+                }));
+        };
+        record_.onClick = [this] { if (onRecord) onRecord(); };
+        cancel_.onClick = [this] { if (onCancel) onCancel(); };
+        updateInfo();
+        startTimerHz(10);
+        setSize(560, 330);
+    }
+    std::function<void()> onRecord, onCancel;
+    int firstInput() const { return (input_.getSelectedId() - 1) * 2; }
+    int bits() const { return bits_.getSelectedId(); }
+    bool print() const { return print_.getToggleState(); }
+    bool punch() const { return punch_.getToggleState(); }
+    bool mute() const { return mute_.getToggleState(); }
+    int extra() const { return extra_.getText().getIntValue(); }
+    int measured() const { return measured_; }
+    void paint(juce::Graphics& g) override { g.fillAll(colours::bg); }
+    void resized() override {
+        auto r = getLocalBounds().reduced(12);
+        auto row = [&](juce::Label& l, juce::Component& c) { auto x = r.removeFromTop(26); l.setBounds(x.removeFromLeft(150)); c.setBounds(x); r.removeFromTop(6); };
+        row(inLbl_, input_);
+        row(bitsLbl_, bits_);
+        for (auto* t : {&print_, &punch_, &mute_}) { t->setBounds(r.removeFromTop(24)); r.removeFromTop(2); }
+        r.removeFromTop(6);
+        auto x = r.removeFromTop(26);
+        latLbl_.setBounds(x.removeFromLeft(150));
+        extra_.setBounds(x.removeFromLeft(80));
+        x.removeFromLeft(8);
+        measure_.setBounds(x.removeFromLeft(150));
+        latInfo_.setBounds(r.removeFromTop(40));
+        auto b = r.removeFromBottom(28);
+        record_.setBounds(b.removeFromRight(130));
+        b.removeFromRight(8);
+        cancel_.setBounds(b.removeFromRight(90));
+    }
+private:
+    void updateInfo() {
+        juce::String s = "Interface reports " + juce::String(e_.reportedRoundTrip()) + " samples round trip.";
+        if (measured_ > 0) s << " Measured loopback: " << measured_ << " samples (used instead).";
+        latInfo_.setText(s + "\nPrints are moved earlier by the round trip so they line up with the session.", juce::dontSendNotification);
+    }
+    void timerCallback() override {
+        if (testing_ && e_.latencyTestResult() >= 0) {
+            testing_ = false;
+            int v = e_.latencyTestResult();
+            if (v > 0) measured_ = v;
+            else juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Latency test", "No click came back on the selected inputs. Check the loopback patch and levels.");
+            updateInfo();
+        }
+    }
+    AudioEngine& e_;
+    int measured_;
+    bool testing_ = false;
+    juce::ComboBox input_, bits_;
+    juce::ToggleButton print_, punch_, mute_;
+    juce::Label inLbl_, bitsLbl_, latLbl_, latInfo_;
+    juce::TextEditor extra_;
+    juce::TextButton measure_{"Measure (loopback)"}, record_{"Record"}, cancel_{"Cancel"};
+};
+}  // namespace
+
+juce::File MainComponent::recordingsFolder() const {
+    if (session_.file.existsAsFile())
+        return session_.file.getSiblingFile(session_.file.getFileNameWithoutExtension() + " Recordings");
+    return juce::File::getSpecialLocation(juce::File::userMusicDirectory).getChildFile("Lathe Recordings");
+}
+
+void MainComponent::showRecordDialog() {
+    recWindow_.reset();
+    auto sel = timeline_.selection();
+    auto* p = new RecordPanel(engine_, !session_.regions.isEmpty(), !sel.isEmpty(), rec_.firstInput, rec_.bits, rec_.print, rec_.autoPunch,
+                              rec_.muteSources, rec_.extraLatency, rec_.measured);
+    juce::Component::SafePointer<RecordPanel> safe(p);
+    p->onCancel = [this] { juce::MessageManager::callAsync([this] { recWindow_.reset(); }); };
+    p->onRecord = [this, safe] {
+        if (!safe) return;
+        rec_.firstInput = safe->firstInput();
+        rec_.bits = safe->bits();
+        rec_.print = safe->print();
+        rec_.autoPunch = safe->punch();
+        rec_.muteSources = safe->mute();
+        rec_.extraLatency = safe->extra();
+        rec_.measured = safe->measured();
+        auto* u = props_.getUserSettings();
+        u->setValue("recInput", rec_.firstInput);
+        u->setValue("recBits", rec_.bits);
+        u->setValue("recExtraLatency", rec_.extraLatency);
+        u->setValue("recMeasuredLatency", rec_.measured);
+        u->setValue("recPrint", rec_.print);
+        u->setValue("recMute", rec_.muteSources);
+        juce::MessageManager::callAsync([this] { recWindow_.reset(); beginRecording(); });
+    };
+    auto* w = new PlainWindow(p, "Record", true);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { recWindow_.reset(); }); };
+    recWindow_.reset(w);
+}
+
+void MainComponent::beginRecording() {
+    auto folder = recordingsFolder();
+    auto stamp = juce::Time::getCurrentTime().formatted("%Y-%m-%d %H%M%S");
+    recFile_ = folder.getNonexistentChildFile((rec_.print ? "Print " : "Recording ") + stamp, ".wav", false);
+    recPunch_ = rec_.autoPunch ? timeline_.selection() : juce::Range<double>();
+    if (rec_.print && !recPunch_.isEmpty()) engine_.setPositionSeconds(juce::jmax(0.0, recPunch_.getStart() - 2.0));   // 2 s pre-roll
+    juce::String err;
+    if (!engine_.startRecording(recFile_, rec_.firstInput, rec_.bits, rec_.print && !session_.regions.isEmpty(), err)) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Couldn't record", err);
+        return;
+    }
+    commands_.commandStatusChanged();
+}
+
+void MainComponent::finishRecording() {
+    if (!engine_.isRecording()) return;
+    const bool printed = rec_.print && !session_.regions.isEmpty();
+    const double start = engine_.recordStartPosition();
+    engine_.stopRecording();
+    std::unique_ptr<juce::AudioFormatReader> r(engine_.formats().createReaderFor(recFile_));
+    if (!r || r->lengthInSamples < 16) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Recording", "Nothing was recorded.");
+        return;
+    }
+    Region reg = session_.makeRegion(recFile_, r->sampleRate, r->lengthInSamples);
+    reg.start = start;
+    if (printed) {
+        // The return arrives one round trip late: drop those samples so the print lines up.
+        int lat = (rec_.measured > 0 ? rec_.measured : engine_.reportedRoundTrip()) + rec_.extraLatency;
+        reg.srcIn = juce::jlimit<juce::int64>(0, reg.srcOut - 1, lat);
+        if (!recPunch_.isEmpty()) {
+            // Auto-punch: keep only the destination In-Out of the print.
+            auto in = juce::jlimit<juce::int64>(reg.srcIn, reg.srcOut - 1, reg.srcIn + juce::int64((recPunch_.getStart() - start) * r->sampleRate));
+            auto out = juce::jlimit<juce::int64>(in + 1, reg.srcOut, reg.srcIn + juce::int64((recPunch_.getEnd() - start) * r->sampleRate));
+            reg.start = start + double(in - reg.srcIn) / r->sampleRate;
+            reg.srcIn = in;
+            reg.srcOut = out;
+        }
+        // New track (lane) below everything else.
+        int maxLane = 0;
+        for (auto& x : session_.regions) maxLane = juce::jmax(maxLane, x.lane);
+        reg.lane = maxLane + 1;
+        session_.lanes = juce::jmax(session_.lanes, reg.lane + 1);
+        if (rec_.muteSources)
+            for (auto& x : session_.regions)
+                if (recPunch_.isEmpty() || (x.end() > recPunch_.getStart() && x.start < recPunch_.getEnd())) x.mute = true;
+    } else {
+        reg.lane = timeline_.selectedLane();
+    }
+    reg.name = recFile_.getFileNameWithoutExtension();
+    session_.regions.add(reg);
+    if (session_.toDisc().tracks.empty() && !printed) session_.addMarker(Marker::TrackStart, reg.start, reg.id);
+    sessionChanged();
+    timeline_.resized();
+    timeline_.selectRegion(reg.id);
     commands_.commandStatusChanged();
 }
 
@@ -1848,6 +2119,15 @@ void MainComponent::timerCallback() {
                                                               "  (" + msfString(sel.getLength()) + ")",
                         juce::dontSendNotification);
     playBtn_.setButtonText(engine_.isPlaying() ? "Stop" : "Play");
+    recordBtn_.setToggleState(engine_.isRecording(), juce::dontSendNotification);
+    if (engine_.isRecording()) {
+        timeDisplay_.setColour(juce::Label::textColourId, colours::error);
+        if (!engine_.isPlaying() && !rec_.print) timeDisplay_.setText("REC " + msfString(double(engine_.recordedSamples()) / engine_.recordRate()), juce::dontSendNotification);
+        if (rec_.print && rec_.autoPunch && !recPunch_.isEmpty() && pos > recPunch_.getEnd() + 1.0) finishRecording();
+        if (rec_.print && !engine_.isPlaying()) finishRecording();   // playback reached the end
+    } else {
+        timeDisplay_.setColour(juce::Label::textColourId, colours::text);
+    }
     {
         juce::String why;
         double g = referenceGainDb(&why);
