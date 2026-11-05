@@ -15,6 +15,7 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::exportTrackWavs, "Export Track WAVs...", "File", "16-bit / 44.1 kHz WAV per track, cut at the PQ marks", "command + shift + E"},
         {cmd::exportProgram24, "Export Programme WAV (24-bit)...", "File", "The whole programme at the project rate, 24-bit dithered", ""},
         {cmd::exportProgram32, "Export Programme WAV (32-bit float)...", "File", "The whole programme at the project rate, 32-bit float", ""},
+        {cmd::batchRender, "Render Album (Batch)...", "File", "DDP plus WAV / FLAC deliverables in one go, with a QC and checksum report", "command + R"},
         // Edit
         {cmd::undo, "Undo", "Edit", "Undo the last change", "command + Z"},
         {cmd::redo, "Redo", "Edit", "Redo the last undone change", "command + shift + Z"},
@@ -28,6 +29,8 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::nudgeRightBig, "Nudge Region Right 100 ms", "Edit", "Move the selected region 100 ms later", "option + shift + cursor right"},
         {cmd::clearSelection, "Clear Selection", "Edit", "Deselect regions and the destination range", "escape"},
         {cmd::selectRegionRange, "Select Region Range", "Edit", "Set the destination In/Out to the selected region", "command + A"},
+        {cmd::regionEffects, "Region Effects...", "Edit", "Open the selected region's own plugin chain", "F"},
+        {cmd::bypassRegionFx, "Bypass All Region Effects", "Edit", "A/B every region's effects at once (the master chain stays on)", "shift + F"},
         // Source / destination
         {cmd::sourceIn, "Mark Source In", "Source / Destination", "Set the Source In point at the source playhead", "I"},
         {cmd::sourceOut, "Mark Source Out", "Source / Destination", "Set the Source Out point at the source playhead", "O"},

@@ -6,6 +6,7 @@
 // and hands audio to the device through a FIFO; exports run it directly.
 #pragma once
 
+#include "RegionFx.h"
 #include "Session.h"
 
 #include <juce_audio_formats/juce_audio_formats.h>
@@ -22,7 +23,8 @@ public:
     ~ProgramRenderer();
 
     // Takes a snapshot of the session; safe to call while nothing else uses this object.
-    void setSession(const Session& s, double targetRate);
+    void setSession(const Session& s, double targetRate, bool offline = false);
+    void setRegionFx(RegionFxBank* fx) { fx_ = fx; }
     void seek(juce::int64 programSample);
     juce::int64 position() const { return pos_; }
     juce::int64 totalSamples() const { return total_; }
@@ -47,6 +49,7 @@ private:
     double rate_ = 44100;
     juce::int64 pos_ = 0, total_ = 0;
     juce::String error_;
+    RegionFxBank* fx_ = nullptr;
 };
 
 }  // namespace lathe

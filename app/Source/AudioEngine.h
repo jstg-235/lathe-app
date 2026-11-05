@@ -14,7 +14,10 @@ namespace lathe {
 // Adapts ProgramRenderer to JUCE's positionable source interface.
 class ProgramSource : public juce::PositionableAudioSource {
 public:
-    ProgramSource(juce::AudioFormatManager& fm, const Session& s, double rate) : r_(fm) { r_.setSession(s, rate); }
+    ProgramSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx) : r_(fm) {
+        r_.setRegionFx(fx);
+        r_.setSession(s, rate);
+    }
     void prepareToPlay(int, double) override {}
     void releaseResources() override {}
     void getNextAudioBlock(const juce::AudioSourceChannelInfo& info) override {
@@ -56,6 +59,8 @@ public:
     juce::AudioDeviceManager& devices() { return devices_; }
     juce::AudioFormatManager& formats() { return formats_; }
     PluginChain& chain() { return chain_; }
+    PluginHost& pluginHost() { return host_; }
+    RegionFxBank& regionFx() { return fx_; }
     MeterTap& meterTap() { return tap_; }
 
     // Rebuilds the playback source from the session. Keeps position and play state.
@@ -101,7 +106,9 @@ private:
     juce::AudioTransportSource sourceTransport_;
     std::unique_ptr<juce::AudioFormatReaderSource> sourceReader_;
     juce::AudioBuffer<float> sourceBuf_;
-    PluginChain chain_;
+    PluginHost host_;
+    PluginChain chain_{host_, "Master"};
+    RegionFxBank fx_{host_};
     MeterTap tap_;
     double rate_ = 44100;
     int block_ = 512;

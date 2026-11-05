@@ -14,7 +14,8 @@ add_library(lathe_core STATIC
     core/cd/CdTextEncoder.cpp
     core/ddp/Ddp.cpp
     core/dsp/Meters.cpp
-    core/util/Hash.cpp)
+    core/util/Hash.cpp
+    core/util/FlacTags.cpp)
 target_include_directories(lathe_core PUBLIC core)
 set_target_properties(lathe_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -67,7 +68,9 @@ target_sources(Lathe PRIVATE
     app/Source/Timeline.cpp
     app/Source/EditPanels.cpp
     app/Source/NullTest.cpp
-    app/Source/Commands.cpp)
+    app/Source/Commands.cpp
+    app/Source/RegionFx.cpp
+    app/Source/ChainPanel.cpp)
 
 target_include_directories(Lathe PRIVATE ${r8b_SOURCE_DIR})
 
@@ -95,10 +98,10 @@ target_link_libraries(Lathe PRIVATE
 
 if(LATHE_BUILD_TESTS)
     juce_add_console_app(lathe_render_tests PRODUCT_NAME "lathe_render_tests")
-    target_sources(lathe_render_tests PRIVATE tests/render_tests.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp app/Source/NullTest.cpp app/Source/Commands.cpp)
+    target_sources(lathe_render_tests PRIVATE tests/render_tests.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp app/Source/NullTest.cpp app/Source/Commands.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp)
     target_include_directories(lathe_render_tests PRIVATE ${r8b_SOURCE_DIR})
-    target_compile_definitions(lathe_render_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1)
-    target_link_libraries(lathe_render_tests PRIVATE lathe_core juce::juce_audio_formats juce::juce_gui_basics
+    target_compile_definitions(lathe_render_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1 JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)
+    target_link_libraries(lathe_render_tests PRIVATE lathe_core juce::juce_audio_formats juce::juce_gui_basics juce::juce_audio_processors
         juce::juce_recommended_config_flags)
     add_test(NAME render COMMAND lathe_render_tests)
 endif()

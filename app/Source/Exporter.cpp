@@ -1,5 +1,8 @@
 #include "Exporter.h"
 
+#include "../../core/util/FlacTags.h"
+#include "../../core/util/Hash.h"
+
 #include <CDSPResampler.h>
 
 namespace lathe {
@@ -13,9 +16,11 @@ public:
         : engine_(e), renderer_(e.formats()), runPlugins_(es.runPlugins) {
         projRate_ = s.effectiveRate();
         outRate_ = outRate;
-        renderer_.setSession(s, projRate_);
         engine_.suspendForOffline(true);
         lock_ = std::make_unique<juce::ScopedLock>(engine_.chain().lock());
+        fxLock_ = std::make_unique<juce::ScopedLock>(engine_.regionFx().lock());   // region chains belong to the export now
+        if (es.runPlugins) renderer_.setRegionFx(&engine_.regionFx());
+        renderer_.setSession(s, projRate_, true);
         if (runPlugins_) {
             engine_.chain().prepare(projRate_, kBlock, true);   // 64-bit for every plugin that supports it
             engine_.chain().setNonRealtime(true);
@@ -28,8 +33,10 @@ public:
 
     ~MasterStream() {
         if (runPlugins_) engine_.chain().setNonRealtime(false);
+        engine_.regionFx().prepare(engine_.deviceRate(), 2048, false);   // back to playback settings
+        fxLock_.reset();
         lock_.reset();
-        engine_.suspendForOffline(false);   // re-prepares the chain for playback
+        engine_.suspendForOffline(false);   // re-prepares the master chain for playback
     }
 
     // Fills n frames per channel of output-rate audio, 64-bit float.
@@ -69,7 +76,7 @@ private:
     bool runPlugins_;
     double projRate_ = 44100, outRate_ = 44100;
     int latency_ = 0;
-    std::unique_ptr<juce::ScopedLock> lock_;
+    std::unique_ptr<juce::ScopedLock> lock_, fxLock_;
     std::unique_ptr<r8b::CDSPResampler24> rs_[2];
     juce::AudioBuffer<double> buf_;
     std::vector<double> dbl_;
@@ -324,6 +331,324 @@ juce::String Exporter::analyse(const Session& s, const ExportSettings& es, const
     }
     qr.fill(qc);
     return {};
+}
+
+
+// ================================================================= Batch render
+
+namespace {
+
+struct TrackInfo {
+    juce::int64 start = 0, end = 0;   // samples at the sink's rate, [start, end)
+    juce::String fileName;            // without extension
+    juce::String title, performer, isrc;
+    int number = 0;
+};
+
+// Writes a stream of dithered integers into one file per track, cut at the PQ marks.
+class TrackSink {
+public:
+    enum Kind { Wav, Flac };
+    TrackSink(Kind k, const juce::File& dir, double rate, int bits, std::vector<TrackInfo> tracks, const Session& s)
+        : kind_(k), dir_(dir), rate_(rate), bits_(bits), tracks_(std::move(tracks)), album_(s.discTitle), albumArtist_(s.discPerformer) {
+        dir_.createDirectory();
+    }
+
+    bool consume(const int32_t* interleaved, int n, juce::int64 pos, juce::String& err) {
+        for (size_t t = 0; t < tracks_.size(); ++t) {
+            auto& tr = tracks_[t];
+            juce::int64 a = juce::jmax(pos, tr.start), b = juce::jmin(pos + n, tr.end);
+            if (b <= a) continue;
+            if (int(t) != cur_) {
+                if (!close(err)) return false;
+                if (!open(int(t), err)) return false;
+            }
+            if (!writeInts(*w_, interleaved + (a - pos) * 2, int(b - a), bits_, tmp_)) { err = "Disk write failed (" + file_.getFileName() + ")"; return false; }
+            if (b == tr.end && !close(err)) return false;
+        }
+        return true;
+    }
+
+    bool finish(juce::String& err) { return close(err); }
+    const juce::Array<juce::File>& files() const { return written_; }
+
+private:
+    bool open(int t, juce::String& err) {
+        auto& tr = tracks_[size_t(t)];
+        file_ = dir_.getChildFile(tr.fileName + (kind_ == Wav ? ".wav" : ".flac"));
+        file_.deleteFile();
+        std::unique_ptr<juce::OutputStream> os(file_.createOutputStream().release());
+        if (!os) { err = "Couldn't write " + file_.getFullPathName(); return false; }
+        juce::StringPairArray meta;
+        if (kind_ == Wav) {
+            meta.set(juce::WavAudioFormat::riffInfoTitle, tr.title);
+            meta.set(juce::WavAudioFormat::riffInfoArtist, tr.performer);
+            meta.set(juce::WavAudioFormat::riffInfoProductName, album_);
+            meta.set(juce::WavAudioFormat::riffInfoTrackNumber, juce::String(tr.number));
+            if (tr.isrc.isNotEmpty()) meta.set(juce::WavAudioFormat::riffInfoComment, "ISRC " + tr.isrc);
+            meta.set(juce::WavAudioFormat::riffInfoSoftware, "Lathe");
+            w_.reset(wav_.createWriterFor(os.get(), rate_, 2, bits_, meta, 0));
+        } else {
+            w_.reset(flac_.createWriterFor(os.get(), rate_, 2, bits_, meta, 5));
+        }
+        if (!w_) { err = "Couldn't create a " + juce::String(bits_) + "-bit writer for " + file_.getFileName(); return false; }
+        os.release();
+        cur_ = t;
+        return true;
+    }
+
+    bool close(juce::String& err) {
+        if (!w_) return true;
+        w_.reset();   // flushes and finalises the header
+        if (kind_ == Flac) {
+            auto& tr = tracks_[size_t(cur_)];
+            util::Tags tags{{"TITLE", tr.title.toStdString()},
+                            {"ARTIST", tr.performer.toStdString()},
+                            {"ALBUM", album_.toStdString()},
+                            {"ALBUMARTIST", albumArtist_.toStdString()},
+                            {"TRACKNUMBER", std::to_string(tr.number)},
+                            {"TRACKTOTAL", std::to_string(tracks_.size())}};
+            if (tr.isrc.isNotEmpty()) tags.push_back({"ISRC", tr.isrc.toStdString()});
+            auto e = util::writeFlacTags(file_.getFullPathName().toStdString(), tags);
+            if (!e.empty()) { err = "Tagging " + file_.getFileName() + ": " + juce::String(e); return false; }
+        }
+        written_.add(file_);
+        cur_ = -1;
+        return true;
+    }
+
+    Kind kind_;
+    juce::File dir_, file_;
+    double rate_;
+    int bits_;
+    std::vector<TrackInfo> tracks_;
+    juce::String album_, albumArtist_;
+    juce::WavAudioFormat wav_;
+    juce::FlacAudioFormat flac_;
+    std::unique_ptr<juce::AudioFormatWriter> w_;
+    std::vector<int> tmp_[2];
+    int cur_ = -1;
+    juce::Array<juce::File> written_;
+};
+
+std::vector<TrackInfo> trackList(const Session& s, const cd::Disc& disc, double rate, bool cdFrames) {
+    std::vector<TrackInfo> v;
+    auto ranges = s.trackRanges();
+    for (size_t t = 0; t < disc.tracks.size(); ++t) {
+        TrackInfo ti;
+        if (cdFrames) {   // exactly the CD's track boundaries
+            ti.start = disc.tracks[t].startSector() * cd::kSamplesPerSector;
+            ti.end = (t + 1 < disc.tracks.size() ? disc.tracks[t + 1].startSector() : disc.leadOutSector) * cd::kSamplesPerSector;
+        } else {
+            ti.start = juce::int64(std::llround(ranges[int(t)].getStart() * rate));
+            ti.end = juce::int64(std::llround(ranges[int(t)].getEnd() * rate));
+        }
+        ti.number = int(t + 1);
+        ti.title = juce::String::fromUTF8(disc.tracks[t].text.title.c_str());
+        ti.performer = juce::String::fromUTF8(disc.tracks[t].text.performer.c_str());
+        if (ti.performer.isEmpty()) ti.performer = s.discPerformer;
+        ti.isrc = juce::String(disc.tracks[t].isrc);
+        ti.fileName = juce::String(ti.number).paddedLeft('0', 2) + " " +
+                      juce::File::createLegalFileName(ti.title.isEmpty() ? juce::String("Track") : ti.title);
+        v.push_back(ti);
+    }
+    return v;
+}
+
+juce::String rateLabel(double r) {
+    auto k = r / 1000.0;
+    return std::abs(k - std::round(k)) < 0.01 ? juce::String(int(std::round(k))) : juce::String(k, 1);
+}
+
+juce::String md5Of(const juce::File& f) {
+    juce::FileInputStream in(f);
+    if (!in.openedOk()) return {};
+    util::Md5 m;
+    juce::HeapBlock<char> buf(1 << 20);
+    for (;;) {
+        auto n = in.read(buf.get(), 1 << 20);
+        if (n <= 0) break;
+        m.update(buf.get(), size_t(n));
+    }
+    return m.hexDigest();
+}
+
+}  // namespace
+
+BatchResult Exporter::batchRender(const Session& s, const BatchSettings& bs, const juce::File& folder, const ExportSettings& es,
+                                  const Keep& keep) {
+    BatchResult res;
+    juce::StringArray adj;
+    cd::Disc disc = s.toDisc(&adj);
+    if (disc.tracks.empty()) { res.error = "There are no track markers."; return res; }
+    if (bs.ddp) {
+        auto issues = cd::validate(disc);
+        if (cd::hasErrors(issues)) {
+            res.error = "The disc has errors that a plant would reject; fix them or untick DDP:";
+            for (auto& i : issues)
+                if (i.level == cd::Issue::Error) res.error << "\n  " << juce::String::fromUTF8(i.message.c_str());
+            return res;
+        }
+    }
+    if (!folder.createDirectory()) { res.error = "Couldn't create " + folder.getFullPathName(); return res; }
+
+    const bool passCd = bs.ddp || bs.wav16 || bs.flac16;
+    const bool passHi = bs.wavHi || bs.flacHi || bs.programme;
+    const double hiRate = s.effectiveRate();
+    const double weightCd = passCd ? (passHi ? 0.5 : 1.0) : 0.0;
+    QcReport qc;
+    juce::String err;
+    juce::String settingsText;
+
+    // ---- Pass 1: the CD master at 44.1 kHz / 16-bit. One render feeds the DDP and the
+    // 16-bit track files, so the WAVs/FLACs are bit-identical to what's on the disc.
+    if (passCd) {
+        MasterStream ms(engine_, s, es, cd::kSampleRate);
+        QcRunner qr(s, cd::kSampleRate);
+        dsp::Ditherer dither;
+        dither.prepare(2, 16, es.shape, 0x5EED1234u, cd::kSampleRate);
+        std::vector<std::unique_ptr<TrackSink>> sinks;
+        auto tracks = trackList(s, disc, cd::kSampleRate, true);
+        if (bs.wav16) sinks.push_back(std::make_unique<TrackSink>(TrackSink::Wav, folder.getChildFile("WAV 16-bit 44.1 kHz"), cd::kSampleRate, 16, tracks, s));
+        if (bs.flac16) sinks.push_back(std::make_unique<TrackSink>(TrackSink::Flac, folder.getChildFile("FLAC 16-bit 44.1 kHz"), cd::kSampleRate, 16, tracks, s));
+        const juce::int64 total = disc.leadOutSector * cd::kSamplesPerSector;
+        std::vector<double> l, r;
+        std::vector<int32_t> ints;
+        juce::int64 pos = 0;
+        bool cancelled = false;
+
+        auto pull16 = [&](int16_t* out, int64_t frames) -> bool {
+            l.resize(size_t(frames));
+            r.resize(size_t(frames));
+            ints.resize(size_t(frames * 2));
+            if (!ms.pull(l.data(), r.data(), int(frames), err)) return false;
+            qr.feed(l.data(), r.data(), int(frames), pos);
+            const double* ch[2] = {l.data(), r.data()};
+            dither.process(ch, int(frames), ints.data());
+            for (int64_t i = 0; i < frames * 2; ++i) out[i] = int16_t(ints[size_t(i)]);
+            for (auto& sk : sinks)
+                if (!sk->consume(ints.data(), int(frames), pos, err)) return false;
+            pos += frames;
+            if (!keep(weightCd * double(pos) / double(total))) { cancelled = true; return false; }
+            return true;
+        };
+
+        if (bs.ddp) {
+            ddp::WriteOptions wo;
+            juce::String header;
+            if (s.client.isNotEmpty()) header << "Client:   " << s.client << "\n";
+            if (s.engineer.isNotEmpty()) header << "Engineer: " << s.engineer << "\n";
+            header << "Created:  " << juce::Time::getCurrentTime().toString(true, true) << " by Lathe (batch render)\n";
+            header << "Dither:   " << ditherName(es.shape) << "\n";
+            wo.pqLogHeader = header.toStdString();
+            auto ddpDir = folder.getChildFile("DDP");
+            auto w = ddp::writeDdp(disc, ddpDir.getFullPathName().toStdString(), pull16, wo);
+            if (!w.ok) {
+                res.error = cancelled ? juce::String("Cancelled.") : err.isNotEmpty() ? err : juce::String::fromUTF8(w.error.c_str());
+                return res;
+            }
+            for (auto& f : w.files) res.files.add("DDP/" + juce::String(f));
+            auto check = ddp::readDdp(ddpDir.getFullPathName().toStdString());
+            res.ddpVerified = check.ok && check.checksumsOk;
+        } else {
+            std::vector<int16_t> scratch;
+            while (pos < total) {
+                auto n = juce::jmin<juce::int64>(4096, total - pos);
+                scratch.resize(size_t(n * 2));
+                if (!pull16(scratch.data(), n)) { res.error = cancelled ? juce::String("Cancelled.") : err; return res; }
+            }
+        }
+        for (auto& sk : sinks) {
+            if (!sk->finish(err)) { res.error = err; return res; }
+            for (auto& f : sk->files()) res.files.add(f.getRelativePathFrom(folder));
+        }
+        qr.fill(qc);
+        settingsText << "CD master: 44.1 kHz / 16-bit, dither " << ditherName(es.shape) << "\n";
+    }
+
+    // ---- Pass 2: hi-res deliverables at the project rate (no sample-rate conversion).
+    if (passHi) {
+        MasterStream ms(engine_, s, es, hiRate);
+        std::unique_ptr<QcRunner> qr;
+        if (!passCd) qr = std::make_unique<QcRunner>(s, hiRate);
+        dsp::Ditherer dither;
+        const bool floatOut = bs.hiBits >= 32;
+        if (!floatOut) dither.prepare(2, bs.hiBits, es.shape, 0x5EED1234u, hiRate);
+        const int sinkBits = floatOut ? 24 : bs.hiBits;
+        auto label = juce::String(sinkBits) + "-bit " + rateLabel(hiRate) + " kHz";
+        std::vector<std::unique_ptr<TrackSink>> sinks;
+        auto tracks = trackList(s, disc, hiRate, false);
+        if (bs.wavHi) sinks.push_back(std::make_unique<TrackSink>(TrackSink::Wav, folder.getChildFile("WAV " + label), hiRate, sinkBits, tracks, s));
+        if (bs.flacHi) sinks.push_back(std::make_unique<TrackSink>(TrackSink::Flac, folder.getChildFile("FLAC " + label), hiRate, sinkBits, tracks, s));
+        std::unique_ptr<juce::AudioFormatWriter> prog;
+        juce::File progFile;
+        juce::WavAudioFormat wav;
+        if (bs.programme) {
+            progFile = folder.getChildFile(juce::File::createLegalFileName((s.discTitle.isEmpty() ? juce::String("Programme") : s.discTitle) + " " + label + ".wav"));
+            progFile.deleteFile();
+            std::unique_ptr<juce::OutputStream> os(progFile.createOutputStream().release());
+            if (os) prog.reset(wav.createWriterFor(os.get(), hiRate, 2, sinkBits, {}, 0));
+            if (!prog) { res.error = "Couldn't write " + progFile.getFullPathName(); return res; }
+            os.release();
+        }
+        const juce::int64 total = juce::int64(std::ceil(s.end() * hiRate));
+        std::vector<double> l(4096), r(4096);
+        std::vector<int32_t> ints(4096 * 2);
+        std::vector<int> tmp[2];
+        for (juce::int64 pos = 0; pos < total;) {
+            int n = int(juce::jmin<juce::int64>(4096, total - pos));
+            if (!ms.pull(l.data(), r.data(), n, err)) { res.error = err; return res; }
+            if (qr) qr->feed(l.data(), r.data(), n, pos);
+            const double* ch[2] = {l.data(), r.data()};
+            if (floatOut) {   // 32-bit float requested: deliver 24-bit integer files without dither
+                for (int i = 0; i < n; ++i) {
+                    ints[size_t(i * 2)] = int32_t(juce::jlimit(-8388608.0, 8388607.0, std::round(l[size_t(i)] * 8388608.0)));
+                    ints[size_t(i * 2 + 1)] = int32_t(juce::jlimit(-8388608.0, 8388607.0, std::round(r[size_t(i)] * 8388608.0)));
+                }
+            } else {
+                dither.process(ch, n, ints.data());
+            }
+            for (auto& sk : sinks)
+                if (!sk->consume(ints.data(), n, pos, err)) { res.error = err; return res; }
+            if (prog && !writeInts(*prog, ints.data(), n, sinkBits, tmp)) { res.error = "Disk write failed."; return res; }
+            pos += n;
+            if (!keep(weightCd + (1.0 - weightCd) * double(pos) / double(total))) { res.error = "Cancelled."; return res; }
+        }
+        for (auto& sk : sinks) {
+            if (!sk->finish(err)) { res.error = err; return res; }
+            for (auto& f : sk->files()) res.files.add(f.getRelativePathFrom(folder));
+        }
+        if (prog) { prog.reset(); res.files.add(progFile.getFileName()); }
+        if (qr) qr->fill(qc);
+        settingsText << "Hi-res: " << label << ", dither " << (floatOut ? juce::String("none") : ditherName(es.shape)) << "\n";
+    }
+
+    // ---- Report: settings, QC and an MD5 for every file, so the client can verify delivery.
+    juce::String rep;
+    rep << "LATHE RENDER REPORT\n";
+    rep << (s.discTitle.isNotEmpty() ? s.discTitle : juce::String("(untitled)"));
+    if (s.discPerformer.isNotEmpty()) rep << " - " << s.discPerformer;
+    rep << "\n";
+    if (s.client.isNotEmpty()) rep << "Client:   " << s.client << "\n";
+    if (s.engineer.isNotEmpty()) rep << "Engineer: " << s.engineer << "\n";
+    rep << "Rendered: " << juce::Time::getCurrentTime().toString(true, true) << "\n";
+    rep << "Engine:   64-bit float mix, region effects and master chain";
+    rep << " (" << engine_.chain().size() << " master insert(s))\n";
+    rep << settingsText << "\n";
+    if (bs.ddp) rep << "DDP: " << (res.ddpVerified ? "written and verified (all checksums match)" : "WRITTEN BUT VERIFY FAILED - re-render") << "\n\n";
+    rep << qc.toText() << "\n";
+    for (auto& a : adj) rep << "Note: " << a << "\n";
+    rep << "FILES (MD5)\n";
+    for (auto& f : res.files) {
+        auto file = folder.getChildFile(f);
+        rep << "  " << md5Of(file) << "  " << f << "\n";
+    }
+    folder.getChildFile("Render Report.txt").replaceWithText(rep);
+    res.files.add("Render Report.txt");
+    res.report = rep;
+    res.ok = !bs.ddp || res.ddpVerified;
+    if (!res.ok) res.error = "The DDP didn't verify after writing. Re-render to a different drive.";
+    return res;
 }
 
 }  // namespace lathe

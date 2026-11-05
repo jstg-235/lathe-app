@@ -7,8 +7,15 @@ namespace lathe {
 // One open source file, positioned and resampled to the programme rate.
 class ClipStream {
 public:
-    ClipStream(juce::AudioFormatManager& fm, const Region& c, const EffectiveFades& fades, double targetRate, juce::int64 localStart)
+    ClipStream(juce::AudioFormatManager& fm, const Region& c, const EffectiveFades& fades, double targetRate, juce::int64 localStart,
+               RegionFxBank* fx)
         : clip_(c), fades_(fades), rate_(targetRate), local_(localStart) {
+        if (fx && fx->hasEffects(c.id)) {
+            fx_ = fx;
+            fx_->reset(c.id);
+            skip_ = fx_->latency(c.id);   // plugin delay compensation for this region
+            fxBuf_.setSize(2, kChunk * 4);
+        }
         reader_.reset(fm.createReaderFor(c.file));
         if (!reader_) return;
         ratio_ = c.fileRate / targetRate;
@@ -21,6 +28,7 @@ public:
         for (auto& v : pending_) v.reserve(size_t(kChunk * 8));
         lengthOut_ = juce::int64(std::floor(c.length() * targetRate));
         gain_ = juce::Decibels::decibelsToGain(c.gainDb);
+        flushNeeded_ = (rs_[0] ? 64 : 0) + (skip_ + kChunk - 1) / kChunk;
     }
 
     bool ok() const { return reader_ != nullptr; }
@@ -64,18 +72,29 @@ private:
             if (reader_->numChannels == 1) in_.copyFrom(1, 0, in_, 0, 0, n);
             srcPos_ += n;
         } else {
-            n = kChunk;   // flush the resampler with silence
-            if (++flushPasses_ > 64 || !rs_[0]) drained_ = true;
+            n = kChunk;   // flush the resampler and plugin latency with silence
+            if (++flushPasses_ > flushNeeded_) drained_ = true;
         }
+        double* outs[2] = {};
+        int got = n;
         for (int ch = 0; ch < 2; ++ch) {
             auto* src = in_.getReadPointer(ch);
-            dbl_.resize(size_t(n));
-            for (int i = 0; i < n; ++i) dbl_[size_t(i)] = src[i];
-            double* op = dbl_.data();
-            int got = rs_[ch] ? rs_[ch]->process(dbl_.data(), n, op) : n;
-            pending_[size_t(ch)].insert(pending_[size_t(ch)].end(), op, op + got);
+            dbl_[ch].resize(size_t(n));
+            for (int i = 0; i < n; ++i) dbl_[ch][size_t(i)] = src[i];
+            outs[ch] = dbl_[ch].data();
+            if (rs_[ch]) got = rs_[ch]->process(dbl_[ch].data(), n, outs[ch]);
         }
-        if (pastEnd && !rs_[0]) drained_ = true;
+        if (fx_ && got > 0) {
+            // Region effects run at the programme rate, before gain, envelope and fades.
+            if (fxBuf_.getNumSamples() < got) fxBuf_.setSize(2, got);
+            for (int ch = 0; ch < 2; ++ch) std::copy(outs[ch], outs[ch] + got, fxBuf_.getWritePointer(ch));
+            fx_->process(clip_.id, fxBuf_, got);
+            for (int ch = 0; ch < 2; ++ch) outs[ch] = fxBuf_.getWritePointer(ch);
+        }
+        int drop = juce::jmin(skip_, got);
+        skip_ -= drop;
+        for (int ch = 0; ch < 2; ++ch)
+            pending_[size_t(ch)].insert(pending_[size_t(ch)].end(), outs[ch] + drop, outs[ch] + got);
     }
 
     Region clip_;
@@ -84,8 +103,11 @@ private:
     std::unique_ptr<juce::AudioFormatReader> reader_;
     std::unique_ptr<r8b::CDSPResampler24> rs_[2];
     juce::AudioBuffer<float> in_;
-    std::vector<double> dbl_;
+    std::vector<double> dbl_[2];
     std::vector<double> pending_[2];
+    RegionFxBank* fx_ = nullptr;
+    juce::AudioBuffer<double> fxBuf_;
+    int skip_ = 0, flushNeeded_ = 0;
     int pendingPos_ = 0;
     juce::int64 local_ = 0, srcPos_ = 0, srcEnd_ = 0, lengthOut_ = 0;
     int flushPasses_ = 0;
@@ -95,7 +117,8 @@ private:
 ProgramRenderer::ProgramRenderer(juce::AudioFormatManager& f) : formats_(f) {}
 ProgramRenderer::~ProgramRenderer() = default;
 
-void ProgramRenderer::setSession(const Session& s, double targetRate) {
+void ProgramRenderer::setSession(const Session& s, double targetRate, bool offline) {
+    if (fx_) fx_->prepare(targetRate, 2048, offline);
     regions_.clear();
     fades_.clear();
     for (int i = 0; i < s.regions.size(); ++i) {
@@ -138,7 +161,7 @@ bool ProgramRenderer::renderT(juce::AudioBuffer<T>& out, int start, int n) {
         auto& st = streams_[size_t(i)];
         juce::int64 from = juce::jmax(a, starts_[i]);
         if (!st) {
-            st = std::make_unique<ClipStream>(formats_, regions_.getReference(i), fades_.getReference(i), rate_, from - starts_[i]);
+            st = std::make_unique<ClipStream>(formats_, regions_.getReference(i), fades_.getReference(i), rate_, from - starts_[i], fx_);
             if (!st->ok()) {
                 error_ = "Couldn't open " + regions_.getReference(i).file.getFullPathName();
                 ok = false;

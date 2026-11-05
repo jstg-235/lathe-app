@@ -60,7 +60,7 @@ void AudioEngine::loadSession(const Session& s) {
     {
         const juce::ScopedLock sl(sourceLock_);
         buffered_.reset();
-        program_ = std::make_unique<ProgramSource>(formats_, s, rate_);
+        program_ = std::make_unique<ProgramSource>(formats_, s, rate_, &fx_);
         // 4 s of read-ahead absorbs slow disks and network volumes.
         buffered_ = std::make_unique<juce::BufferingAudioSource>(program_.get(), readAhead_, false,
                                                                   int(rate_ * 4), 2, true);

@@ -21,6 +21,27 @@ struct QcReport {
     juce::String toText() const;
 };
 
+struct ExportSettings;
+
+// Batch render ("Render Album"): every deliverable in one go.
+struct BatchSettings {
+    bool ddp = true;
+    bool wav16 = true;      // per-track 16-bit / 44.1 kHz WAV, bit-identical to the CD
+    bool flac16 = false;    // per-track 16-bit / 44.1 kHz FLAC, tagged
+    bool wavHi = true;      // per-track hi-res WAV at the project rate
+    bool flacHi = false;    // per-track hi-res FLAC at the project rate, tagged
+    bool programme = false; // one hi-res WAV of the whole programme
+    int hiBits = 24;
+};
+
+struct BatchResult {
+    bool ok = false;
+    juce::String error;
+    juce::StringArray files;     // relative to the output folder
+    juce::String report;         // also written as Render Report.txt
+    bool ddpVerified = false;
+};
+
 struct ExportSettings {
     dsp::Ditherer::Shape shape = dsp::Ditherer::Shape::None;
     bool runPlugins = true;
@@ -40,6 +61,9 @@ public:
                                  const Keep& keepGoing);
     juce::String exportProgramWav(const Session& s, const juce::File& file, int bits, const ExportSettings& es,
                                   const Keep& keepGoing);
+    // Renders all selected deliverables into `folder` (created), with a QC + checksum report.
+    BatchResult batchRender(const Session& s, const BatchSettings& bs, const juce::File& folder, const ExportSettings& es,
+                            const Keep& keepGoing);
     // Loudness / true peak / overs for the CD master, without writing anything.
     juce::String analyse(const Session& s, const ExportSettings& es, const Keep& keepGoing, QcReport& qc);
 
