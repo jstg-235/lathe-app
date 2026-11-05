@@ -90,6 +90,20 @@ void AudioEngine::playSource() {
 
 void AudioEngine::stopSource() { sourceTransport_.stop(); }
 
+juce::String AudioEngine::matchDeviceRate(double rate) {
+    auto* dev = devices_.getCurrentAudioDevice();
+    if (!dev) return "No audio device.";
+    if (std::abs(dev->getCurrentSampleRate() - rate) < 0.5) return {};
+    bool supported = false;
+    for (double r : dev->getAvailableSampleRates()) supported |= std::abs(r - rate) < 0.5;
+    if (!supported)
+        return dev->getName() + " can't run at " + juce::String(rate / 1000.0, 1) + " kHz; playback is resampled (export is unaffected).";
+    auto setup = devices_.getAudioDeviceSetup();
+    setup.sampleRate = rate;
+    auto err = devices_.setAudioDeviceSetup(setup, true);
+    return err;
+}
+
 void AudioEngine::play() {
     sourceTransport_.stop();
     if (transport_.getCurrentPosition() >= transport_.getLengthInSeconds() - 0.01) transport_.setPosition(0);

@@ -21,6 +21,8 @@ public:
     void markIn() { in_ = engine_.sourcePosition(); if (out_ >= 0 && out_ <= in_) out_ = -1; repaint(); }
     void markOut() { out_ = engine_.sourcePosition(); if (in_ >= out_) in_ = -1; repaint(); }
     void togglePlay();
+    void playInOut();
+    void showOpenDialog();
     void tick();   // called from the UI timer
 
     std::function<void(Session::EditMode)> onEdit;

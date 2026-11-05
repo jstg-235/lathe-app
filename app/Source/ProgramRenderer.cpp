@@ -26,7 +26,8 @@ public:
     bool ok() const { return reader_ != nullptr; }
 
     // Adds n frames of this clip, starting at the clip-local sample local_, into out.
-    void addTo(juce::AudioBuffer<float>& out, int offset, int n) {
+    template <typename T>
+    void addTo(juce::AudioBuffer<T>& out, int offset, int n) {
         while (int(pending_[0].size()) - pendingPos_ < n && !drained_) pull();
         const int avail = juce::jmin(n, int(pending_[0].size()) - pendingPos_);
         const double fadeIn = fades_.in * rate_, fadeOut = fades_.out * rate_;
@@ -40,7 +41,7 @@ public:
             double toEnd = double(lengthOut_ - 1 - k);
             if (fadeOut > 0 && toEnd < fadeOut) g *= fadeGain(fades_.outShape, juce::jmax(0.0, toEnd) / fadeOut);
             for (int ch = 0; ch < 2; ++ch)
-                out.addSample(ch, offset + i, float(pending_[size_t(ch)][size_t(pendingPos_ + i)] * g));
+                out.getWritePointer(ch)[offset + i] += T(pending_[size_t(ch)][size_t(pendingPos_ + i)] * g);
         }
         pendingPos_ += avail;
         local_ += n;
@@ -121,7 +122,11 @@ void ProgramRenderer::seek(juce::int64 p) {
     for (auto& s : streams_) s.reset();
 }
 
-bool ProgramRenderer::render(juce::AudioBuffer<float>& out, int start, int n) {
+bool ProgramRenderer::render(juce::AudioBuffer<float>& out, int start, int n) { return renderT(out, start, n); }
+bool ProgramRenderer::render(juce::AudioBuffer<double>& out, int start, int n) { return renderT(out, start, n); }
+
+template <typename T>
+bool ProgramRenderer::renderT(juce::AudioBuffer<T>& out, int start, int n) {
     for (int ch = 0; ch < out.getNumChannels(); ++ch) out.clear(ch, start, n);
     bool ok = true;
     const juce::int64 a = pos_, b = pos_ + n;

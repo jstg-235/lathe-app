@@ -266,7 +266,57 @@ static void testDither() {
     CHECK(o[0] == 32767 && o[1] == -32768);
 }
 
+// Noise power of the requantisation error in the band below ~4 kHz, via a 4th-order lowpass.
+static double lowBandNoise(dsp::Ditherer::Shape shape) {
+    dsp::Ditherer d;
+    d.prepare(1, 16, shape, 12345, 44100);
+    const int n = 1 << 17;
+    std::vector<double> x(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) x[size_t(i)] = 0.001 * std::sin(2 * M_PI * 1000.0 * i / 44100.0);   // -60 dBFS tone
+    std::vector<int32_t> q(static_cast<size_t>(n));
+    const double* ch[1] = {x.data()};
+    d.process(ch, n, q.data());
+    // Butterworth-ish lowpass at 4 kHz (two cascaded 2nd-order sections, bilinear).
+    auto lp = [](std::vector<double>& s) {
+        const double K = std::tan(M_PI * 4000.0 / 44100.0), Q = 0.7071;
+        const double a0 = 1 + K / Q + K * K;
+        const double b0 = K * K / a0, b1 = 2 * b0, b2 = b0, a1 = 2 * (K * K - 1) / a0, a2 = (1 - K / Q + K * K) / a0;
+        double z1 = 0, z2 = 0;
+        for (auto& v : s) { double y = b0 * v + z1; z1 = b1 * v - a1 * y + z2; z2 = b2 * v - a2 * y; v = y; }
+    };
+    std::vector<double> e(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) e[size_t(i)] = double(q[size_t(i)]) - x[size_t(i)] * 32768.0;
+    lp(e); lp(e);
+    double p = 0;
+    for (int i = 4096; i < n; ++i) p += e[size_t(i)] * e[size_t(i)];
+    return p / (n - 4096);
+}
+
+static void testNoiseShaping() {
+    double flat = lowBandNoise(dsp::Ditherer::Shape::None);
+    double light = lowBandNoise(dsp::Ditherer::Shape::Light);
+    double medium = lowBandNoise(dsp::Ditherer::Shape::Medium);
+    double psycho = lowBandNoise(dsp::Ditherer::Shape::Psycho);
+    auto db = [&](double v) { return 10 * std::log10(v / flat); };
+    std::printf("noise below 4 kHz vs flat TPDF: light %.1f dB, lipshitz %.1f dB, psycho %.1f dB\n", db(light), db(medium), db(psycho));
+    CHECK(db(light) < -3);
+    CHECK(db(medium) < -8);
+    CHECK(db(psycho) < -8);
+    // Stays bounded on a full-scale square wave (clipping must not make the 9-tap shaper ring).
+    dsp::Ditherer d;
+    d.prepare(1, 16, dsp::Ditherer::Shape::Psycho, 1, 44100);
+    std::vector<double> sq(44100);
+    for (size_t i = 0; i < sq.size(); ++i) sq[i] = ((i / 50) % 2) ? 0.999 : -0.999;
+    std::vector<int32_t> out(sq.size());
+    const double* ch[1] = {sq.data()};
+    d.process(ch, int(sq.size()), out.data());
+    double worst = 0;
+    for (size_t i = 0; i < sq.size(); ++i) worst = std::max(worst, std::abs(out[i] - sq[i] * 32768.0));
+    CHECK(worst < 64);   // within a few dozen LSB of the input even at the rails
+}
+
 int main() {
+    testNoiseShaping();
     testMsf();
     testValidation();
     testHashes();

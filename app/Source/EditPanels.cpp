@@ -13,20 +13,11 @@ SourcePanel::SourcePanel(AudioEngine& e, ThumbPool& pool) : engine_(e), pool_(po
     info_.setFont(juce::FontOptions(12.0f));
     addAndMakeVisible(info_);
 
-    openBtn_.onClick = [this] {
-        chooser_ = std::make_unique<juce::FileChooser>("Open source audio", juce::File(), engine_.formats().getWildcardForAllFormats());
-        chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                              [this](const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) open(fc.getResult()); });
-    };
+    openBtn_.onClick = [this] { showOpenDialog(); };
     playBtn_.onClick = [this] { togglePlay(); };
     inBtn_.onClick = [this] { markIn(); };
     outBtn_.onClick = [this] { markOut(); };
-    playRange_.onClick = [this] {
-        auto r = inOut();
-        engine_.setSourcePosition(r.getStart());
-        stopAtOut_ = true;
-        engine_.playSource();
-    };
+    playRange_.onClick = [this] { playInOut(); };
     insertBtn_.setTooltip("Insert the source In-Out at the destination playhead (or selection start); later material moves right");
     overwriteBtn_.setTooltip("Overwrite the destination from the playhead for the length of the source In-Out");
     replaceBtn_.setTooltip("4-point edit: replace the destination selection with the source In-Out; later material moves to fit");
@@ -52,6 +43,20 @@ bool SourcePanel::open(const juce::File& f) {
     if (onOpened) onOpened(f);
     repaint();
     return true;
+}
+
+void SourcePanel::showOpenDialog() {
+    chooser_ = std::make_unique<juce::FileChooser>("Open source audio", juce::File(), engine_.formats().getWildcardForAllFormats());
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                          [this](const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) open(fc.getResult()); });
+}
+
+void SourcePanel::playInOut() {
+    if (!hasSource()) return;
+    auto r = inOut();
+    engine_.setSourcePosition(r.getStart());
+    stopAtOut_ = true;
+    engine_.playSource();
 }
 
 juce::Range<double> SourcePanel::inOut() const {

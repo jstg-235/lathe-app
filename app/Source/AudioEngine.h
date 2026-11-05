@@ -18,7 +18,14 @@ public:
     void prepareToPlay(int, double) override {}
     void releaseResources() override {}
     void getNextAudioBlock(const juce::AudioSourceChannelInfo& info) override {
-        r_.render(*info.buffer, info.startSample, info.numSamples);
+        // Mix in 64-bit, convert to the device's 32-bit float once at the end.
+        if (dbl_.getNumSamples() < info.numSamples) dbl_.setSize(2, info.numSamples, false, false, true);
+        r_.render(dbl_, 0, info.numSamples);
+        for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch) {
+            auto* d = info.buffer->getWritePointer(ch, info.startSample);
+            auto* s = dbl_.getReadPointer(juce::jmin(ch, 1));
+            for (int i = 0; i < info.numSamples; ++i) d[i] = float(s[i]);
+        }
     }
     void setNextReadPosition(juce::int64 p) override { r_.seek(p); }
     juce::int64 getNextReadPosition() const override { return r_.position(); }
@@ -26,6 +33,7 @@ public:
     bool isLooping() const override { return false; }
 private:
     ProgramRenderer r_;
+    juce::AudioBuffer<double> dbl_{2, 8192};
 };
 
 // Single-producer/single-consumer ring of stereo samples for the meters.
@@ -69,6 +77,10 @@ public:
     double sourcePosition() const { return sourceTransport_.getCurrentPosition(); }
     void setSourcePosition(double sec) { sourceTransport_.setPosition(sec); }
     double sourceLength() const { return sourceTransport_.getLengthInSeconds(); }
+
+    // Switches the interface to `rate` when it supports it, so playback reaches the converters
+    // with no sample-rate conversion anywhere (ours or the OS's). Returns a status message.
+    juce::String matchDeviceRate(double rate);
 
     // While exporting, the chain is used offline, so playback is suspended.
     void suspendForOffline(bool suspend);

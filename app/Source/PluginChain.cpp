@@ -104,17 +104,66 @@ void PluginChain::closeAllEditors() {
     for (auto* s : slots_) s->window.reset();
 }
 
-void PluginChain::prepare(double rate, int block) {
+void PluginChain::prepare(double rate, int block, bool doublePrecision) {
     const juce::ScopedLock sl(lock_);
     rate_ = rate;
     block_ = block;
     scratch_.setSize(2, juce::jmax(block, 8192));
+    dscratch_.setSize(2, juce::jmax(block, 8192));
     for (auto* s : slots_) {
         s->plugin->releaseResources();
         s->plugin->setRateAndBufferSizeDetails(rate, block);
+        // 64-bit processing for plugins that offer it (offline renders); 32-bit otherwise.
+        bool dbl = doublePrecision && s->plugin->supportsDoublePrecisionProcessing();
+        s->plugin->setProcessingPrecision(dbl ? juce::AudioProcessor::doublePrecision : juce::AudioProcessor::singlePrecision);
         s->plugin->prepareToPlay(rate, block);
     }
     prepared_ = true;
+}
+
+int PluginChain::countDoublePrecision() const {
+    int n = 0;
+    for (auto* s : slots_)
+        if (!s->bypassed && s->plugin->getProcessingPrecision() == juce::AudioProcessor::doublePrecision) ++n;
+    return n;
+}
+
+void PluginChain::process(juce::AudioBuffer<double>& b, int start, int n) {
+    const juce::ScopedTryLock sl(lock_);
+    if (!sl.isLocked() || !prepared_ || slots_.isEmpty()) return;
+    for (int done = 0; done < n;) {
+        int k = juce::jmin(n - done, block_, dscratch_.getNumSamples());
+        juce::AudioBuffer<double> dview(dscratch_.getArrayOfWritePointers(), 2, k);
+        juce::AudioBuffer<float> fview(scratch_.getArrayOfWritePointers(), 2, k);
+        for (int ch = 0; ch < 2; ++ch) dview.copyFrom(ch, 0, b, juce::jmin(ch, b.getNumChannels() - 1), start + done, k);
+        for (auto* s : slots_) {
+            if (s->bypassed) continue;
+            midi_.clear();
+            if (s->plugin->getProcessingPrecision() == juce::AudioProcessor::doublePrecision) {
+                s->plugin->processBlock(dview, midi_);
+            } else {
+                // 32-bit plugin inside the 64-bit chain: convert just around it.
+                for (int ch = 0; ch < 2; ++ch) {
+                    auto* d = dview.getReadPointer(ch);
+                    auto* f = fview.getWritePointer(ch);
+                    for (int i = 0; i < k; ++i) f[i] = float(d[i]);
+                }
+                s->plugin->processBlock(fview, midi_);
+                for (int ch = 0; ch < 2; ++ch) {
+                    auto* f = fview.getReadPointer(ch);
+                    auto* d = dview.getWritePointer(ch);
+                    for (int i = 0; i < k; ++i) d[i] = double(f[i]);
+                }
+            }
+        }
+        for (int ch = 0; ch < juce::jmin(2, b.getNumChannels()); ++ch) {
+            auto* p = dview.getWritePointer(ch);
+            for (int i = 0; i < k; ++i)
+                if (!std::isfinite(p[i])) p[i] = 0;
+            b.copyFrom(ch, start + done, dview, ch, 0, k);
+        }
+        done += k;
+    }
 }
 
 void PluginChain::release() {

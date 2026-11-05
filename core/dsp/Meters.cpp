@@ -198,16 +198,28 @@ double LoudnessMeter::truePeakDb() const {
 
 // ---------------------------------------------------------------- Dither
 
-void Ditherer::prepare(int channels, int bits, Shape shape, uint32_t seed) {
+void Ditherer::prepare(int channels, int bits, Shape shape, uint32_t seed, double sampleRate) {
     ch_ = channels;
     bits_ = bits;
-    shape_ = shape;
     rng_ = seed ? seed : 1;
-    err_.assign(size_t(channels), {0.0, 0.0});
+    err_.assign(size_t(channels), {});
+    std::fill(std::begin(coef_), std::end(coef_), 0.0);
+    // Noise transfer function = 1 - sum(c_k z^-k).
+    static const double lipshitz[5] = {2.033, -2.165, 1.959, -1.590, 0.6149};
+    static const double fweighted[9] = {2.412, -3.370, 3.937, -4.174, 3.353, -2.205, 1.281, -0.569, 0.0847};
+    const bool cdRate = sampleRate < 50000.0;
+    if ((shape == Shape::Medium || shape == Shape::Psycho) && !cdRate) shape = Shape::Light;
+    switch (shape) {
+        case Shape::None: taps_ = 0; break;
+        case Shape::Light: taps_ = 1; coef_[0] = 1.0; break;
+        case Shape::Strong: taps_ = 2; coef_[0] = 1.5; coef_[1] = -0.6; break;
+        case Shape::Medium: taps_ = 5; std::copy(lipshitz, lipshitz + 5, coef_); break;
+        case Shape::Psycho: taps_ = 9; std::copy(fweighted, fweighted + 9, coef_); break;
+    }
 }
 
 void Ditherer::reset() {
-    for (auto& e : err_) e = {0.0, 0.0};
+    for (auto& e : err_) e.fill(0.0);
 }
 
 double Ditherer::nextUniform() {
@@ -218,39 +230,47 @@ double Ditherer::nextUniform() {
     return double(rng_) / 4294967296.0;
 }
 
-void Ditherer::process(const float* const* in, int n, int32_t* out) {
+template <typename T>
+void Ditherer::run(const T* const* in, int n, int32_t* out) {
     const double scale = double(1LL << (bits_ - 1));
     const double maxV = scale - 1, minV = -scale;
-    double c1 = 0, c2 = 0;
-    if (shape_ == Shape::Light) c1 = 1.0;
-    if (shape_ == Shape::Strong) { c1 = 1.5; c2 = -0.6; }
     for (int i = 0; i < n; ++i) {
         for (int c = 0; c < ch_; ++c) {
             auto& e = err_[size_t(c)];
             double x = double(in[c][i]) * scale;
-            double v = x - c1 * e[0] - c2 * e[1];
-            double tpdf = nextUniform() - nextUniform();   // triangular, ±1 LSB
+            double fb = 0;
+            for (int k = 0; k < taps_; ++k) fb += coef_[k] * e[size_t(k)];
+            double v = x - fb;
+            double tpdf = nextUniform() - nextUniform();   // triangular, +/-1 LSB
             double q = std::floor(v + tpdf + 0.5);
+            bool clipped = q > maxV || q < minV;
             q = std::clamp(q, minV, maxV);
-            e[1] = e[0];
-            e[0] = std::clamp(q - v, -4.0, 4.0);   // bounded so clipping can't make the shaper ring
+            for (int k = taps_ - 1; k > 0; --k) e[size_t(k)] = e[size_t(k - 1)];
+            // On clipping the shaper would integrate a huge error and ring; reset it instead.
+            if (taps_) e[0] = clipped ? 0.0 : std::clamp(q - v, -8.0, 8.0);
+            if (clipped) e.fill(0.0);
             out[i * ch_ + c] = int32_t(q);
         }
     }
 }
 
-void Ditherer::process16(const float* const* in, int n, int16_t* out) {
-    // Small fixed buffer avoids allocation.
+template <typename T>
+void Ditherer::run16(const T* const* in, int n, int16_t* out) {
     int32_t tmp[512];
     const int perPass = 512 / std::max(1, ch_);
-    const float* ptrs[8] = {};
+    const T* ptrs[8] = {};
     for (int done = 0; done < n;) {
         int k = std::min(perPass, n - done);
         for (int c = 0; c < ch_ && c < 8; ++c) ptrs[c] = in[c] + done;
-        process(ptrs, k, tmp);
+        run(ptrs, k, tmp);
         for (int i = 0; i < k * ch_; ++i) out[done * ch_ + i] = int16_t(tmp[i]);
         done += k;
     }
 }
+
+void Ditherer::process(const float* const* in, int n, int32_t* out) { run(in, n, out); }
+void Ditherer::process(const double* const* in, int n, int32_t* out) { run(in, n, out); }
+void Ditherer::process16(const float* const* in, int n, int16_t* out) { run16(in, n, out); }
+void Ditherer::process16(const double* const* in, int n, int16_t* out) { run16(in, n, out); }
 
 }  // namespace lathe::dsp

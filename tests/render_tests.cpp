@@ -1,5 +1,7 @@
 // Renderer tests: real WAV files through ProgramRenderer (gaps, gain, fades, SRC) and the
 // DDP layout derived from the same session, so playback, export and PQ stay in step.
+#include "../app/Source/Commands.h"
+#include "../app/Source/NullTest.h"
 #include "../app/Source/ProgramRenderer.h"
 #include "../core/ddp/Ddp.h"
 
@@ -170,6 +172,95 @@ int main() {
         auto md = m.toDisc();
         CHECK(md.tracks.size() == 2 && md.tracks[1].isrc == "USABC2600002" && md.tracks[1].indexes.size() == 3);
         CHECK(md.tracks[0].text.title == "Song A");
+    }
+
+    // ---- Bit transparency: a 24-bit file at the project rate, unity gain, no fades,
+    // must come out of the 64-bit renderer sample-for-sample identical.
+    {
+        auto f = dir.getChildFile("noise24.wav");
+        juce::WavAudioFormat wav;
+        {
+            std::unique_ptr<juce::OutputStream> os(f.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 44100, 2, 24, {}, 0));
+            os.release();
+            juce::Random rnd(42);
+            juce::AudioBuffer<int> ib(2, 44100);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 44100; ++i) ib.setSample(ch, i, (rnd.nextInt(1 << 24) - (1 << 23)) << 8);
+            const int* chans[3] = {ib.getReadPointer(0), ib.getReadPointer(1), nullptr};
+            w->write(chans, 44100);
+        }
+        Session t;
+        t.append(regionFor(t, fm, f), 2.0);
+        ProgramRenderer rr(fm);
+        rr.setSession(t, 44100);
+        juce::AudioBuffer<double> o(2, int(rr.totalSamples()));
+        rr.render(o, 0, o.getNumSamples());
+        std::unique_ptr<juce::AudioFormatReader> rd(fm.createReaderFor(f));
+        juce::AudioBuffer<float> src(2, 44100);
+        rd->read(&src, 0, 44100, 0, true, true);
+        int mismatches = 0;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < 44100; ++i)
+                if (o.getSample(ch, 88200 + i) != double(src.getSample(ch, i))) ++mismatches;
+        CHECK(mismatches == 0);
+        std::printf("bit-transparency: %d mismatches in 88200 samples\n", mismatches);
+    }
+
+    // ---- Null test: B = A delayed 123 samples, inverted, -0.5 dB. Must find all three.
+    {
+        auto fa = dir.getChildFile("na.wav");
+        {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(fa.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 44100, 2, 32, {}, 0));
+            os.release();
+            juce::Random rnd(99);
+            juce::AudioBuffer<float> n(2, 44100 * 4);
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < n.getNumSamples(); ++i) n.setSample(ch, i, (rnd.nextFloat() - 0.5f) * 0.5f);
+            w->writeFromAudioSampleBuffer(n, 0, n.getNumSamples());
+        }
+        auto fb = dir.getChildFile("nb.wav");
+        {
+            std::unique_ptr<juce::AudioFormatReader> ra(fm.createReaderFor(fa));
+            juce::AudioBuffer<float> x(2, int(ra->lengthInSamples) + 123);
+            x.clear();
+            ra->read(&x, 123, int(ra->lengthInSamples), 0, true, true);
+            x.applyGain(-std::pow(10.0f, -0.5f / 20.0f));
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(fb.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 44100, 2, 32, {}, 0));
+            os.release();
+            w->writeFromAudioSampleBuffer(x, 0, x.getNumSamples());
+        }
+        auto nr = nullTest(fm, fa, fb, {}, {});
+        CHECK(nr.ok);
+        std::printf("null test: offset %lld inverted %d gain %.3f dB residual-after-gain %.1f dBFS\n", (long long) nr.offset,
+                    int(nr.inverted), nr.gainDiffDb, 20 * std::log10(nr.residualRmsGainMatched + 1e-30));
+        CHECK(nr.offset == 123);
+        CHECK(nr.inverted);
+        CHECK(std::abs(nr.gainDiffDb - 0.5) < 0.01);
+        CHECK(nr.residualRmsGainMatched < 1e-5);
+        // Identical files are reported bit-identical.
+        auto same = nullTest(fm, fa, fa, {}, {});
+        CHECK(same.ok && same.offset == 0 && same.residualPeak == 0.0);
+    }
+
+    // ---- Key commands: every default parses, and no two commands share a key.
+    {
+        std::map<juce::String, juce::String> seen;
+        int dupes = 0, unparsed = 0;
+        for (auto& d : allCommands())
+            for (auto& k : juce::StringArray::fromTokens(d.keys, ";", "")) {
+                if (k.trim().isEmpty()) continue;
+                auto kp = juce::KeyPress::createFromDescription(k.trim());
+                if (!kp.isValid()) { ++unparsed; std::printf("unparsed key: %s\n", k.toRawUTF8()); }
+                auto key = kp.getTextDescription().toLowerCase();
+                if (seen.count(key)) { ++dupes; std::printf("duplicate key %s: %s / %s\n", key.toRawUTF8(), seen[key].toRawUTF8(), d.name); }
+                seen[key] = d.name;
+            }
+        CHECK(dupes == 0 && unparsed == 0);
+        if (auto* out = std::getenv("LATHE_KEYGUIDE_OUT")) juce::File(out).replaceWithText(keyGuideHtml(nullptr));
     }
 
     dir.deleteRecursively();

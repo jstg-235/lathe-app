@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AudioEngine.h"
+#include "Commands.h"
 #include "EditPanels.h"
 #include "Exporter.h"
 #include "Session.h"
@@ -16,6 +17,8 @@ class LevelMeters;
 class MainComponent : public juce::Component,
                       public juce::TableListBoxModel,
                       public juce::FileDragAndDropTarget,
+                      public juce::ApplicationCommandTarget,
+                      public juce::MenuBarModel,
                       private juce::Timer,
                       private juce::ChangeListener {
 public:
@@ -24,7 +27,16 @@ public:
 
     void paint(juce::Graphics&) override;
     void resized() override;
-    bool keyPressed(const juce::KeyPress&) override;
+
+    // Commands, key mappings and menus
+    juce::ApplicationCommandManager& commandManager() { return commands_; }
+    juce::ApplicationCommandTarget* getNextCommandTarget() override { return nullptr; }
+    void getAllCommands(juce::Array<juce::CommandID>& ids) override;
+    void getCommandInfo(juce::CommandID id, juce::ApplicationCommandInfo& info) override;
+    bool perform(const InvocationInfo& info) override;
+    juce::StringArray getMenuBarNames() override;
+    juce::PopupMenu getMenuForIndex(int index, const juce::String& name) override;
+    void menuItemSelected(int, int) override {}
 
     Session& session() { return session_; }
     void sessionChanged(bool undoable = true);
@@ -85,6 +97,12 @@ private:
     void redo();
     ExportSettings exportSettings() const;
     void showText(const juce::String& title, const juce::String& text);
+    void showKeyGuide();
+    void showKeyEditor();
+    void runNullTest();
+    void jumpToMarker(int dir);
+    void applyFollowRate();
+    void saveKeyMappings();
     int markerRowToTrackNumber(int row) const;
 
     Session session_;
@@ -114,6 +132,9 @@ private:
     bool dirty_ = false, updatingFields_ = false;
     double lastDeviceRate_ = 0, auditionEnd_ = -1;
     juce::ApplicationProperties props_;
+    juce::ApplicationCommandManager commands_;
+    bool followRate_ = true;
+    juce::String rateMessage_;
     std::unique_ptr<juce::FileChooser> chooser_;
     juce::Component::SafePointer<CrossfadeEditor> xfadeEditor_;
     std::unique_ptr<juce::DocumentWindow> xfadeWindow_;

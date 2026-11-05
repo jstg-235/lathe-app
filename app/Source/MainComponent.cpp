@@ -1,6 +1,7 @@
 #include "MainComponent.h"
 
 #include "../../core/cd/CdTextEncoder.h"
+#include "NullTest.h"
 #include "Theme.h"
 
 namespace lathe {
@@ -296,15 +297,28 @@ MainComponent::MainComponent() {
     ditherLbl_.setText("Dither", juce::dontSendNotification);
     ditherLbl_.setColour(juce::Label::textColourId, colours::dim);
     addAndMakeVisible(ditherLbl_);
-    dither_.addItem("TPDF (flat)", 1);
-    dither_.addItem("TPDF + light shaping", 2);
-    dither_.addItem("TPDF + strong shaping", 3);
+    dither_.addItem("TPDF flat", 1);
+    dither_.addItem("TPDF + 1st-order shaping", 2);
+    dither_.addItem("TPDF + 2nd-order shaping", 3);
+    dither_.addItem("TPDF + Lipshitz 5th-order", 4);
+    dither_.addItem("TPDF + psychoacoustic 9th-order", 5);
     dither_.setSelectedId(props_.getUserSettings()->getIntValue("dither", 1), juce::dontSendNotification);
     dither_.onChange = [this] { props_.getUserSettings()->setValue("dither", dither_.getSelectedId()); };
     addAndMakeVisible(dither_);
 
     engine_.devices().addChangeListener(this);
     lastDeviceRate_ = engine_.deviceRate();
+    followRate_ = props_.getUserSettings()->getBoolValue("followProjectRate", true);
+
+    commands_.registerAllCommandsForTarget(this);
+    commands_.setFirstCommandTarget(this);
+    if (auto xml = props_.getUserSettings()->getXmlValue("keyMappings")) commands_.getKeyMappings()->restoreFromXml(*xml);
+    commands_.getKeyMappings()->addChangeListener(this);
+    addKeyListener(commands_.getKeyMappings());
+    setApplicationCommandManagerToWatch(&commands_);
+#if JUCE_MAC
+    juce::MenuBarModel::setMacMainMenu(this);
+#endif
     setWantsKeyboardFocus(true);
     setSize(1440, 900);
     newSession();
@@ -312,6 +326,11 @@ MainComponent::MainComponent() {
 }
 
 MainComponent::~MainComponent() {
+#if JUCE_MAC
+    juce::MenuBarModel::setMacMainMenu(nullptr);
+#endif
+    commands_.getKeyMappings()->removeChangeListener(this);
+    removeKeyListener(commands_.getKeyMappings());
     xfadeWindow_.reset();
     engine_.devices().removeChangeListener(this);
     engine_.chain().closeAllEditors();
@@ -388,55 +407,269 @@ void MainComponent::resized() {
     timeline_.setBounds(r);
 }
 
-// ---------------------------------------------------------------- keys
+// ---------------------------------------------------------------- commands
 
-bool MainComponent::keyPressed(const juce::KeyPress& k) {
-    const auto mods = k.getModifiers();
-    const int code = k.getKeyCode();
-    const bool cmd = mods.isCommandDown(), shift = mods.isShiftDown(), alt = mods.isAltDown();
-    auto is = [&](int c) { return code == c || code == int(juce::CharacterFunctions::toUpperCase(juce::juce_wchar(c))); };
+void MainComponent::getAllCommands(juce::Array<juce::CommandID>& ids) {
+    for (auto& d : allCommands()) ids.add(d.id);
+}
 
-    if (code == juce::KeyPress::spaceKey) {
-        if (shift) source_.togglePlay();
-        else playBtn_.onClick();
-        return true;
+void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandInfo& info) {
+    auto* d = findCommand(id);
+    if (!d) return;
+    info.setInfo(d->name, d->description, d->category, 0);
+    for (auto& k : juce::StringArray::fromTokens(d->keys, ";", ""))
+        if (k.trim().isNotEmpty()) info.addDefaultKeypress(juce::KeyPress::createFromDescription(k.trim()).getKeyCode(),
+                                                           juce::KeyPress::createFromDescription(k.trim()).getModifiers());
+    switch (id) {
+        case cmd::undo: info.setActive(!undo_.isEmpty()); break;
+        case cmd::redo: info.setActive(!redo_.isEmpty()); break;
+        case cmd::toggleEnvelope: info.setTicked(timeline_.envelopeMode()); break;
+        case cmd::toggleSnap: info.setTicked(snapBtn_.getToggleState()); break;
+        case cmd::followProjectRate: info.setTicked(followRate_); break;
+        case cmd::muteRegion:
+        case cmd::nudgeLeft: case cmd::nudgeRight: case cmd::nudgeLeftBig: case cmd::nudgeRightBig:
+        case cmd::selectRegionRange: info.setActive(timeline_.selectedRegion() != 0); break;
+        default: break;
     }
-    if (cmd && is('z')) { shift ? redo() : undo(); return true; }
-    if (cmd && is('s')) { saveSession(shift); return true; }
-    if (cmd && is('o')) { openSession(); return true; }
-    if (cmd && (code == '=' || code == '+')) { zoomIn_.onClick(); return true; }
-    if (cmd && code == '-') { zoomOut_.onClick(); return true; }
-    if (cmd && code == '0') { timeline_.zoomToFit(); return true; }
-    if (cmd) return false;
+}
 
-    if (code == juce::KeyPress::homeKey || code == juce::KeyPress::returnKey) { homeBtn_.onClick(); return true; }
-    if (code == juce::KeyPress::leftKey || code == juce::KeyPress::rightKey) {
-        double dir = code == juce::KeyPress::leftKey ? -1.0 : 1.0;
-        if (alt) nudgeSelectedRegion(dir * (shift ? 0.1 : 1.0 / 75));
-        else engine_.setPositionSeconds(juce::jmax(0.0, engine_.positionSeconds() + dir * (shift ? 1.0 : 1.0 / 75)));
-        return true;
+bool MainComponent::perform(const InvocationInfo& info) {
+    const double pos = engine_.positionSeconds();
+    switch (info.commandID) {
+        case cmd::newSession: newSession(); break;
+        case cmd::openSession: openSession(); break;
+        case cmd::saveSession: saveSession(false); break;
+        case cmd::saveSessionAs: saveSession(true); break;
+        case cmd::importAudio: importBtn_.onClick(); break;
+        case cmd::openSource: source_.showOpenDialog(); break;
+        case cmd::exportDdp: exportDdp(); break;
+        case cmd::exportTrackWavs: exportTrackWavs(); break;
+        case cmd::exportProgram24:
+        case cmd::exportProgram32: showExportMenu(); break;
+        case cmd::undo: undo(); break;
+        case cmd::redo: redo(); break;
+        case cmd::splitAtPlayhead: splitAtPlayhead(); break;
+        case cmd::deleteClose: deleteSelection(true); break;
+        case cmd::deleteLeave: deleteSelection(false); break;
+        case cmd::muteRegion:
+            if (auto* r = session_.findRegion(timeline_.selectedRegion())) { r->mute = !r->mute; sessionChanged(); }
+            break;
+        case cmd::nudgeLeft: nudgeSelectedRegion(-1.0 / 75); break;
+        case cmd::nudgeRight: nudgeSelectedRegion(1.0 / 75); break;
+        case cmd::nudgeLeftBig: nudgeSelectedRegion(-0.1); break;
+        case cmd::nudgeRightBig: nudgeSelectedRegion(0.1); break;
+        case cmd::clearSelection: timeline_.setSelection({}); timeline_.selectRegion(0); timeline_.selectMarker(0); break;
+        case cmd::selectRegionRange:
+            if (auto* r = session_.findRegion(timeline_.selectedRegion())) timeline_.setSelection({r->start, r->end()});
+            break;
+        case cmd::sourceIn: source_.markIn(); break;
+        case cmd::sourceOut: source_.markOut(); break;
+        case cmd::destIn: { auto s = timeline_.selection(); timeline_.setSelection({pos, juce::jmax(pos, s.getEnd())}); break; }
+        case cmd::destOut: { auto s = timeline_.selection(); timeline_.setSelection({juce::jmin(pos, s.isEmpty() ? pos : s.getStart()), pos}); break; }
+        case cmd::insertEdit: sourceEdit(Session::EditMode::Insert); break;
+        case cmd::overwriteEdit: sourceEdit(Session::EditMode::Overwrite); break;
+        case cmd::replaceEdit: sourceEdit(Session::EditMode::Replace); break;
+        case cmd::appendEdit: appendSource(); break;
+        case cmd::playSourceInOut: source_.playInOut(); break;
+        case cmd::playStop: playBtn_.onClick(); break;
+        case cmd::playSource: source_.togglePlay(); break;
+        case cmd::returnToStart: homeBtn_.onClick(); break;
+        case cmd::locateBackFrame: engine_.setPositionSeconds(juce::jmax(0.0, pos - 1.0 / 75)); break;
+        case cmd::locateFwdFrame: engine_.setPositionSeconds(pos + 1.0 / 75); break;
+        case cmd::locateBackSecond: engine_.setPositionSeconds(juce::jmax(0.0, pos - 1.0)); break;
+        case cmd::locateFwdSecond: engine_.setPositionSeconds(pos + 1.0); break;
+        case cmd::prevMarker: jumpToMarker(-1); break;
+        case cmd::nextMarker: jumpToMarker(1); break;
+        case cmd::playSelection: {
+            auto s = timeline_.selection();
+            if (!s.isEmpty()) auditionRange(s.getStart(), s.getEnd());
+            break;
+        }
+        case cmd::addTrackMarker: addMarkerAtPlayhead(Marker::TrackStart); break;
+        case cmd::addIndexMarker: addMarkerAtPlayhead(Marker::Index); break;
+        case cmd::addPauseMarker: addMarkerAtPlayhead(Marker::PauseStart); break;
+        case cmd::addEndMarker: addMarkerAtPlayhead(Marker::EndOfDisc); break;
+        case cmd::zoomIn: zoomIn_.onClick(); break;
+        case cmd::zoomOut: zoomOut_.onClick(); break;
+        case cmd::zoomFit: timeline_.zoomToFit(); break;
+        case cmd::toggleEnvelope: envBtn_.triggerClick(); break;
+        case cmd::toggleSnap: snapBtn_.triggerClick(); break;
+        case cmd::crossfadeEditor: xfadeBtn_.onClick(); break;
+        case cmd::analyse: analyse(); break;
+        case cmd::verifyDdp: verifyDdp(); break;
+        case cmd::nullTest: runNullTest(); break;
+        case cmd::pluginManager: showPluginScanner(); break;
+        case cmd::audioSetup: showAudioSettings(); break;
+        case cmd::followProjectRate:
+            followRate_ = !followRate_;
+            props_.getUserSettings()->setValue("followProjectRate", followRate_);
+            applyFollowRate();
+            break;
+        case cmd::keyGuide: showKeyGuide(); break;
+        case cmd::editKeyCommands: showKeyEditor(); break;
+        default: return false;
     }
-    // Source in/out (I/O); destination in/out (Shift+I/O).
-    if (is('i')) {
-        if (shift) { auto s = timeline_.selection(); double t = engine_.positionSeconds(); timeline_.setSelection({t, juce::jmax(t, s.getEnd())}); }
-        else source_.markIn();
-        return true;
+    commands_.commandStatusChanged();
+    return true;
+}
+
+juce::StringArray MainComponent::getMenuBarNames() { return {"File", "Edit", "Transport", "Markers", "View", "Tools", "Help"}; }
+
+juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
+    juce::PopupMenu m;
+    auto add = [&](std::initializer_list<juce::CommandID> ids) { for (auto id : ids) m.addCommandItem(&commands_, id); };
+    switch (index) {
+        case 0:
+            add({cmd::newSession, cmd::openSession, cmd::saveSession, cmd::saveSessionAs});
+            m.addSeparator();
+            add({cmd::importAudio, cmd::openSource});
+            m.addSeparator();
+            add({cmd::exportDdp, cmd::exportTrackWavs, cmd::exportProgram24});
+            break;
+        case 1:
+            add({cmd::undo, cmd::redo});
+            m.addSeparator();
+            add({cmd::sourceIn, cmd::sourceOut, cmd::destIn, cmd::destOut});
+            m.addSeparator();
+            add({cmd::insertEdit, cmd::overwriteEdit, cmd::replaceEdit, cmd::appendEdit});
+            m.addSeparator();
+            add({cmd::splitAtPlayhead, cmd::deleteClose, cmd::deleteLeave, cmd::muteRegion, cmd::selectRegionRange, cmd::clearSelection});
+            m.addSeparator();
+            add({cmd::nudgeLeft, cmd::nudgeRight, cmd::nudgeLeftBig, cmd::nudgeRightBig});
+            break;
+        case 2:
+            add({cmd::playStop, cmd::playSource, cmd::playSourceInOut, cmd::playSelection, cmd::returnToStart});
+            m.addSeparator();
+            add({cmd::locateBackFrame, cmd::locateFwdFrame, cmd::locateBackSecond, cmd::locateFwdSecond, cmd::prevMarker, cmd::nextMarker});
+            break;
+        case 3: add({cmd::addTrackMarker, cmd::addIndexMarker, cmd::addPauseMarker, cmd::addEndMarker}); break;
+        case 4:
+            add({cmd::zoomIn, cmd::zoomOut, cmd::zoomFit});
+            m.addSeparator();
+            add({cmd::toggleEnvelope, cmd::toggleSnap, cmd::crossfadeEditor});
+            break;
+        case 5:
+            add({cmd::analyse, cmd::verifyDdp, cmd::nullTest});
+            m.addSeparator();
+            add({cmd::pluginManager, cmd::audioSetup, cmd::followProjectRate});
+            break;
+        case 6: add({cmd::keyGuide, cmd::editKeyCommands}); break;
+        default: break;
     }
-    if (is('o')) {
-        if (shift) { auto s = timeline_.selection(); double t = engine_.positionSeconds(); timeline_.setSelection({juce::jmin(t, s.isEmpty() ? t : s.getStart()), t}); }
-        else source_.markOut();
-        return true;
+    return m;
+}
+
+void MainComponent::saveKeyMappings() {
+    if (auto xml = commands_.getKeyMappings()->createXml(true)) props_.getUserSettings()->setValue("keyMappings", xml.get());
+    props_.saveIfNeeded();
+}
+
+namespace {
+class KeyGuideView : public juce::Component {
+public:
+    KeyGuideView(const juce::KeyPressMappingSet& keys) : keys_(keys) {
+        text_.setMultiLine(true);
+        text_.setReadOnly(true);
+        text_.setFont(juce::FontOptions(juce::Font::getDefaultMonospacedFontName(), 13.0f, juce::Font::plain));
+        text_.setText(keyGuideText(&keys_));
+        addAndMakeVisible(text_);
+        for (auto* b : {&saveBtn_, &editBtn_}) { styleButton(*b); addAndMakeVisible(*b); }
+        saveBtn_.onClick = [this] {
+            chooser_ = std::make_unique<juce::FileChooser>("Save printable key guide",
+                                                           juce::File::getSpecialLocation(juce::File::userDesktopDirectory).getChildFile("Lathe Key Commands.html"), "*.html");
+            chooser_->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting, [this](const juce::FileChooser& fc) {
+                auto f = fc.getResult();
+                if (f == juce::File()) return;
+                f = f.withFileExtension("html");
+                if (f.replaceWithText(keyGuideHtml(&keys_))) f.startAsProcess();
+            });
+        };
+        setSize(900, 640);
     }
-    if (is('b')) { splitAtPlayhead(); return true; }
-    if (is('m')) { addMarkerAtPlayhead(shift ? Marker::Index : Marker::TrackStart); return true; }
-    if (is('p')) { addMarkerAtPlayhead(Marker::PauseStart); return true; }
-    if (is('e')) { addMarkerAtPlayhead(Marker::EndOfDisc); return true; }
-    if (is('x')) { xfadeBtn_.onClick(); return true; }
-    if (is('g')) { envBtn_.triggerClick(); return true; }
-    if (is('r')) { sourceEdit(Session::EditMode::Replace); return true; }
-    if (code == juce::KeyPress::deleteKey || code == juce::KeyPress::backspaceKey) { deleteSelection(!shift); return true; }
-    if (code == juce::KeyPress::escapeKey) { timeline_.setSelection({}); timeline_.selectRegion(0); return true; }
-    return false;
+    std::function<void()> onEdit;
+    void resized() override {
+        auto r = getLocalBounds().reduced(8);
+        auto row = r.removeFromBottom(28);
+        saveBtn_.setBounds(row.removeFromLeft(220));
+        row.removeFromLeft(6);
+        editBtn_.setBounds(row.removeFromLeft(160));
+        r.removeFromBottom(6);
+        text_.setBounds(r);
+        editBtn_.onClick = [this] { if (onEdit) onEdit(); };
+    }
+private:
+    const juce::KeyPressMappingSet& keys_;
+    juce::TextEditor text_;
+    juce::TextButton saveBtn_{"Save Printable Guide (HTML)..."}, editBtn_{"Edit Key Commands..."};
+    std::unique_ptr<juce::FileChooser> chooser_;
+};
+}  // namespace
+
+void MainComponent::showKeyGuide() {
+    auto* v = new KeyGuideView(*commands_.getKeyMappings());
+    v->onEdit = [this] { showKeyEditor(); };
+    juce::DialogWindow::LaunchOptions o;
+    o.content.setOwned(v);
+    o.dialogTitle = "Key Command Guide";
+    o.dialogBackgroundColour = colours::bg;
+    o.useNativeTitleBar = true;
+    o.resizable = true;
+    o.launchAsync();
+}
+
+void MainComponent::showKeyEditor() {
+    auto* ed = new juce::KeyMappingEditorComponent(*commands_.getKeyMappings(), true);
+    ed->setColours(colours::panel2, colours::text);
+    ed->setSize(620, 640);
+    juce::DialogWindow::LaunchOptions o;
+    o.content.setOwned(ed);
+    o.dialogTitle = "Edit Key Commands (click + to add a key, click a key to change or remove it)";
+    o.dialogBackgroundColour = colours::bg;
+    o.useNativeTitleBar = true;
+    o.resizable = true;
+    o.launchAsync();
+}
+
+void MainComponent::jumpToMarker(int dir) {
+    double pos = engine_.positionSeconds();
+    double best = dir < 0 ? -1.0 : 1e12;
+    for (auto& m : session_.markers) {
+        if (dir < 0 && m.t < pos - 0.02 && m.t > best) best = m.t;
+        if (dir > 0 && m.t > pos + 0.02 && m.t < best) best = m.t;
+    }
+    if (dir < 0 && best < 0) best = 0;
+    if (dir > 0 && best > 1e11) return;
+    engine_.setPositionSeconds(best);
+}
+
+void MainComponent::applyFollowRate() {
+    rateMessage_ = {};
+    if (followRate_ && !session_.regions.isEmpty()) rateMessage_ = engine_.matchDeviceRate(session_.effectiveRate());
+}
+
+void MainComponent::runNullTest() {
+    auto pickB = [this](juce::File a) {
+        chooser_ = std::make_unique<juce::FileChooser>("Null test: choose file B (e.g. the Lathe render)", a.getParentDirectory(),
+                                                       engine_.formats().getWildcardForAllFormats());
+        chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles, [this, a](const juce::FileChooser& fc) {
+            auto b = fc.getResult();
+            if (!b.existsAsFile()) return;
+            auto diff = a.getSiblingFile(a.getFileNameWithoutExtension() + " minus " + b.getFileNameWithoutExtension() + ".wav");
+            auto res = std::make_shared<NullResult>();
+            runJob("Comparing files...",
+                   [this, a, b, diff, res](Job& j) { *res = nullTest(engine_.formats(), a, b, diff, [&](double p) { return j.keep(p); }); },
+                   [this, a, b, diff, res](bool) {
+                       auto text = res->toText(a.getFileName(), b.getFileName());
+                       if (res->ok) text << "\nDifference file (A minus B, 32-bit float):\n  " << diff.getFullPathName() << "\n";
+                       showText("Null test", text);
+                   });
+        });
+    };
+    chooser_ = std::make_unique<juce::FileChooser>("Null test: choose file A (e.g. the reference render)", juce::File(),
+                                                   engine_.formats().getWildcardForAllFormats());
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles, [pickB](const juce::FileChooser& fc) {
+        if (fc.getResult().existsAsFile()) pickB(fc.getResult());
+    });
 }
 
 // ---------------------------------------------------------------- session lifecycle
@@ -452,6 +685,7 @@ void MainComponent::sessionChanged(bool undoable) {
     }
     lastState_ = now;
     dirty_ = true;
+    applyFollowRate();
     engine_.loadSession(session_);
     timeline_.sessionUpdated();
     pqList_.updateContent();
@@ -497,6 +731,7 @@ void MainComponent::refreshAll() {
     engineer_.setText(session_.engineer, false);
     updatingFields_ = false;
     xfadeWindow_.reset();
+    applyFollowRate();
     engine_.loadSession(session_);
     timeline_.sessionUpdated();
     timeline_.resized();
@@ -864,9 +1099,13 @@ void MainComponent::showPluginMenu() {
 
 ExportSettings MainComponent::exportSettings() const {
     ExportSettings es;
-    es.shape = dither_.getSelectedId() == 2 ? dsp::Ditherer::Shape::Light
-             : dither_.getSelectedId() == 3 ? dsp::Ditherer::Shape::Strong
-                                            : dsp::Ditherer::Shape::None;
+    switch (dither_.getSelectedId()) {
+        case 2: es.shape = dsp::Ditherer::Shape::Light; break;
+        case 3: es.shape = dsp::Ditherer::Shape::Strong; break;
+        case 4: es.shape = dsp::Ditherer::Shape::Medium; break;
+        case 5: es.shape = dsp::Ditherer::Shape::Psycho; break;
+        default: es.shape = dsp::Ditherer::Shape::None; break;
+    }
     return es;
 }
 
@@ -1046,7 +1285,8 @@ void MainComponent::filesDropped(const juce::StringArray& files, int x, int y) {
     importFiles(audio);
 }
 
-void MainComponent::changeListenerCallback(juce::ChangeBroadcaster*) {
+void MainComponent::changeListenerCallback(juce::ChangeBroadcaster* src) {
+    if (src == commands_.getKeyMappings()) { saveKeyMappings(); return; }
     if (std::abs(engine_.deviceRate() - lastDeviceRate_) > 0.5) {
         lastDeviceRate_ = engine_.deviceRate();
         engine_.loadSession(session_);
@@ -1077,10 +1317,14 @@ void MainComponent::timerCallback() {
     meters_->feed(engine_.meterTap());
 
     double pr = session_.effectiveRate(), dr = engine_.deviceRate();
-    rateWarning_.setText(!session_.regions.isEmpty() && std::abs(pr - dr) > 0.5
-                             ? "Monitoring at " + juce::String(dr / 1000.0, 1) + " kHz; project " + juce::String(pr / 1000.0, 1) + " kHz"
-                             : juce::String(),
-                         juce::dontSendNotification);
+    juce::String rw;
+    if (!session_.regions.isEmpty() && std::abs(pr - dr) > 0.5)
+        rw = rateMessage_.isNotEmpty() ? rateMessage_
+                                       : "Monitoring at " + juce::String(dr / 1000.0, 1) + " kHz (resampled); project " + juce::String(pr / 1000.0, 1) + " kHz";
+    else if (!session_.regions.isEmpty())
+        rw = "Playing at the project rate, " + juce::String(dr / 1000.0, 1) + " kHz (no resampling)";
+    rateWarning_.setText(rw, juce::dontSendNotification);
+    rateWarning_.setColour(juce::Label::textColourId, std::abs(pr - dr) > 0.5 ? colours::accent : colours::ok);
 }
 
 }  // namespace lathe

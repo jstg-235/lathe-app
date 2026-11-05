@@ -11,6 +11,8 @@
 
 namespace lathe {
 
+juce::String ditherName(dsp::Ditherer::Shape s);
+
 struct QcReport {
     double integratedLufs = -INFINITY, truePeakDb = -INFINITY, lra = 0;
     juce::int64 clippedSamples = 0;

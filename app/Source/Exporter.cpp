@@ -17,7 +17,7 @@ public:
         engine_.suspendForOffline(true);
         lock_ = std::make_unique<juce::ScopedLock>(engine_.chain().lock());
         if (runPlugins_) {
-            engine_.chain().prepare(projRate_, kBlock);
+            engine_.chain().prepare(projRate_, kBlock, true);   // 64-bit for every plugin that supports it
             engine_.chain().setNonRealtime(true);
             latency_ = engine_.chain().latencySamples();
         }
@@ -32,8 +32,8 @@ public:
         engine_.suspendForOffline(false);   // re-prepares the chain for playback
     }
 
-    // Fills n frames per channel of output-rate audio.
-    bool pull(float* l, float* r, int n, juce::String& err) {
+    // Fills n frames per channel of output-rate audio, 64-bit float.
+    bool pull(double* l, double* r, int n, juce::String& err) {
         while (int(pend_[0].size()) - pendPos_ < n) {
             if (!renderer_.render(buf_, 0, kBlock)) { err = renderer_.lastError(); return false; }
             if (runPlugins_) engine_.chain().process(buf_, 0, kBlock);
@@ -41,12 +41,12 @@ public:
             latency_ -= skip;
             int n0 = kBlock - skip;
             for (int ch = 0; ch < 2; ++ch) {
-                const float* p = buf_.getReadPointer(ch) + skip;
+                const double* p = buf_.getReadPointer(ch) + skip;
                 if (rs_[ch]) {
                     dbl_.assign(p, p + n0);
                     double* op = nullptr;
                     int got = rs_[ch]->process(dbl_.data(), n0, op);
-                    for (int i = 0; i < got; ++i) pend_[ch].push_back(float(op[i]));
+                    pend_[ch].insert(pend_[ch].end(), op, op + got);
                 } else {
                     pend_[ch].insert(pend_[ch].end(), p, p + n0);
                 }
@@ -71,9 +71,9 @@ private:
     int latency_ = 0;
     std::unique_ptr<juce::ScopedLock> lock_;
     std::unique_ptr<r8b::CDSPResampler24> rs_[2];
-    juce::AudioBuffer<float> buf_;
+    juce::AudioBuffer<double> buf_;
     std::vector<double> dbl_;
-    std::vector<float> pend_[2];
+    std::vector<double> pend_[2];
     int pendPos_ = 0;
 };
 
@@ -88,7 +88,12 @@ struct QcRunner {
             m->prepare(rate, 2);
         }
     }
-    void feed(const float* l, const float* r, int n, juce::int64 pos) {
+    void feed(const double* ld, const double* rd, int n, juce::int64 pos) {
+        fl.resize(size_t(n));
+        fr.resize(size_t(n));
+        for (int i = 0; i < n; ++i) { fl[size_t(i)] = float(ld[i]); fr[size_t(i)] = float(rd[i]); }
+        const float* l = fl.data();
+        const float* r = fr.data();
         const float* ch[2] = {l, r};
         whole.process(ch, n);
         for (int i = 0; i < per.size(); ++i) {
@@ -107,15 +112,39 @@ struct QcRunner {
         for (auto* m : per) q.tracks.add({m->integratedLufs(), m->truePeakDb()});
     }
     dsp::LoudnessMeter whole;
+    std::vector<float> fl, fr;
     juce::OwnedArray<dsp::LoudnessMeter> per;
     juce::Array<juce::int64> starts, ends;
 };
+
+// Writes dithered integers exactly: JUCE's integer writers take left-justified 32-bit samples.
+bool writeInts(juce::AudioFormatWriter& w, const int32_t* interleaved, int n, int bits, std::vector<int> (&tmp)[2]) {
+    for (auto& v : tmp) if (int(v.size()) < n) v.resize(size_t(n));
+    const int shift = 32 - bits;
+    for (int i = 0; i < n; ++i) {
+        tmp[0][size_t(i)] = int(uint32_t(interleaved[i * 2]) << shift);
+        tmp[1][size_t(i)] = int(uint32_t(interleaved[i * 2 + 1]) << shift);
+    }
+    const int* chans[3] = {tmp[0].data(), tmp[1].data(), nullptr};
+    return w.write(chans, n);
+}
 
 juce::String fmtDb(double v, const char* unit) {
     return std::isfinite(v) ? juce::String(v, 1) + " " + unit : juce::String("--");
 }
 
 }  // namespace
+
+juce::String ditherName(dsp::Ditherer::Shape s) {
+    switch (s) {
+        case dsp::Ditherer::Shape::None: return "TPDF, flat";
+        case dsp::Ditherer::Shape::Light: return "TPDF, 1st-order shaped";
+        case dsp::Ditherer::Shape::Strong: return "TPDF, 2nd-order shaped";
+        case dsp::Ditherer::Shape::Medium: return "TPDF, 5th-order Lipshitz shaped";
+        case dsp::Ditherer::Shape::Psycho: return "TPDF, 9th-order psychoacoustic shaped";
+    }
+    return {};
+}
 
 juce::String QcReport::toText() const {
     juce::String s;
@@ -145,8 +174,8 @@ ddp::WriteResult Exporter::exportDdp(const Session& s, const juce::File& folder,
     MasterStream ms(engine_, s, es, cd::kSampleRate);
     QcRunner qr(s, cd::kSampleRate);
     dsp::Ditherer dither;
-    dither.prepare(2, 16, es.shape);
-    std::vector<float> l, r;
+    dither.prepare(2, 16, es.shape, 0x5EED1234u, cd::kSampleRate);
+    std::vector<double> l, r;
     juce::int64 pos = 0;
     const juce::int64 total = disc.leadOutSector * cd::kSamplesPerSector;
     juce::String err;
@@ -157,7 +186,7 @@ ddp::WriteResult Exporter::exportDdp(const Session& s, const juce::File& folder,
         r.resize(size_t(frames));
         if (!ms.pull(l.data(), r.data(), int(frames), err)) return false;
         qr.feed(l.data(), r.data(), int(frames), pos);
-        const float* ch[2] = {l.data(), r.data()};
+        const double* ch[2] = {l.data(), r.data()};
         dither.process16(ch, int(frames), out);
         pos += frames;
         if (!keep(double(pos) / double(total))) { cancelled = true; return false; }
@@ -169,7 +198,10 @@ ddp::WriteResult Exporter::exportDdp(const Session& s, const juce::File& folder,
     if (s.client.isNotEmpty()) header << "Client:   " << s.client << "\n";
     if (s.engineer.isNotEmpty()) header << "Engineer: " << s.engineer << "\n";
     header << "Created:  " << juce::Time::getCurrentTime().toString(true, true) << " by Lathe\n";
-    header << "Dither:   TPDF" << (es.shape == dsp::Ditherer::Shape::None ? "" : es.shape == dsp::Ditherer::Shape::Light ? " + light shaping" : " + strong shaping") << "\n";
+    header << "Dither:   " << ditherName(es.shape) << "\n";
+    header << "Engine:   64-bit float mix and plugin path";
+    if (es.runPlugins) header << " (" << juce::String(engine_.chain().countDoublePrecision()) << " plugin(s) in 64-bit)";
+    header << "\n";
     wo.pqLogHeader = header.toStdString();
 
     auto res = ddp::writeDdp(disc, folder.getFullPathName().toStdString(), pull, wo);
@@ -192,11 +224,11 @@ juce::String Exporter::exportTrackWavs(const Session& s, const juce::File& folde
     folder.createDirectory();
     MasterStream ms(engine_, s, es, cd::kSampleRate);
     dsp::Ditherer dither;
-    dither.prepare(2, 16, es.shape);
+    dither.prepare(2, 16, es.shape, 0x5EED1234u, cd::kSampleRate);
     juce::WavAudioFormat wav;
     const juce::int64 total = disc.leadOutSector * cd::kSamplesPerSector;
     juce::int64 pos = 0;
-    std::vector<float> l(4096), r(4096);
+    std::vector<double> l(4096), r(4096);
     std::vector<int16_t> pcm(4096 * 2);
     juce::String err;
 
@@ -208,7 +240,7 @@ juce::String Exporter::exportTrackWavs(const Session& s, const juce::File& folde
         while (pos < a) {
             int n = int(juce::jmin<juce::int64>(4096, a - pos));
             if (!ms.pull(l.data(), r.data(), n, err)) return err;
-            const float* ch[2] = {l.data(), r.data()};
+            const double* ch[2] = {l.data(), r.data()};
             dither.process16(ch, n, pcm.data());
             pos += n;
         }
@@ -225,7 +257,7 @@ juce::String Exporter::exportTrackWavs(const Session& s, const juce::File& folde
         while (pos < b) {
             int n = int(juce::jmin<juce::int64>(4096, b - pos));
             if (!ms.pull(l.data(), r.data(), n, err)) return err;
-            const float* ch[2] = {l.data(), r.data()};
+            const double* ch[2] = {l.data(), r.data()};
             dither.process16(ch, n, pcm.data());
             for (int i = 0; i < n; ++i) {   // JUCE int writers take left-justified 32-bit samples
                 ib.setSample(0, i, int(pcm[size_t(i * 2)]) << 16);
@@ -252,25 +284,25 @@ juce::String Exporter::exportProgramWav(const Session& s, const juce::File& file
     std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), rate, 2, bits, {}, 0));
     if (!w) return "Couldn't create a " + juce::String(bits) + "-bit WAV writer.";
     os.release();
-    juce::AudioBuffer<float> buf(2, 4096);
+    std::vector<double> l(4096), r(4096);
+    juce::AudioBuffer<float> fbuf(2, 4096);
+    std::vector<int> ibuf[2];
     dsp::Ditherer dither;
-    if (bits < 32) dither.prepare(2, bits, es.shape);
+    if (bits < 32) dither.prepare(2, bits, es.shape, 0x5EED1234u, rate);
     std::vector<int32_t> q(4096 * 2);
     juce::String err;
     for (juce::int64 pos = 0; pos < total;) {
         int n = int(juce::jmin<juce::int64>(4096, total - pos));
-        if (!ms.pull(buf.getWritePointer(0), buf.getWritePointer(1), n, err)) return err;
+        if (!ms.pull(l.data(), r.data(), n, err)) return err;
         if (bits < 32) {
-            // Dither to the target word length, then hand JUCE exact values.
-            const float* ch[2] = {buf.getReadPointer(0), buf.getReadPointer(1)};
+            // Dither from 64-bit to the target word length, then write the integers exactly.
+            const double* ch[2] = {l.data(), r.data()};
             dither.process(ch, n, q.data());
-            const float scale = 1.0f / float(1 << (bits - 1));
-            for (int i = 0; i < n; ++i) {
-                buf.setSample(0, i, float(q[size_t(i * 2)]) * scale);
-                buf.setSample(1, i, float(q[size_t(i * 2 + 1)]) * scale);
-            }
+            if (!writeInts(*w, q.data(), n, bits, ibuf)) return "Disk write failed.";
+        } else {
+            for (int i = 0; i < n; ++i) { fbuf.setSample(0, i, float(l[size_t(i)])); fbuf.setSample(1, i, float(r[size_t(i)])); }
+            if (!w->writeFromAudioSampleBuffer(fbuf, 0, n)) return "Disk write failed.";
         }
-        if (!w->writeFromAudioSampleBuffer(buf, 0, n)) return "Disk write failed.";
         pos += n;
         if (!keep(double(pos) / double(total))) return "Export cancelled.";
     }
@@ -281,7 +313,7 @@ juce::String Exporter::analyse(const Session& s, const ExportSettings& es, const
     MasterStream ms(engine_, s, es, cd::kSampleRate);
     QcRunner qr(s, cd::kSampleRate);
     const juce::int64 total = juce::int64(std::ceil(s.end() * cd::kSampleRate));
-    std::vector<float> l(4096), r(4096);
+    std::vector<double> l(4096), r(4096);
     juce::String err;
     for (juce::int64 pos = 0; pos < total;) {
         int n = int(juce::jmin<juce::int64>(4096, total - pos));

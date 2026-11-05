@@ -30,11 +30,15 @@ public:
 
     // Renders n stereo frames into out (channels 0 and 1) and advances. Past the end
     // it outputs silence. Returns false if a source file couldn't be read.
+    // The double version is the master path: the mix, gains, fades and crossfades are all
+    // computed in 64-bit float, and samples at unity gain pass through bit-for-bit.
     bool render(juce::AudioBuffer<float>& out, int startSample, int n);
+    bool render(juce::AudioBuffer<double>& out, int startSample, int n);
 
     juce::String lastError() const { return error_; }
 
 private:
+    template <typename T> bool renderT(juce::AudioBuffer<T>& out, int startSample, int n);
     juce::AudioFormatManager& formats_;
     juce::Array<Region> regions_;
     juce::Array<EffectiveFades> fades_;

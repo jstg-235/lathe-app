@@ -36,9 +36,11 @@ public:
     void closeAllEditors();
 
     // Real-time side. process() never blocks: if the chain is being edited it passes audio through.
-    void prepare(double rate, int block);
+    void prepare(double rate, int block, bool doublePrecision = false);
     void release();
     void process(juce::AudioBuffer<float>& b, int start, int n);
+    void process(juce::AudioBuffer<double>& b, int start, int n);   // offline master path
+    int countDoublePrecision() const;
     int latencySamples() const;
     void setNonRealtime(bool offline);
 
@@ -54,6 +56,7 @@ private:
     juce::OwnedArray<Slot> slots_;
     juce::CriticalSection lock_;
     juce::AudioBuffer<float> scratch_;
+    juce::AudioBuffer<double> dscratch_;
     juce::MidiBuffer midi_;
     double rate_ = 44100;
     int block_ = 512;

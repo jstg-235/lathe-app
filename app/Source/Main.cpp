@@ -65,11 +65,20 @@ private:
     public:
         Window() : DocumentWindow("Lathe", juce::Colour(0xff16181c), DocumentWindow::allButtons) {
             setUsingNativeTitleBar(true);
-            setContentOwned(new MainComponent(), true);
+            auto* mc = new MainComponent();
+            setContentOwned(mc, true);
+#if ! JUCE_MAC
+            setMenuBar(mc);
+#endif
             setResizable(true, false);
             setResizeLimits(1000, 640, 10000, 10000);
             centreWithSize(1360, 860);
             setVisible(true);
+        }
+        ~Window() override {
+#if ! JUCE_MAC
+            setMenuBar(nullptr);
+#endif
         }
         void closeButtonPressed() override { juce::JUCEApplication::getInstance()->systemRequestedQuit(); }
         MainComponent& main() { return *static_cast<MainComponent*>(getContentComponent()); }

@@ -71,21 +71,32 @@ private:
 
 double energyToLufs(double meanSquare);
 
-// TPDF dither (optionally with 1st/2nd-order noise shaping) from float to integer PCM.
+// TPDF dither with optional error-feedback noise shaping, from 64-bit float to integer PCM.
+//  None    flat TPDF (the reference: noise is white, signal fully decorrelated from the error)
+//  Light   1st-order high-pass shaping
+//  Strong  2nd-order high-pass shaping
+//  Medium  5-tap Lipshitz minimally-audible shaping (44.1/48 kHz)
+//  Psycho  9-tap psychoacoustic F-weighted shaping (Wannamaker), the most audible-band noise removed
+// Medium/Psycho are designed for 44.1-48 kHz; at higher rates they fall back to Light,
+// because their curves would push noise into the audible band.
 class Ditherer {
 public:
-    enum class Shape { None, Light, Strong };
-    void prepare(int channels, int bits, Shape shape, uint32_t seed = 0x5EED1234u);
+    enum class Shape { None, Light, Strong, Medium, Psycho };
+    void prepare(int channels, int bits, Shape shape, uint32_t seed = 0x5EED1234u, double sampleRate = 44100.0);
     void reset();
-    // Converts n frames of float [-1,1) to signed integers of `bits` width, interleaved.
+    // n frames of float/double [-1,1) to signed integers of `bits` width, interleaved.
     void process(const float* const* in, int n, int32_t* interleavedOut);
-    // Convenience for CD: 16-bit output.
+    void process(const double* const* in, int n, int32_t* interleavedOut);
     void process16(const float* const* in, int n, int16_t* interleavedOut);
+    void process16(const double* const* in, int n, int16_t* interleavedOut);
 private:
-    int ch_ = 2, bits_ = 16;
-    Shape shape_ = Shape::None;
+    template <typename T> void run(const T* const* in, int n, int32_t* out);
+    template <typename T> void run16(const T* const* in, int n, int16_t* out);
+    static constexpr int kTaps = 9;
+    int ch_ = 2, bits_ = 16, taps_ = 0;
+    double coef_[kTaps] = {};
     uint32_t rng_ = 1;
-    std::vector<std::array<double, 2>> err_;
+    std::vector<std::array<double, kTaps>> err_;
     double nextUniform();
 };
 
