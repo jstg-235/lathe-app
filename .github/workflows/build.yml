@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: "Configure (universal: Apple Silicon + Intel)"
-        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
 
       - name: Build
         run: cmake --build build --config Release -- -quiet
@@ -30,6 +30,9 @@ jobs:
           mkdir -p dist
           ditto -c -k --keepParent "$APP" dist/Lathe-mac.zip
           ls -la dist
+          lipo -info "$APP/Contents/MacOS/Lathe"
+          vtool -show-build "$APP/Contents/MacOS/Lathe" | grep -E "minos|sdk"
+          /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$APP/Contents/Info.plist"
 
       - uses: actions/upload-artifact@v4
         with:

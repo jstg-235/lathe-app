@@ -57,7 +57,7 @@ CD-R burning, Japanese (MS-JIS) CD-Text, and a sign-off sheet.
 ## Building
 
 GitHub Actions builds a universal (Apple Silicon + Intel) app on every push to `main`
-and publishes `Lathe-mac.zip` to the `builds` branch. Requires macOS 11 or later.
+and publishes `Lathe-mac.zip` to the `builds` branch. Runs on macOS 10.15 Catalina or later, Intel or Apple Silicon.
 
 Locally: `cmake -S . -B build && cmake --build build`.
 
