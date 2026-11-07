@@ -525,7 +525,7 @@ int main() {
         auto pw = writePaperwork(s, res.delivery, st, out);
         if (pw.error.isNotEmpty()) std::printf("paperwork error: %s\n", pw.error.toRawUTF8());
         CHECK(pw.error.isEmpty());
-        for (auto& n : {"PQ Sheet - TR-001.pdf", "PQ Sheet - CD.pdf", "Cutting Sheet - LP.pdf", "Label Copy.pdf", "Delivery Manifest.pdf", "Track Metadata.csv", "Delivery.json"})
+        for (auto& n : {"PQ Sheet - Full Programme - TR-001.pdf", "PQ Sheet - CD.pdf", "Cutting Sheet - LP.pdf", "Label Copy.pdf", "Delivery Manifest.pdf", "Track Metadata.csv", "Delivery.json"})
             CHECK(out.getChildFile("Paperwork").getChildFile(n).existsAsFile());
         juce::MemoryBlock pdf;
         out.getChildFile("Paperwork/PQ Sheet - CD.pdf").loadFileAsData(pdf);
@@ -536,6 +536,13 @@ int main() {
         CHECK(json["files"][0]["md5"].toString().length() == 32);
         auto csv = out.getChildFile("Paperwork/Track Metadata.csv").loadFileAsString();
         CHECK(csv.contains("Long Movement") && csv.contains("BMI") && csv.contains("Side B"));
+        // A product named like the full programme's sheet doesn't overwrite it.
+        {
+            Session same = s;
+            same.catalogue = {};
+            auto pw2 = writePaperwork(same, res.delivery, st, dir.getChildFile("pw2"));
+            CHECK(pw2.error.isEmpty() && pw2.files.contains("Paperwork/PQ Sheet - Full Programme.pdf") && pw2.files.contains("Paperwork/PQ Sheet - CD.pdf"));
+        }
         if (auto* keep = std::getenv("LATHE_KEEP_PAPERWORK")) out.getChildFile("Paperwork").copyDirectoryTo(juce::File(keep));
     }
     dir.deleteRecursively();

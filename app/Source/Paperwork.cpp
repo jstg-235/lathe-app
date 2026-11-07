@@ -580,8 +580,13 @@ PaperworkResult writePaperwork(const Session& s, const DeliveryData& d, const St
     if (!dir.createDirectory()) { res.error = "Couldn't create " + dir.getFullPathName(); return res; }
     const auto logo = logoJpeg(st.logo);
     const auto project = projectName(s);
-    auto saveSheet = [&](Sheet& sh, const juce::String& name) {
-        auto f = dir.getChildFile(juce::File::createLegalFileName(name) + ".pdf");
+    juce::StringArray usedNames;
+    auto saveSheet = [&](Sheet& sh, const juce::String& wanted) {
+        // Names must stay unique: products can share names with each other or the full programme.
+        auto name = juce::File::createLegalFileName(wanted);
+        for (int k = 2; usedNames.contains(name, true); ++k) name = juce::File::createLegalFileName(wanted + " (" + juce::String(k) + ")");
+        usedNames.add(name);
+        auto f = dir.getChildFile(name + ".pdf");
         if (!sh.save(f)) { res.error = "Couldn't write " + f.getFullPathName(); return false; }
         res.files.add(f.getRelativePathFrom(folder));
         return true;
@@ -592,7 +597,7 @@ PaperworkResult writePaperwork(const Session& s, const DeliveryData& d, const St
         Sheet sh(st, logo, "CD PQ Sheet", project);
         pqSheet(sh, s, d.disc, "Full programme", 1, 1, s.catalogue, s.upcEan, d.files.isEmpty() ? juce::String() : juce::String("DDP"), d.ddpVerified, {},
                 d.discNotes, d.files.isEmpty() ? nullptr : &d.qc, d.dither, 0);
-        if (!saveSheet(sh, "PQ Sheet - " + (s.catalogue.isNotEmpty() ? s.catalogue : juce::String("CD")))) return res;
+        if (!saveSheet(sh, "PQ Sheet - Full Programme" + (s.catalogue.isNotEmpty() ? " - " + s.catalogue : juce::String()))) return res;
     }
     for (int pi = 0; pi < s.products.size(); ++pi) {
         const auto& p = s.products.getReference(pi);
