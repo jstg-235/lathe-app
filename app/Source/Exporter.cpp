@@ -499,6 +499,208 @@ juce::String md5Of(const juce::File& f) {
     return m.hexDigest();
 }
 
+
+// Renders product units from the master stream. Each unit takes its window of the programme,
+// applies its own fades (after the master chain, before dither) and writes either a 16-bit
+// CD image (staged to a temp file, then written as a DDP) or a hi-res side file.
+class UnitSink {
+public:
+    UnitSink(UnitRender info, bool cd, double rate, int bits, dsp::Ditherer::Shape shape, juce::File out, uint32_t seed)
+        : info_(std::move(info)), cd_(cd), rate_(rate), bits_(bits), out_(std::move(out)) {
+        winStart_ = juce::int64(std::llround(info_.window.start * rate));
+        winEnd_ = juce::int64(std::llround(info_.window.end * rate));
+        if (cd_) {
+            leadSamples_ = juce::int64(std::llround(info_.lead * rate));
+            total_ = info_.disc.leadOutSector * cd::kSamplesPerSector;
+        }
+        dither_.prepare(2, bits, shape, seed, rate);
+        meter_.prepare(rate, 2);
+        info_.rate = rate;
+        info_.bits = bits;
+    }
+
+    ~UnitSink() { if (tmp_.exists()) tmp_.deleteFile(); }
+
+    bool consume(const double* l, const double* r, int n, juce::int64 pos, juce::String& err) {
+        juce::int64 a = juce::jmax(pos, winStart_), b = juce::jmin(pos + n, winEnd_);
+        if (b <= a || done_) return true;
+        if (!opened_ && !open(err)) return false;
+        const int m = int(b - a);
+        gl_.resize(size_t(m));
+        gr_.resize(size_t(m));
+        for (int i = 0; i < m; ++i) {
+            const double g = unitGain(info_.window, double(a + i) / rate_);
+            gl_[size_t(i)] = l[a - pos + i] * g;
+            gr_[size_t(i)] = r[a - pos + i] * g;
+        }
+        fl_.resize(size_t(m));
+        fr_.resize(size_t(m));
+        for (int i = 0; i < m; ++i) { fl_[size_t(i)] = float(gl_[size_t(i)]); fr_[size_t(i)] = float(gr_[size_t(i)]); }
+        const float* fch[2] = {fl_.data(), fr_.data()};
+        meter_.process(fch, m);
+        const double* ch[2] = {gl_.data(), gr_.data()};
+        if (cd_) {
+            pcm_.resize(size_t(m * 2));
+            dither_.process16(ch, m, pcm_.data());
+            if (!writePcm(pcm_.data(), m)) { err = "Disk write failed (" + tmp_.getFileName() + ")"; return false; }
+        } else {
+            ints_.resize(size_t(m * 2));
+            dither_.process(ch, m, ints_.data());
+            if (!writeInts(*w_, ints_.data(), m, bits_, tmp2_)) { err = "Disk write failed (" + out_.getFileName() + ")"; return false; }
+        }
+        written_ += m;
+        if (b == winEnd_) done_ = true;
+        return true;
+    }
+
+    // Closes the side file, or writes and verifies the DDP from the staged image.
+    bool finish(const juce::File& root, juce::String& err) {
+        if (!opened_ && !open(err)) return false;
+        info_.lufs = meter_.integratedLufs();
+        info_.truePeakDb = meter_.truePeakDb();
+        if (!cd_) {
+            w_.reset();
+            info_.path = out_.getRelativePathFrom(root);
+            info_.verified = true;
+            return true;
+        }
+        // Pad to the disc's last sector with digital silence, then hand the image to the DDP writer.
+        std::vector<int16_t> zeros(8192 * 2, 0);
+        while (leadSamples_ + written_ < total_) {
+            int n = int(juce::jmin<juce::int64>(8192, total_ - leadSamples_ - written_));
+            if (!writePcm(zeros.data(), n)) { err = "Disk write failed."; return false; }
+            written_ += n;
+        }
+        os_.reset();
+        juce::FileInputStream in(tmp_);
+        if (!in.openedOk()) { err = "Couldn't read back " + tmp_.getFullPathName(); return false; }
+        auto pull = [&](int16_t* dst, int64_t frames) -> bool {
+            const auto bytes = size_t(frames) * 4;
+            if (in.read(dst, int(bytes)) != int(bytes)) return false;
+            for (int64_t i = 0; i < frames * 2; ++i) dst[i] = int16_t(juce::ByteOrder::swapIfBigEndian(uint16_t(dst[i])));
+            return true;
+        };
+        ddp::WriteOptions wo;
+        wo.pqLogHeader = header_.toStdString();
+        auto res = ddp::writeDdp(info_.disc, out_.getFullPathName().toStdString(), pull, wo);
+        if (!res.ok) { err = info_.longLabel + ": " + juce::String::fromUTF8(res.error.c_str()); return false; }
+        auto check = ddp::readDdp(out_.getFullPathName().toStdString());
+        info_.verified = check.ok && check.checksumsOk;
+        info_.imageMd5 = juce::String(res.imageMd5);
+        info_.path = out_.getRelativePathFrom(root);
+        tmp_.deleteFile();
+        return true;
+    }
+
+    void setHeader(juce::String h) { header_ = std::move(h); }
+    const UnitRender& info() const { return info_; }
+    bool isCd() const { return cd_; }
+    juce::File output() const { return out_; }
+
+private:
+    bool open(juce::String& err) {
+        opened_ = true;
+        if (cd_) {
+            out_.createDirectory();
+            tmp_ = out_.getChildFile(".lathe-image.tmp");
+            tmp_.deleteFile();
+            os_ = std::make_unique<juce::FileOutputStream>(tmp_);
+            if (!os_->openedOk()) { err = "Couldn't write " + tmp_.getFullPathName(); return false; }
+            // Pregap: digital silence, not dithered.
+            std::vector<int16_t> zeros(size_t(juce::jmax<juce::int64>(1, leadSamples_)) * 2, 0);
+            if (leadSamples_ > 0 && !writePcm(zeros.data(), int(leadSamples_))) { err = "Disk write failed."; return false; }
+            return true;
+        }
+        out_.getParentDirectory().createDirectory();
+        out_.deleteFile();
+        std::unique_ptr<juce::OutputStream> os(out_.createOutputStream().release());
+        if (!os) { err = "Couldn't write " + out_.getFullPathName(); return false; }
+        juce::StringPairArray meta;
+        meta.set(juce::WavAudioFormat::riffInfoTitle, info_.longLabel);
+        meta.set(juce::WavAudioFormat::riffInfoSoftware, "Lathe");
+        w_.reset(wav_.createWriterFor(os.get(), rate_, 2, bits_, meta, 0));
+        if (!w_) { err = "Couldn't create a " + juce::String(bits_) + "-bit writer for " + out_.getFileName(); return false; }
+        os.release();
+        return true;
+    }
+
+    bool writePcm(const int16_t* interleaved, int frames) {
+        le_.resize(size_t(frames) * 2);
+        for (int i = 0; i < frames * 2; ++i) le_[size_t(i)] = juce::ByteOrder::swapIfBigEndian(uint16_t(interleaved[i]));
+        return os_->write(le_.data(), size_t(frames) * 4);
+    }
+
+    UnitRender info_;
+    bool cd_;
+    double rate_;
+    int bits_;
+    juce::File out_, tmp_;
+    juce::String header_;
+    juce::int64 winStart_ = 0, winEnd_ = 0, leadSamples_ = 0, total_ = 0, written_ = 0;
+    bool opened_ = false, done_ = false;
+    dsp::Ditherer dither_;
+    dsp::LoudnessMeter meter_;
+    std::unique_ptr<juce::FileOutputStream> os_;
+    juce::WavAudioFormat wav_;
+    std::unique_ptr<juce::AudioFormatWriter> w_;
+    std::vector<double> gl_, gr_;
+    std::vector<float> fl_, fr_;
+    std::vector<int16_t> pcm_;
+    std::vector<uint16_t> le_;
+    std::vector<int32_t> ints_;
+    std::vector<int> tmp2_[2];
+};
+
+// Builds the unit sinks for every product. CD units go in `cd`, side units in `hi`.
+juce::String makeUnitSinks(const Session& s, const juce::File& folder, double hiRate, int hiBits, dsp::Ditherer::Shape shape,
+                           const juce::String& header, std::vector<std::unique_ptr<UnitSink>>& cdOut,
+                           std::vector<std::unique_ptr<UnitSink>>& hiOut) {
+    for (int pi = 0; pi < s.products.size(); ++pi) {
+        const auto& p = s.products.getReference(pi);
+        const auto& spec = productSpec(p.kind);
+        for (auto& issue : validateProduct(s, p))
+            if (issue.error) return issue.message;
+        const auto pname = juce::File::createLegalFileName(p.name.isEmpty() ? juce::String(spec.name) : p.name);
+        for (int ui = 0; ui < p.units.size(); ++ui) {
+            UnitRender info;
+            info.product = pi;
+            info.unit = ui;
+            info.label = unitLabel(p, ui);
+            info.longLabel = p.name + " " + unitLabel(p, ui, true);
+            info.window = p.units[ui];
+            const uint32_t seed = 0x5EED1234u + uint32_t(pi * 100 + ui);
+            if (spec.cdFormat) {
+                Session ps = s;
+                if (p.upc.isNotEmpty()) ps.upcEan = p.upc;
+                if (p.catalogue.isNotEmpty()) ps.catalogue = p.catalogue, ps.masterId = {};
+                info.disc = ps.toDiscForUnit(info.window, ui + 1, p.units.size(), info.lead, &info.notes);
+                auto issues = cd::validate(info.disc);
+                if (cd::hasErrors(issues)) {
+                    juce::String e = info.longLabel + " can't be made into a valid disc:";
+                    for (auto& i : issues)
+                        if (i.level == cd::Issue::Error) e << "\n  " << juce::String::fromUTF8(i.message.c_str());
+                    return e;
+                }
+                auto dir = folder.getChildFile(pname + " DDP");
+                if (p.units.size() > 1) {
+                    auto cat = p.catalogue.isNotEmpty() ? p.catalogue : s.catalogue;
+                    dir = dir.getChildFile(juce::File::createLegalFileName("Disc " + juce::String(ui + 1) + (cat.isNotEmpty() ? " - " + cat + "-D" + juce::String(ui + 1) : juce::String())));
+                }
+                auto sink = std::make_unique<UnitSink>(info, true, cd::kSampleRate, 16, shape, dir, seed);
+                juce::String h = header;
+                h << "Product:  " << p.name << ", " << info.label << " of " << p.units.size() << "\n";
+                sink->setHeader(h);
+                cdOut.push_back(std::move(sink));
+            } else {
+                auto title = s.discTitle.isNotEmpty() ? s.discTitle + " - " : juce::String();
+                auto file = folder.getChildFile(pname + " " + spec.unitNoun + "s")
+                                .getChildFile(juce::File::createLegalFileName(title + p.name + " " + unitLabel(p, ui) + ".wav"));
+                hiOut.push_back(std::make_unique<UnitSink>(info, false, hiRate, hiBits, shape, file, seed));
+            }
+        }
+    }
+    return {};
+}
 }  // namespace
 
 BatchResult Exporter::batchRender(const Session& s, const BatchSettings& bs, const juce::File& folder, const ExportSettings& es,
@@ -518,9 +720,20 @@ BatchResult Exporter::batchRender(const Session& s, const BatchSettings& bs, con
     }
     if (!folder.createDirectory()) { res.error = "Couldn't create " + folder.getFullPathName(); return res; }
 
-    const bool passCd = bs.ddp || bs.wav16 || bs.flac16;
-    const bool passHi = bs.wavHi || bs.flacHi || bs.programme;
     const double hiRate = s.effectiveRate();
+    juce::String unitHeader;
+    if (s.client.isNotEmpty()) unitHeader << "Client:   " << s.client << "\n";
+    if (s.engineer.isNotEmpty()) unitHeader << "Engineer: " << s.engineer << "\n";
+    unitHeader << "Created:  " << juce::Time::getCurrentTime().toString(true, true) << " by Lathe (batch render)\n";
+    unitHeader << "Dither:   " << ditherName(es.shape) << "\n";
+    std::vector<std::unique_ptr<UnitSink>> cdUnits, hiUnits;
+    if (bs.products && !s.products.isEmpty()) {
+        auto e = makeUnitSinks(s, folder, hiRate, bs.hiBits >= 32 ? 24 : bs.hiBits, es.shape, unitHeader, cdUnits, hiUnits);
+        if (e.isNotEmpty()) { res.error = e; return res; }
+    }
+
+    const bool passCd = bs.ddp || bs.wav16 || bs.flac16 || !cdUnits.empty();
+    const bool passHi = bs.wavHi || bs.flacHi || bs.programme || !hiUnits.empty();
     const double weightCd = passCd ? (passHi ? 0.5 : 1.0) : 0.0;
     QcReport qc;
     juce::String err;
@@ -549,6 +762,8 @@ BatchResult Exporter::batchRender(const Session& s, const BatchSettings& bs, con
             ints.resize(size_t(frames * 2));
             if (!ms.pull(l.data(), r.data(), int(frames), err)) return false;
             qr.feed(l.data(), r.data(), int(frames), pos);
+            for (auto& u : cdUnits)
+                if (!u->consume(l.data(), r.data(), int(frames), pos, err)) return false;
             const double* ch[2] = {l.data(), r.data()};
             dither.process(ch, int(frames), ints.data());
             for (int64_t i = 0; i < frames * 2; ++i) out[i] = int16_t(ints[size_t(i)]);
@@ -588,6 +803,13 @@ BatchResult Exporter::batchRender(const Session& s, const BatchSettings& bs, con
             if (!sk->finish(err)) { res.error = err; return res; }
             for (auto& f : sk->files()) res.files.add(f.getRelativePathFrom(folder));
         }
+        for (auto& u : cdUnits) {
+            if (!u->finish(folder, err)) { res.error = err; return res; }
+            auto kids = u->output().findChildFiles(juce::File::findFiles, false);
+            kids.sort();
+            for (auto& f : kids) res.files.add(f.getRelativePathFrom(folder));
+            res.delivery.units.push_back(u->info());
+        }
         qr.fill(qc);
         settingsText << "CD master: 44.1 kHz / 16-bit, dither " << ditherName(es.shape) << "\n";
     }
@@ -625,6 +847,8 @@ BatchResult Exporter::batchRender(const Session& s, const BatchSettings& bs, con
             int n = int(juce::jmin<juce::int64>(4096, total - pos));
             if (!ms.pull(l.data(), r.data(), n, err)) { res.error = err; return res; }
             if (qr) qr->feed(l.data(), r.data(), n, pos);
+            for (auto& u : hiUnits)
+                if (!u->consume(l.data(), r.data(), n, pos, err)) { res.error = err; return res; }
             const double* ch[2] = {l.data(), r.data()};
             if (floatOut) {   // 32-bit float requested: deliver 24-bit integer files without dither
                 for (int i = 0; i < n; ++i) {
@@ -645,6 +869,11 @@ BatchResult Exporter::batchRender(const Session& s, const BatchSettings& bs, con
             for (auto& f : sk->files()) res.files.add(f.getRelativePathFrom(folder));
         }
         if (prog) { prog.reset(); res.files.add(progFile.getFileName()); }
+        for (auto& u : hiUnits) {
+            if (!u->finish(folder, err)) { res.error = err; return res; }
+            res.files.add(u->info().path);
+            res.delivery.units.push_back(u->info());
+        }
         if (qr) qr->fill(qc);
         settingsText << "Hi-res: " << label << ", dither " << (floatOut ? juce::String("none") : ditherName(es.shape)) << "\n";
     }
@@ -664,6 +893,17 @@ BatchResult Exporter::batchRender(const Session& s, const BatchSettings& bs, con
     if (bs.ddp) rep << "DDP: " << (res.ddpVerified ? "written and verified (all checksums match)" : "WRITTEN BUT VERIFY FAILED - re-render") << "\n\n";
     rep << qc.toText() << "\n";
     for (auto& a : adj) rep << "Note: " << a << "\n";
+    if (!res.delivery.units.empty()) {
+        rep << "PRODUCTS\n";
+        for (auto& u : res.delivery.units) {
+            rep << "  " << u.longLabel << ": " << juce::String(u.window.length() / 60.0, 2) << " min, " << fmtDb(u.lufs, "LUFS") << ", "
+                << fmtDb(u.truePeakDb, "dBTP");
+            if (!u.disc.tracks.empty()) rep << ", " << int(u.disc.tracks.size()) << " tracks, DDP " << (u.verified ? "verified" : "VERIFY FAILED");
+            rep << "\n";
+            for (auto& n : u.notes) rep << "    Note: " << n << "\n";
+        }
+        rep << "\n";
+    }
     rep << "FILES (MD5)\n";
     for (auto& f : res.files) {
         auto file = folder.getChildFile(f);
@@ -672,8 +912,21 @@ BatchResult Exporter::batchRender(const Session& s, const BatchSettings& bs, con
     folder.getChildFile("Render Report.txt").replaceWithText(rep);
     res.files.add("Render Report.txt");
     res.report = rep;
-    res.ok = !bs.ddp || res.ddpVerified;
-    if (!res.ok) res.error = "The DDP didn't verify after writing. Re-render to a different drive.";
+    bool unitsOk = true;
+    for (auto& u : res.delivery.units) unitsOk = unitsOk && u.verified;
+    res.ok = (!bs.ddp || res.ddpVerified) && unitsOk;
+    if (!res.ok) res.error = "A DDP didn't verify after writing. Re-render to a different drive.";
+    auto& d = res.delivery;
+    d.disc = disc;
+    d.discNotes = adj;
+    d.fullDdp = bs.ddp;
+    d.ddpVerified = res.ddpVerified;
+    d.qc = qc;
+    d.files = res.files;
+    d.settingsText = settingsText;
+    d.dither = ditherName(es.shape);
+    d.hiRate = hiRate;
+    d.hiBits = bs.hiBits;
     return res;
 }
 

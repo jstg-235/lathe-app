@@ -36,6 +36,10 @@ public:
     std::function<void(int markerId)> onMarkerDoubleClicked;
     std::function<void(int regionId)> onRegionFx;      // open the region's effects window
     std::function<void(int regionId)> onRegionRestore, onRegionSpectral;
+    // Product strip (units of one product drawn under the markers); double-click a break to edit it.
+    std::function<void(int productId, int breakIndex)> onBreakEdit;
+    void setProductView(int productId) { productView_ = productId; resized(); repaint(); }
+    int productView() const;   // the product shown (first one if none chosen), 0 = none
 
     void setPlayhead(double sec, bool follow);
     double playhead() const { return playhead_; }
@@ -76,7 +80,11 @@ public:
     void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
 
 private:
-    static constexpr int kRuler = 22, kMarkers = 26, kScroll = 12;
+    static constexpr int kRuler = 22, kMarkerStrip = 26, kProductStrip = 22, kScroll = 12;
+    int productH() const { return productView() ? kProductStrip : 0; }
+    int top() const { return kRuler + kMarkerStrip + productH(); }   // first lane's y
+    void paintProducts(juce::Graphics&);
+    int breakAt(juce::Point<int> p) const;   // break index in the shown product, -1 = none
     enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint };
 
     double xToTime(float x) const { return view0_ + double(x) / pps_; }
@@ -113,6 +121,7 @@ private:
     bool changed_ = false;
     std::shared_ptr<const dsp::AnalysisResult> an_, raw_;
     bool stale_ = false, showLoudness_ = true;
+    int productView_ = 0;
 };
 
 }  // namespace lathe

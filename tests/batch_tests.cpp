@@ -3,6 +3,7 @@
 #include "../app/Source/ControlSurface.h"
 #include "../app/Source/DdpFormat.h"
 #include "../app/Source/Exporter.h"
+#include "../app/Source/Paperwork.h"
 #include "../app/Source/Restore.h"
 #include "../core/util/FlacTags.h"
 
@@ -375,6 +376,168 @@ int main() {
         engine.releaseResources();
     }
 
+
+    // ---- Products: per-disc DDPs and LP side files with their own fades, plus paperwork ----
+    {
+        // 16-bit sources, so unity-gain samples pass dither untouched and can be compared exactly.
+        auto make16 = [&](const juce::String& name, double sec, int seed) {
+            auto f = dir.getChildFile(name);
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(f.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 44100, 2, 16, {}, 0));
+            os.release();
+            juce::Random rnd(seed);
+            std::vector<int> l(size_t(44100 * sec)), r(l.size());
+            for (size_t i = 0; i < l.size(); ++i) { l[i] = (rnd.nextInt(20000) - 10000) << 16; r[i] = (rnd.nextInt(20000) - 10000) << 16; }
+            const int* ch[3] = {l.data(), r.data(), nullptr};
+            w->write(ch, int(l.size()));
+            return f;
+        };
+        auto a = make16("pa.wav", 5.0, 11);
+        auto b = make16("pb.wav", 12.0, 12);
+        Session s;
+        s.discTitle = "Split Test";
+        s.discPerformer = "Lathe Ensemble";
+        s.label = "Test Records";
+        s.catalogue = "TR-001";
+        s.upcEan = "0123456789012";
+        s.releaseDate = "2026-12-01";
+        s.pLine = "2026 Test Records";
+        s.cLine = "2026 Test Records";
+        s.engineer = "A. Engineer";
+        s.client = "Test Client";
+        s.cdTextGenre = 14;
+        for (auto& f : {a, b}) {
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(f));
+            s.append(s.makeRegion(f, r->sampleRate, r->lengthInSamples), 2.0);
+        }
+        s.sortMarkers();
+        int tn = 0;
+        for (auto& m : s.markers)
+            if (m.type == Marker::TrackStart) {
+                ++tn;
+                m.text.title = tn == 1 ? "Overture" : "Long Movement";
+                m.isrc = tn == 1 ? "USABC2600011" : "USABC2600012";
+                m.text.songwriter = "C. Omposer";
+                m.publisher = "Test Music";
+                m.pro = "BMI";
+                m.explicitContent = tn == 2;
+            }
+        // a: 2..7 s, b: 9..21 s.
+        Product cdp;
+        cdp.id = s.nextId++;
+        cdp.kind = ProductKind::CD;
+        cdp.name = "CD";
+        cdp.catalogue = "TR-001CD";
+        cdp.units.add({0.0, 15.0, 0.0, 1.0, FadeShape::EqualPower, FadeShape::Linear});
+        cdp.units.add({14.0, 21.0, 1.0, 0.0, FadeShape::Linear, FadeShape::EqualPower});
+        s.products.add(cdp);
+        Product lp;
+        lp.id = s.nextId++;
+        lp.kind = ProductKind::LP12_33;
+        lp.name = "LP";
+        lp.catalogue = "TR-001LP";
+        lp.units.add({0.0, 9.0});
+        lp.units.add({9.0, 21.0});
+        s.products.add(lp);
+
+        BatchSettings bs;
+        bs.ddp = true;
+        bs.wav16 = bs.flac16 = bs.wavHi = bs.flacHi = false;
+        bs.programme = true;
+        ExportSettings es;
+        es.shape = dsp::Ditherer::Shape::None;
+        Exporter ex(engine);
+        auto out = dir.getChildFile("products");
+        auto res = ex.batchRender(s, bs, out, es, [](double) { return true; });
+        if (!res.ok) std::printf("products error: %s\n", res.error.toRawUTF8());
+        std::printf("products: %d units, %d files\n", int(res.delivery.units.size()), res.files.size());
+        CHECK(res.ok && res.delivery.units.size() == 4);
+
+        auto full = out.getChildFile("DDP/IMAGE.DAT");
+        auto disc1 = out.getChildFile("CD DDP/Disc 1 - TR-001CD-D1/IMAGE.DAT");
+        auto disc2 = out.getChildFile("CD DDP/Disc 2 - TR-001CD-D2/IMAGE.DAT");
+        CHECK(full.existsAsFile() && disc1.existsAsFile() && disc2.existsAsFile());
+        juce::MemoryBlock mf, m1, m2;
+        full.loadFileAsData(mf);
+        disc1.loadFileAsData(m1);
+        disc2.loadFileAsData(m2);
+        auto sample = [](const juce::MemoryBlock& m, juce::int64 frame, int ch) {
+            auto* p = static_cast<const uint8_t*>(m.getData()) + (frame * 2 + ch) * 2;
+            return int16_t(p[0] | (p[1] << 8));
+        };
+        // Disc 1: identical to the full programme up to its fade-out (14 s), faded after, silent padding at the end.
+        int diff1 = 0;
+        for (juce::int64 i = 0; i < 14 * 44100; ++i) diff1 += sample(m1, i, 0) != sample(mf, i, 0) || sample(m1, i, 1) != sample(mf, i, 1);
+        CHECK(diff1 == 0);
+        juce::int64 mid = juce::int64(14.5 * 44100);
+        double ratio = double(sample(m1, mid, 0)) / double(sample(mf, mid, 0));
+        CHECK(std::abs(ratio - 0.5) < 0.01);   // linear fade-out half way
+        CHECK(m1.getSize() == size_t(std::ceil(15.0 * 75)) * 2352);
+        // Disc 2: 2 s of digital silence, then the programme from 14 s with a 1 s fade-in.
+        bool silentPregap = true;
+        for (juce::int64 i = 0; i < 2 * 44100; ++i) silentPregap = silentPregap && sample(m2, i, 0) == 0 && sample(m2, i, 1) == 0;
+        CHECK(silentPregap);
+        int diff2 = 0;
+        for (juce::int64 i = 44100; i < 6 * 44100; ++i) diff2 += sample(m2, 2 * 44100 + i, 0) != sample(mf, 14 * 44100 + i, 0);
+        CHECK(diff2 == 0);
+        CHECK(m2.getSize() == size_t(std::ceil(9.0 * 75)) * 2352);
+        auto rd = ddp::readDdp(out.getChildFile("CD DDP/Disc 2 - TR-001CD-D2").getFullPathName().toStdString());
+        CHECK(rd.ok && rd.checksumsOk && rd.disc.tracks.size() == 1 && rd.disc.tracks[0].isrc == "USABC2600012" && rd.disc.tracks[0].text.title == "Long Movement (cont.)");
+        CHECK(rd.disc.masterId == "TR-001CD-D2");
+
+        // LP sides: hi-res files whose samples are exactly the programme's (unity gain, 16-bit source).
+        auto sideB = out.getChildFile("LP Sides/Split Test - LP Side B.wav");
+        auto prog = out.getChildFile("Split Test 24-bit 44.1 kHz.wav");
+        std::unique_ptr<juce::AudioFormatReader> rb(fm.createReaderFor(sideB)), rp(fm.createReaderFor(prog));
+        CHECK(rb && rp && rb->lengthInSamples == 12 * 44100 && rb->bitsPerSample == 24);
+        if (rb && rp) {
+            juce::AudioBuffer<float> bb(2, 44100), pb(2, 44100);
+            rb->read(&bb, 0, 44100, 0, true, true);
+            rp->read(&pb, 0, 44100, 9 * 44100, true, true);
+            int d = 0;
+            for (int i = 0; i < 44100; ++i) d += bb.getSample(0, i) != pb.getSample(0, i);
+            CHECK(d == 0);
+        }
+        CHECK(res.report.contains("PRODUCTS") && res.report.contains("CD Disc 2"));
+
+        // Paperwork with a logo.
+        auto logo = dir.getChildFile("logo.png");
+        {
+            juce::Image img(juce::Image::ARGB, 300, 100, true);
+            juce::Graphics g(img);
+            g.setColour(juce::Colours::darkorange);
+            g.fillEllipse(10, 10, 80, 80);
+            g.setColour(juce::Colours::black);
+            g.setFont(40.0f);
+            g.drawText("STUDIO", 100, 20, 190, 60, juce::Justification::centredLeft);
+            juce::FileOutputStream fo(logo);
+            juce::PNGImageFormat().writeImageToStream(img, fo);
+        }
+        StudioProfile st;
+        st.name = "Lathe Test Mastering";
+        st.address = "1 Groove Street\nNashville, TN 37203";
+        st.phone = "+1 615 555 0100";
+        st.email = "studio@example.com";
+        st.website = "example.com";
+        st.logo = logo;
+        CHECK(!logoJpeg(logo).empty());
+        auto pw = writePaperwork(s, res.delivery, st, out);
+        if (pw.error.isNotEmpty()) std::printf("paperwork error: %s\n", pw.error.toRawUTF8());
+        CHECK(pw.error.isEmpty());
+        for (auto& n : {"PQ Sheet - TR-001.pdf", "PQ Sheet - CD.pdf", "Cutting Sheet - LP.pdf", "Label Copy.pdf", "Delivery Manifest.pdf", "Track Metadata.csv", "Delivery.json"})
+            CHECK(out.getChildFile("Paperwork").getChildFile(n).existsAsFile());
+        juce::MemoryBlock pdf;
+        out.getChildFile("Paperwork/PQ Sheet - CD.pdf").loadFileAsData(pdf);
+        std::string pdfText(static_cast<const char*>(pdf.getData()), pdf.getSize());
+        CHECK(pdfText.rfind("%PDF-1.4", 0) == 0 && pdfText.find("/DCTDecode") != std::string::npos && pdfText.find("Long Movement \\(cont.\\)") != std::string::npos);
+        auto json = juce::JSON::parse(out.getChildFile("Paperwork/Delivery.json"));
+        CHECK(json["products"].size() == 2 && json["tracks"].size() == 2 && json["files"].size() > 10);
+        CHECK(json["files"][0]["md5"].toString().length() == 32);
+        auto csv = out.getChildFile("Paperwork/Track Metadata.csv").loadFileAsString();
+        CHECK(csv.contains("Long Movement") && csv.contains("BMI") && csv.contains("Side B"));
+        if (auto* keep = std::getenv("LATHE_KEEP_PAPERWORK")) out.getChildFile("Paperwork").copyDirectoryTo(juce::File(keep));
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

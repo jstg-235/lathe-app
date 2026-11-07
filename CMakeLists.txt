@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Lathe VERSION 0.7.0 LANGUAGES C CXX)
+project(Lathe VERSION 0.8.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,7 +17,8 @@ add_library(lathe_core STATIC
     core/dsp/Analyzer.cpp
     core/dsp/Restoration.cpp
     core/util/Hash.cpp
-    core/util/FlacTags.cpp)
+    core/util/FlacTags.cpp
+    core/doc/Pdf.cpp)
 target_include_directories(lathe_core PUBLIC core)
 set_target_properties(lathe_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -76,7 +77,10 @@ target_sources(Lathe PRIVATE
     app/Source/DdpFormat.cpp
     app/Source/DdpPlayer.cpp
     app/Source/ControlSurface.cpp
-    app/Source/Restore.cpp)
+    app/Source/Restore.cpp
+    app/Source/Products.cpp
+    app/Source/Paperwork.cpp
+    app/Source/DeliveryPanels.cpp)
 
 target_include_directories(Lathe PRIVATE ${r8b_SOURCE_DIR})
 
@@ -104,7 +108,7 @@ target_link_libraries(Lathe PRIVATE
 
 if(LATHE_BUILD_TESTS)
     juce_add_console_app(lathe_render_tests PRODUCT_NAME "lathe_render_tests")
-    target_sources(lathe_render_tests PRIVATE tests/render_tests.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp app/Source/NullTest.cpp app/Source/Commands.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp)
+    target_sources(lathe_render_tests PRIVATE tests/render_tests.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp app/Source/Products.cpp app/Source/NullTest.cpp app/Source/Commands.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp)
     target_include_directories(lathe_render_tests PRIVATE ${r8b_SOURCE_DIR})
     target_compile_definitions(lathe_render_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1 JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)
     target_link_libraries(lathe_render_tests PRIVATE lathe_core juce::juce_audio_formats juce::juce_gui_basics juce::juce_audio_processors
@@ -116,7 +120,8 @@ if(LATHE_BUILD_TESTS)
     juce_add_console_app(lathe_batch_tests PRODUCT_NAME "lathe_batch_tests")
     target_sources(lathe_batch_tests PRIVATE tests/batch_tests.cpp app/Source/Exporter.cpp app/Source/AudioEngine.cpp
         app/Source/PluginChain.cpp app/Source/RegionFx.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp
-        app/Source/DdpFormat.cpp app/Source/ControlSurface.cpp app/Source/Commands.cpp app/Source/Restore.cpp)
+        app/Source/DdpFormat.cpp app/Source/ControlSurface.cpp app/Source/Commands.cpp app/Source/Restore.cpp
+        app/Source/Products.cpp app/Source/Paperwork.cpp)
     target_include_directories(lathe_batch_tests PRIVATE ${r8b_SOURCE_DIR})
     target_compile_definitions(lathe_batch_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1
         JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)

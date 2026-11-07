@@ -152,6 +152,7 @@ MainComponent::MainComponent() {
     o.osxLibrarySubFolder = "Application Support";
     o.folderName = "Lathe";
     props_.setStorageParameters(o);
+    studio_.fromVar(juce::JSON::parse(props_.getUserSettings()->getValue("studioProfile")));
 
     getLookAndFeel().setColour(juce::ResizableWindow::backgroundColourId, colours::bg);
     meters_ = std::make_unique<LevelMeters>();
@@ -234,6 +235,7 @@ MainComponent::MainComponent() {
     timeline_.onEdit = [this] { sessionChanged(); };
     timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
     timeline_.onCrossfade = [this](int a, int b) { openCrossfade(a, b); };
+    timeline_.onBreakEdit = [this](int pid, int k) { openBreakEditor(pid, k); };
     timeline_.onRegionFx = [this](int id) { openRegionFx(id); };
     timeline_.onRegionRestore = [this](int id) { showRestore(id); };
     timeline_.onRegionSpectral = [this](int id) { showSpectral(id); };
@@ -569,13 +571,19 @@ bool MainComponent::perform(const InvocationInfo& info) {
             break;
         case cmd::keyGuide: showKeyGuide(); break;
         case cmd::editKeyCommands: showKeyEditor(); break;
+        case cmd::products: showProducts(); break;
+        case cmd::breakEditor: breakNearPlayhead(); break;
+        case cmd::releaseInfo: showReleaseInfo(); break;
+        case cmd::trackCredits: showTrackCredits(); break;
+        case cmd::studioProfile: showStudioProfile(); break;
+        case cmd::exportPaperwork: exportPaperworkOnly(); break;
         default: return false;
     }
     commands_.commandStatusChanged();
     return true;
 }
 
-juce::StringArray MainComponent::getMenuBarNames() { return {"File", "Edit", "Transport", "Markers", "View", "Tools", "Help"}; }
+juce::StringArray MainComponent::getMenuBarNames() { return {"File", "Edit", "Transport", "Markers", "View", "Delivery", "Tools", "Help"}; }
 
 juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
     juce::PopupMenu m;
@@ -621,13 +629,22 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             add({cmd::toggleEnvelope, cmd::toggleSnap, cmd::crossfadeEditor, cmd::toggleLoudness});
             break;
         case 5:
+            add({cmd::releaseInfo, cmd::trackCredits});
+            m.addSeparator();
+            add({cmd::products, cmd::breakEditor});
+            m.addSeparator();
+            add({cmd::batchRender, cmd::exportPaperwork});
+            m.addSeparator();
+            add({cmd::studioProfile});
+            break;
+        case 6:
             add({cmd::analyse, cmd::showAnalysis, cmd::references});
             m.addSeparator();
             add({cmd::ddpPlayer, cmd::verifyDdp, cmd::nullTest});
             m.addSeparator();
             add({cmd::pluginManager, cmd::audioSetup, cmd::controlSurfaces, cmd::followProjectRate});
             break;
-        case 6: add({cmd::keyGuide, cmd::editKeyCommands}); break;
+        case 7: add({cmd::keyGuide, cmd::editKeyCommands}); break;
         default: break;
     }
     return m;
@@ -721,7 +738,7 @@ public:
 
 class BatchPanel : public juce::Component {
 public:
-    BatchPanel(double projectRate) {
+    BatchPanel(double projectRate, int productCount, bool fullFitsCd) {
         auto hi = juce::String(projectRate / 1000.0, projectRate == std::round(projectRate / 1000.0) * 1000.0 ? 0 : 1) + " kHz";
         ddp_.setButtonText("DDP image for replication (verified after writing)");
         wav16_.setButtonText("WAV 16-bit / 44.1 kHz per track (bit-identical to the CD)");
@@ -729,14 +746,22 @@ public:
         wavHi_.setButtonText("WAV 24-bit / " + hi + " per track (hi-res / streaming masters)");
         flacHi_.setButtonText("FLAC 24-bit / " + hi + " per track (tagged)");
         prog_.setButtonText("Whole programme as one WAV, 24-bit / " + hi);
-        for (auto* t : {&ddp_, &wav16_, &flac16_, &wavHi_, &flacHi_, &prog_}) {
+        products_.setButtonText(productCount > 0 ? "Products: " + juce::String(productCount) + " product(s), a DDP per CD and a file per vinyl / tape side"
+                                                 : juce::String("Products (none set up: Delivery > Products & Splitting)"));
+        paperwork_.setButtonText("Paperwork: PQ / cutting sheets, label copy, manifest (PDF, CSV, JSON)");
+        for (auto* t : {&ddp_, &wav16_, &flac16_, &wavHi_, &flacHi_, &prog_, &products_, &paperwork_}) {
             t->setColour(juce::ToggleButton::textColourId, colours::text);
             t->setColour(juce::ToggleButton::tickColourId, colours::accent);
             addAndMakeVisible(*t);
         }
-        ddp_.setToggleState(true, juce::dontSendNotification);
-        wav16_.setToggleState(true, juce::dontSendNotification);
+        ddp_.setToggleState(fullFitsCd, juce::dontSendNotification);
+        if (!fullFitsCd) ddp_.setButtonText("DDP image of the full programme (longer than a CD: use a CD product instead)");
+        wav16_.setToggleState(fullFitsCd, juce::dontSendNotification);
         wavHi_.setToggleState(true, juce::dontSendNotification);
+        products_.setToggleState(productCount > 0, juce::dontSendNotification);
+        products_.setEnabled(productCount > 0);
+        paperwork_.setToggleState(true, juce::dontSendNotification);
+        if (!fullFitsCd) prog_.setToggleState(true, juce::dontSendNotification);
         note_.setText("One render pass feeds the DDP and the 16-bit files, a second (at the project rate, no "
                       "sample-rate conversion) feeds the hi-res files. A Render Report with QC and an MD5 for "
                       "every file is written alongside. MP3/AAC aren't included (encoder licensing).",
@@ -751,7 +776,7 @@ public:
         addAndMakeVisible(cancel_);
         render_.onClick = [this] { if (onRender) onRender(settings()); };
         cancel_.onClick = [this] { if (onCancel) onCancel(); };
-        setSize(560, 330);
+        setSize(600, 400);
     }
     BatchSettings settings() const {
         BatchSettings b;
@@ -761,6 +786,8 @@ public:
         b.wavHi = wavHi_.getToggleState();
         b.flacHi = flacHi_.getToggleState();
         b.programme = prog_.getToggleState();
+        b.products = products_.getToggleState();
+        b.paperwork = paperwork_.getToggleState();
         return b;
     }
     std::function<void(BatchSettings)> onRender;
@@ -768,7 +795,7 @@ public:
     void paint(juce::Graphics& g) override { g.fillAll(colours::bg); }
     void resized() override {
         auto r = getLocalBounds().reduced(14);
-        for (auto* t : {&ddp_, &wav16_, &flac16_, &wavHi_, &flacHi_, &prog_}) { t->setBounds(r.removeFromTop(26)); r.removeFromTop(2); }
+        for (auto* t : {&ddp_, &wav16_, &flac16_, &wavHi_, &flacHi_, &prog_, &products_, &paperwork_}) { t->setBounds(r.removeFromTop(26)); r.removeFromTop(2); }
         auto buttons = r.removeFromBottom(28);
         render_.setBounds(buttons.removeFromRight(140));
         buttons.removeFromRight(8);
@@ -777,7 +804,7 @@ public:
         note_.setBounds(r);
     }
 private:
-    juce::ToggleButton ddp_, wav16_, flac16_, wavHi_, flacHi_, prog_;
+    juce::ToggleButton ddp_, wav16_, flac16_, wavHi_, flacHi_, prog_, products_, paperwork_;
     juce::Label note_;
     juce::TextButton render_{"Choose Folder & Render"}, cancel_{"Cancel"};
 };
@@ -802,7 +829,8 @@ void MainComponent::openRegionFx(int regionId) {
 
 void MainComponent::showBatchDialog() {
     if (session_.regions.isEmpty()) return;
-    auto* panel = new BatchPanel(session_.effectiveRate());
+    auto* panel = new BatchPanel(session_.effectiveRate(), session_.products.size(),
+                                 session_.end() <= productSpec(ProductKind::CD).hardMax);
     juce::DialogWindow::LaunchOptions o;
     o.content.setOwned(panel);
     o.dialogTitle = "Render Album";
@@ -825,8 +853,16 @@ void MainComponent::showBatchDialog() {
             auto snapshot = std::make_shared<Session>(session_);
             auto es = exportSettings();
             auto res = std::make_shared<BatchResult>();
+            auto studio = studio_;
             runJob("Rendering album...",
-                   [this, snapshot, bs, folder, es, res](Job& j) { *res = exporter_.batchRender(*snapshot, bs, folder, es, [&](double p) { return j.keep(p); }); },
+                   [this, snapshot, bs, folder, es, res, studio](Job& j) {
+                       *res = exporter_.batchRender(*snapshot, bs, folder, es, [&](double p) { return j.keep(p); });
+                       if (bs.paperwork && !res->report.isEmpty()) {
+                           auto pw = writePaperwork(*snapshot, res->delivery, studio, folder);
+                           if (pw.error.isNotEmpty()) res->report << "\nPAPERWORK FAILED: " << pw.error << "\n";
+                           else res->report << "\nPAPERWORK\n" << "  " << pw.files.joinIntoString("\n  ") << "\n";
+                       }
+                   },
                    [this, res, folder](bool) {
                        if (!res->ok && res->report.isEmpty()) {
                            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Render failed", res->error);
@@ -1759,6 +1795,7 @@ void MainComponent::refreshAll() {
     chainList_.updateContent();
     chainList_.repaint();
     refreshIssues();
+    refreshDeliveryPanels();
     dirty_ = true;
 }
 
@@ -2384,6 +2421,175 @@ void MainComponent::timerCallback() {
         rw = "Playing at the project rate, " + juce::String(dr / 1000.0, 1) + " kHz (no resampling)";
     rateWarning_.setText(rw, juce::dontSendNotification);
     rateWarning_.setColour(juce::Label::textColourId, std::abs(pr - dr) > 0.5 ? colours::accent : colours::ok);
+}
+
+// ---------------------------------------------------------------- delivery
+
+void MainComponent::saveStudio() {
+    props_.getUserSettings()->setValue("studioProfile", juce::JSON::toString(studio_.toVar(), true));
+    props_.saveIfNeeded();
+}
+
+void MainComponent::refreshDeliveryPanels() {
+    if (productsPanel_) productsPanel_->refresh();
+    if (releasePanel_) releasePanel_->refresh();
+    if (creditsPanel_) creditsPanel_->refresh();
+    if (breakEditor_) {
+        auto* p = session_.findProduct(breakEditor_->productId());
+        if (!p || breakEditor_->breakIndex() + 1 >= p->units.size()) breakWindow_.reset();
+        else breakEditor_->setBreak(p->id, breakEditor_->breakIndex());
+    }
+    timeline_.resized();
+    timeline_.repaint();
+}
+
+void MainComponent::showProducts() {
+    if (productsWindow_) { productsWindow_->toFront(true); return; }
+    auto* panel = new ProductsPanel(session_, [this]() -> const dsp::LoudnessMap* { return analysis_ && !analysis_->map.momentary.empty() ? &analysis_->map : nullptr; });
+    panel->onChange = [this] {
+        sessionChanged();
+        timeline_.resized();
+        timeline_.repaint();
+        if (breakEditor_) {
+            auto* p = session_.findProduct(breakEditor_->productId());
+            if (!p || breakEditor_->breakIndex() + 1 >= p->units.size()) breakWindow_.reset();
+            else breakEditor_->setBreak(p->id, breakEditor_->breakIndex());
+        }
+    };
+    panel->onEditBreak = [this](int pid, int k) { openBreakEditor(pid, k); };
+    panel->onLocate = [this](double t) { engine_.setPositionSeconds(t); timeline_.setPlayhead(t, true); };
+    panel->onProductSelected = [this](int pid) { timeline_.setProductView(pid); };
+    productsPanel_ = panel;
+    auto* w = new PlainWindow(panel, "Products & Splitting", false);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { productsWindow_.reset(); }); };
+    productsWindow_.reset(w);
+    if (panel->selectedProduct()) timeline_.setProductView(panel->selectedProduct());
+}
+
+void MainComponent::openBreakEditor(int pid, int k) {
+    auto* p = session_.findProduct(pid);
+    if (!p || k < 0 || k + 1 >= p->units.size()) return;
+    timeline_.setProductView(pid);
+    if (breakWindow_ && breakEditor_) {
+        breakEditor_->setBreak(pid, k);
+        breakWindow_->toFront(true);
+        return;
+    }
+    auto* ed = new BreakEditor(session_, thumbs_, pid, k);
+    ed->onChange = [this] {
+        sessionChanged();
+        timeline_.repaint();
+        if (productsPanel_) productsPanel_->refresh();
+    };
+    ed->onAudition = [this](const BreakPlan& plan) { engine_.startBreakAudition(session_, plan); };
+    ed->onStop = [this] { engine_.stopBreakAudition(); };
+    ed->auditionPosition = [this] { return engine_.breakAuditionTimeline(); };
+    breakEditor_ = ed;
+    auto* w = new PlainWindow(ed, "Break Editor", false);
+    w->onClose = [this] { engine_.stopBreakAudition(); juce::MessageManager::callAsync([this] { breakWindow_.reset(); }); };
+    breakWindow_.reset(w);
+}
+
+void MainComponent::breakNearPlayhead() {
+    auto* p = session_.findProduct(timeline_.productView());
+    if (!p || p->units.size() < 2) { showProducts(); return; }
+    const double pos = engine_.positionSeconds();
+    int best = 0;
+    double bestD = 1e18;
+    for (int k = 0; k + 1 < p->units.size(); ++k) {
+        double d = std::abs((p->units[k].end + p->units[k + 1].start) * 0.5 - pos);
+        if (d < bestD) { bestD = d; best = k; }
+    }
+    openBreakEditor(p->id, best);
+}
+
+void MainComponent::showReleaseInfo() {
+    if (releaseWindow_) { releaseWindow_->toFront(true); return; }
+    auto* panel = new ReleaseInfoPanel(session_);
+    panel->onChange = [this] {
+        sessionChanged();
+        updatingFields_ = true;
+        title_.setText(session_.discTitle, false);
+        performer_.setText(session_.discPerformer, false);
+        upc_.setText(session_.upcEan, false);
+        client_.setText(session_.client, false);
+        engineer_.setText(session_.engineer, false);
+        updatingFields_ = false;
+    };
+    releasePanel_ = panel;
+    auto* w = new PlainWindow(panel, "Release Info", false);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { releaseWindow_.reset(); }); };
+    releaseWindow_.reset(w);
+}
+
+void MainComponent::showTrackCredits() {
+    if (creditsWindow_) { creditsWindow_->toFront(true); return; }
+    auto* panel = new TrackCreditsPanel(session_);
+    panel->onChange = [this] {
+        sessionChanged();
+        pqList_.updateContent();
+        pqList_.repaint();
+    };
+    creditsPanel_ = panel;
+    auto* w = new PlainWindow(panel, "Track Credits", false);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { creditsWindow_.reset(); }); };
+    creditsWindow_.reset(w);
+}
+
+void MainComponent::showStudioProfile() {
+    if (studioWindow_) { studioWindow_->toFront(true); return; }
+    auto* panel = new StudioPanel(studio_);
+    panel->onChange = [this] { saveStudio(); };
+    auto* w = new PlainWindow(panel, "Studio Profile", false);
+    w->onClose = [this] { saveStudio(); juce::MessageManager::callAsync([this] { studioWindow_.reset(); }); };
+    studioWindow_.reset(w);
+}
+
+DeliveryData MainComponent::previewDelivery() const {
+    DeliveryData d;
+    d.disc = session_.toDisc(&d.discNotes);
+    d.fullDdp = session_.end() <= productSpec(ProductKind::CD).hardMax;
+    d.dither = ditherName(exportSettings().shape);
+    d.hiRate = session_.effectiveRate();
+    d.settingsText = "Preliminary paperwork from the session: nothing has been rendered, so there are no checksums or loudness figures yet.";
+    for (int pi = 0; pi < session_.products.size(); ++pi) {
+        const auto& p = session_.products.getReference(pi);
+        for (int ui = 0; ui < p.units.size(); ++ui) {
+            UnitRender u;
+            u.product = pi;
+            u.unit = ui;
+            u.label = unitLabel(p, ui);
+            u.longLabel = p.name + " " + unitLabel(p, ui, true);
+            u.window = p.units[ui];
+            if (productSpec(p.kind).cdFormat) {
+                Session ps = session_;
+                if (p.upc.isNotEmpty()) ps.upcEan = p.upc;
+                if (p.catalogue.isNotEmpty()) { ps.catalogue = p.catalogue; ps.masterId = {}; }
+                u.disc = ps.toDiscForUnit(u.window, ui + 1, p.units.size(), u.lead, &u.notes);
+            } else {
+                u.rate = d.hiRate;
+                u.bits = 24;
+            }
+            d.units.push_back(u);
+        }
+    }
+    return d;
+}
+
+void MainComponent::exportPaperworkOnly() {
+    chooser_ = std::make_unique<juce::FileChooser>("Choose where to write the Paperwork folder", juce::File::getSpecialLocation(juce::File::userDesktopDirectory));
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories, [this](const juce::FileChooser& fc) {
+        auto parent = fc.getResult();
+        if (!parent.isDirectory()) return;
+        auto folder = parent.getNonexistentChildFile(juce::File::createLegalFileName((session_.discTitle.isEmpty() ? juce::String("Lathe") : session_.discTitle) + " Paperwork"), "", false);
+        folder.createDirectory();
+        auto res = writePaperwork(session_, previewDelivery(), studio_, folder);
+        if (res.error.isNotEmpty()) {
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Paperwork", res.error);
+            return;
+        }
+        folder.getChildFile("Paperwork").revealToUser();
+    });
 }
 
 }  // namespace lathe

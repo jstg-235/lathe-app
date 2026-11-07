@@ -4,6 +4,7 @@
 #include "../core/util/FlacTags.h"
 #include "../app/Source/NullTest.h"
 #include "../app/Source/ProgramRenderer.h"
+#include "../app/Source/Products.h"
 
 // A test plugin: hard clip at +/-level with a fixed latency, in float and double.
 class ClipDelayPlugin : public juce::AudioPluginInstance {
@@ -405,6 +406,170 @@ int main() {
         if (auto* out = std::getenv("LATHE_KEYGUIDE_OUT")) juce::File(out).replaceWithText(keyGuideHtml(nullptr));
     }
 
+
+    // ---- Products: unit gain, auto-split, unit discs, PQ offset, persistence ----
+    {
+        // A fake programme: regions don't need real files for layout maths.
+        auto fakeSession = [](int tracks, double trackSec, double gap) {
+            Session p;
+            p.discTitle = "Long Night";
+            p.discPerformer = "Ensemble";
+            double t = 2.0;
+            for (int i = 0; i < tracks; ++i) {
+                Region r;
+                r.id = p.nextId++;
+                r.fileRate = 44100;
+                r.fileLength = juce::int64(trackSec * 44100);
+                r.srcIn = 0;
+                r.srcOut = r.fileLength;
+                r.start = t;
+                p.regions.add(r);
+                Marker m;
+                m.id = p.nextId++;
+                m.type = Marker::TrackStart;
+                m.t = t;
+                m.attachedRegion = r.id;
+                m.isrc = "USABC26" + juce::String(i + 1).paddedLeft('0', 5).toStdString();
+                m.text.title = ("Part " + juce::String(i + 1)).toStdString();
+                p.markers.add(m);
+                t += trackSec + gap;
+            }
+            return p;
+        };
+
+        Unit u{10.0, 20.0, 2.0, 4.0, FadeShape::Linear, FadeShape::Linear};
+        CHECK(unitGain(u, 9.99) == 0.0 && unitGain(u, 20.0) == 0.0);
+        CHECK(std::abs(unitGain(u, 11.0) - 0.5) < 1e-9 && unitGain(u, 15.0) == 1.0 && std::abs(unitGain(u, 18.0) - 0.5) < 1e-9);
+
+        // 12 five-minute tracks on 12" LP: 4 sides of 3 tracks, all breaks at track starts.
+        Session lp = fakeSession(12, 300.0, 0.0);
+        Product vinyl;
+        vinyl.kind = ProductKind::LP12_33;
+        vinyl.name = "LP";
+        auto msg = autoSplit(lp, vinyl, nullptr);
+        std::printf("%s\n", msg.toRawUTF8());
+        CHECK(vinyl.units.size() == 4);
+        bool atTracks = true;
+        for (int i = 1; i < vinyl.units.size(); ++i) {
+            atTracks = atTracks && vinyl.units[i].fadeIn == 0 && vinyl.units[i - 1].fadeOut == 0 && vinyl.units[i].start == vinyl.units[i - 1].end;
+            atTracks = atTracks && std::abs(vinyl.units[i].start - (2.0 + 900.0 * i)) < 1e-6;
+        }
+        CHECK(atTracks);
+        CHECK(validateProduct(lp, vinyl).empty());
+        CHECK(unitLabel(vinyl, 2) == "Side C" && unitLabel(vinyl, 2, true) == "Record 2, Side C");
+        auto ut = unitTracks(lp, vinyl.units[1]);
+        CHECK(ut.size() == 3 && ut[0].number == 4 && std::abs(ut[0].start) < 1e-6 && !ut[0].continuesFromPrevious);
+
+        // One 3-hour performance on CD: three discs, mid-music breaks with overlap and fades.
+        Session live = fakeSession(1, 3 * 3600.0, 0.0);
+        Product cdp;
+        cdp.kind = ProductKind::CD;
+        cdp.name = "CD";
+        msg = autoSplit(live, cdp, nullptr);
+        std::printf("%s\n", msg.toRawUTF8());
+        CHECK(cdp.units.size() == 3);
+        const double T = live.end();
+        CHECK(cdp.units[0].start == 0 && cdp.units[2].end == T);
+        CHECK(cdp.units[0].fadeOut == 5.0 && cdp.units[1].fadeIn == 5.0 && cdp.units[1].fadeOut == 5.0);
+        CHECK(std::abs(cdp.units[0].end - cdp.units[1].start - 10.0) < 1e-6);   // 5 s each side of the break
+        CHECK(std::abs(cdp.units[0].end - 5.0 - T / 3) < 1e-6);
+        bool fits = true;
+        for (auto& x : cdp.units) fits = fits && x.length() <= productSpec(ProductKind::CD).target;
+        CHECK(fits && validateProduct(live, cdp).empty());
+
+        // Same programme on LP: 9 sides needed, rounded up to 10.
+        Product lp2;
+        lp2.kind = ProductKind::LP12_33;
+        lp2.name = "LP";
+        autoSplit(live, lp2, nullptr);
+        CHECK(lp2.units.size() == 10);
+
+        // With a loudness map, the break moves to the quiet passage near the ideal point.
+        dsp::LoudnessMap map;
+        map.hopSec = 0.1;
+        map.momentary.assign(size_t(T / 0.1) + 10, -14.0f);
+        for (int i = 0; i < 30; ++i) map.momentary[size_t((3660.0 + 1.0) / 0.1) + size_t(i)] = -50.0f;   // 61:01-61:04
+        Product cdq;
+        cdq.kind = ProductKind::CD;
+        cdq.name = "CD";
+        autoSplit(live, cdq, &map);
+        double brk = cdq.units[0].end - 5.0;
+        std::printf("quiet break at %.1f s (dip at 3661-3664)\n", brk);
+        CHECK(brk > 3661.0 && brk < 3664.0);
+
+        // Disc 2 starts mid-track: a "(cont.)" track reusing the ISRC, after a 2 s pregap.
+        double lead = 0;
+        juce::StringArray notes;
+        auto d2 = live.toDiscForUnit(cdp.units[1], 2, 3, lead, &notes);
+        CHECK(std::abs(lead - 2.0) < 1e-9);
+        CHECK(d2.tracks.size() == 1 && d2.tracks[0].text.title == "Part 1 (cont.)" && d2.tracks[0].isrc == "USABC2600001");
+        CHECK(d2.tracks[0].startSector() == 150 && d2.tracks[0].firstSector() == 0);
+        CHECK(d2.leadOutSector == int64_t(std::ceil((cdp.units[1].length() + 2.0) * 75 - 1e-6)));
+        CHECK(!cd::hasErrors(cd::validate(d2)) && notes.size() == 1);
+        CHECK(d2.text.title == "Long Night (Disc 2)");
+        auto d1 = live.toDiscForUnit(cdp.units[0], 1, 3, lead, nullptr);
+        CHECK(lead == 0 && d1.tracks.size() == 1 && d1.tracks[0].startSector() == 150 && d1.tracks[0].text.title == "Part 1");
+
+        // A disc that starts on a track boundary gets a pregap but no continuation track.
+        Session multi = fakeSession(30, 300.0, 2.0);
+        Product cdm;
+        cdm.kind = ProductKind::CD;
+        cdm.name = "CD";
+        autoSplit(multi, cdm, nullptr);
+        CHECK(cdm.units.size() == 2 && cdm.units[0].fadeOut == 0);
+        auto m2 = multi.toDiscForUnit(cdm.units[1], 2, 2, lead, nullptr);
+        CHECK(std::abs(lead - 2.0) < 1e-9 && m2.tracks[0].text.title.find("(cont.)") == std::string::npos);
+        CHECK(!cd::hasErrors(cd::validate(m2)));
+        int onDiscs = int(m2.tracks.size()) + int(multi.toDiscForUnit(cdm.units[0], 1, 2, lead, nullptr).tracks.size());
+        CHECK(onDiscs == 30);
+
+        // Gaps between units are errors.
+        Product broken = cdp;
+        broken.units.getReference(1).start = broken.units[0].end + 3.0;
+        bool gapFound = false;
+        for (auto& i : validateProduct(live, broken)) gapFound = gapFound || (i.error && i.message.contains("Gap"));
+        CHECK(gapFound);
+
+        // Break audition: out unit's tail, flip gap, in unit's head.
+        cdp.flipGap = 1.5;
+        auto bp = makeBreakPlan(cdp, 0, 3.0, 3.0);
+        CHECK(std::abs(bp.a1 - cdp.units[0].end) < 1e-9 && std::abs(bp.a0 - (cdp.units[0].end - 8.0)) < 1e-9);
+        CHECK(std::abs(bp.length() - (8.0 + 1.5 + 8.0)) < 1e-9);
+        CHECK(bp.at(8.0 + 0.7).first < 0);                                   // in the flip gap
+        CHECK(std::abs(bp.at(8.0 + 1.5).first - cdp.units[1].start) < 1e-9 && bp.at(8.0 + 1.5).second < 1e-6);   // fade-in starts at 0
+
+        // PQ offset moves track starts earlier, but never track 1 under 2 s.
+        multi.pqOffsetFrames = 10;
+        juce::StringArray adj;
+        auto off = multi.toDisc(&adj);
+        multi.pqOffsetFrames = 0;
+        auto plain = multi.toDisc();
+        CHECK(off.tracks[0].startSector() == 150 && plain.tracks[0].startSector() == 150);
+        CHECK(off.tracks[5].startSector() == plain.tracks[5].startSector() - 10);
+        CHECK(adj.joinIntoString(" ").contains("PQ offset"));
+
+        // Persistence: products, release metadata and credits survive a save/load.
+        live.products.add(cdp);
+        live.products.getReference(0).id = live.nextId++;
+        live.products.getReference(0).catalogue = "LN-001CD";
+        live.label = "Night Label";
+        live.pLine = "2026 Night Label";
+        live.cdTextGenre = 5;
+        live.htoa = true;
+        live.pqOffsetFrames = 6;
+        live.markers.getReference(0).publisher = "Night Songs";
+        live.markers.getReference(0).pro = "ASCAP";
+        live.markers.getReference(0).explicitContent = true;
+        auto sf = dir.getChildFile("products.lathe");
+        juce::String err;
+        CHECK(live.save(sf, err));
+        Session back;
+        CHECK(back.load(sf, err));
+        CHECK(back.products.size() == 1 && back.products[0].units.size() == 3 && back.products[0].catalogue == "LN-001CD");
+        CHECK(std::abs(back.products[0].units[1].start - cdp.units[1].start) < 1e-9 && back.products[0].units[1].fadeIn == 5.0);
+        CHECK(back.label == "Night Label" && back.cdTextGenre == 5 && back.htoa && back.pqOffsetFrames == 6 && back.pLine == "2026 Night Label");
+        CHECK(back.markers[0].publisher == "Night Songs" && back.markers[0].pro == "ASCAP" && back.markers[0].explicitContent);
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

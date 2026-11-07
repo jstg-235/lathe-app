@@ -237,7 +237,70 @@ juce::String AudioEngine::matchDeviceRate(double rate) {
     return err;
 }
 
+BreakSource::BreakSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx, BreakPlan plan)
+    : r_(fm), plan_(plan), rate_(rate) {
+    r_.setRegionFx(fx);
+    r_.setSession(s, rate);
+}
+
+void BreakSource::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
+    info.clearActiveBufferRegion();
+    const juce::int64 aLen = juce::int64((plan_.a1 - plan_.a0) * rate_), gap = juce::int64(plan_.gap * rate_);
+    const juce::int64 bLen = juce::int64((plan_.b1 - plan_.b0) * rate_);
+    int done = 0;
+    while (done < info.numSamples) {
+        const juce::int64 p = pos_ + done;
+        int n = info.numSamples - done;
+        juce::int64 timeline = -1;
+        if (p < aLen) { n = int(juce::jmin<juce::int64>(n, aLen - p)); timeline = juce::int64(plan_.a0 * rate_) + p; }
+        else if (p < aLen + gap) { n = int(juce::jmin<juce::int64>(n, aLen + gap - p)); }
+        else if (p < aLen + gap + bLen) { n = int(juce::jmin<juce::int64>(n, aLen + gap + bLen - p)); timeline = juce::int64(plan_.b0 * rate_) + (p - aLen - gap); }
+        if (timeline >= 0) {
+            if (r_.position() != timeline) r_.seek(timeline);
+            if (dbl_.getNumSamples() < n) dbl_.setSize(2, n, false, false, true);
+            r_.render(dbl_, 0, n);
+            for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch) {
+                auto* d = info.buffer->getWritePointer(ch, info.startSample + done);
+                auto* src = dbl_.getReadPointer(juce::jmin(ch, 1));
+                for (int i = 0; i < n; ++i) d[i] = float(src[i]);
+            }
+        }
+        done += n;
+    }
+    pos_ += info.numSamples;
+}
+
+void AudioEngine::startBreakAudition(const Session& s, const BreakPlan& plan) {
+    stopBreakAudition();
+    transport_.stop();
+    sourceTransport_.stop();
+    playerTransport_.stop();
+    {
+        const juce::ScopedLock sl(breakLock_);
+        breakTransport_.setSource(nullptr);
+        breakBuffered_.reset();
+        breakPlan_ = plan;
+        breakSource_ = std::make_unique<BreakSource>(formats_, s, rate_, &fx_, plan);
+        breakBuffered_ = std::make_unique<juce::BufferingAudioSource>(breakSource_.get(), readAhead_, false, int(rate_ * 4), 2, true);
+        breakTransport_.setSource(breakBuffered_.get(), 0, nullptr, rate_, 2);
+        breakTransport_.prepareToPlay(block_, rate_);
+        breakTransport_.setPosition(0);
+    }
+    chain_.reset();
+    breakTransport_.start();
+}
+
+void AudioEngine::stopBreakAudition() {
+    breakTransport_.stop();
+}
+
+double AudioEngine::breakAuditionTimeline() const {
+    if (!breakTransport_.isPlaying()) return -1;
+    return breakPlan_.at(breakTransport_.getCurrentPosition()).first;
+}
+
 void AudioEngine::play() {
+    breakTransport_.stop();
     sourceTransport_.stop();
     playerTransport_.stop();
     if (transport_.getCurrentPosition() >= transport_.getLengthInSeconds() - 0.01) transport_.setPosition(0);
@@ -247,6 +310,7 @@ void AudioEngine::play() {
 
 void AudioEngine::stop() {
     transport_.stop();
+    breakTransport_.stop();
     refTransport_.stop();
 }
 
@@ -269,6 +333,7 @@ void AudioEngine::prepareToPlay(int block, double rate) {
     sourceTransport_.prepareToPlay(block, rate);
     refTransport_.prepareToPlay(block, rate);
     playerTransport_.prepareToPlay(block, rate);
+    breakTransport_.prepareToPlay(block, rate);
     sourceBuf_.setSize(2, juce::jmax(block, 8192));
     refBuf_.setSize(2, juce::jmax(block, 8192));
     inBuf_.setSize(2, juce::jmax(block, 8192));
@@ -281,6 +346,7 @@ void AudioEngine::releaseResources() {
     sourceTransport_.releaseResources();
     refTransport_.releaseResources();
     playerTransport_.releaseResources();
+    breakTransport_.releaseResources();
     chain_.release();
 }
 
@@ -337,6 +403,22 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
             // DDP player: the image exactly as the plant will press it.
             playerTransport_.getNextAudioBlock(info);
             tap_.push(*info.buffer, info.startSample, info.numSamples);
+            return;
+        }
+    }
+    {
+        const juce::ScopedTryLock bsl(breakLock_);
+        if (bsl.isLocked() && breakBuffered_ && breakTransport_.isPlaying()) {
+            // Break audition: master chain, then each unit's own fade, as the render does it.
+            const juce::int64 p0 = breakTransport_.getNextReadPosition();
+            breakTransport_.getNextAudioBlock(info);
+            chain_.process(*info.buffer, info.startSample, info.numSamples);
+            for (int i = 0; i < info.numSamples; ++i) {
+                const float g = float(breakPlan_.at(double(p0 + i) / rate_).second);
+                for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch) info.buffer->getWritePointer(ch, info.startSample)[i] *= g;
+            }
+            tap_.push(*info.buffer, info.startSample, info.numSamples);
+            if (p0 + info.numSamples >= breakTransport_.getTotalLength()) breakTransport_.stop();
             return;
         }
     }

@@ -52,8 +52,17 @@ char Track::controlNibble() const {
     return "0123456789ABCDEF"[v];
 }
 
+std::string genreName(int code) {
+    static const char* names[kGenreCount] = {
+        "", "Not defined", "Adult Contemporary", "Alternative Rock", "Children's Music", "Classical",
+        "Contemporary Christian", "Country", "Dance", "Easy Listening", "Erotic", "Folk", "Gospel", "Hip Hop",
+        "Jazz", "Latin", "Musical", "New Age", "Opera", "Operetta", "Pop Music", "Rap", "Reggae", "Rock Music",
+        "Rhythm & Blues", "Sound Effects", "Spoken Word", "World Music"};
+    return code >= 0 && code < kGenreCount ? names[code] : std::string();
+}
+
 bool Disc::hasCdText() const {
-    if (!text.empty()) return true;
+    if (!text.empty() || !discId.empty() || genreCode > 0 || !genreText.empty()) return true;
     for (auto& t : tracks)
         if (!t.text.empty()) return true;
     return false;

@@ -31,6 +31,8 @@ enum : juce::CommandID {
     listenReference, compareUnprocessed, toggleLoudness, ddpPlayer, openDdpSession, controlSurfaces,
     // Help
     keyGuide = 0x1700, editKeyCommands,
+    // Delivery
+    products = 0x1800, breakEditor, releaseInfo, trackCredits, studioProfile, exportPaperwork,
 };
 }  // namespace cmd
 

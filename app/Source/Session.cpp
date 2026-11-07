@@ -342,19 +342,15 @@ void Session::moveMarker(int id, double t) {
 
 static int64_t toSector(double sec) { return int64_t(std::llround(sec * cd::kFramesPerSecond)); }
 
-cd::Disc Session::toDisc(juce::StringArray* adj) const {
-    cd::Disc d;
-    d.upcEan = upcEan.retainCharacters("0123456789").toStdString();
-    d.masterId = masterId.toStdString();
-    d.text.title = discTitle.toStdString();
-    d.text.performer = discPerformer.toStdString();
-    d.leadOutSector = int64_t(std::ceil(end() * cd::kFramesPerSecond - 1e-6));
+namespace {
 
-    Session s = *this;
-    s.sortMarkers();
+// Builds a Red Book disc from sorted markers whose times are already relative to the disc.
+cd::Disc buildDisc(const juce::Array<Marker>& ms, double lengthSec, int offsetFrames, juce::StringArray* adj) {
+    cd::Disc d;
+    d.leadOutSector = int64_t(std::ceil(lengthSec * cd::kFramesPerSecond - 1e-6));
     double pendingPause = -1;
     int skippedIndexes = 0;
-    for (auto& m : s.markers) {
+    for (auto& m : ms) {
         if (m.type == Marker::PauseStart) { pendingPause = m.t; continue; }
         if (m.type == Marker::EndOfDisc) continue;
         if (m.type == Marker::Index) {
@@ -384,7 +380,120 @@ cd::Disc Session::toDisc(juce::StringArray* adj) const {
         d.tracks.push_back(t);
     }
     if (adj && skippedIndexes) adj->add(juce::String(skippedIndexes) + " index marker(s) outside a track were skipped.");
+
+    // PQ offset: move each track start (index 01) earlier so slow transports don't clip the
+    // first notes. Never past the track's own pause, the previous track's last index, or
+    // (track 1) the 2-second minimum pregap.
+    if (offsetFrames > 0) {
+        int clamped = 0;
+        for (size_t ti = 0; ti < d.tracks.size(); ++ti) {
+            auto& t = d.tracks[ti];
+            for (size_t k = 0; k < t.indexes.size(); ++k) {
+                if (t.indexes[k].number != 1) continue;
+                int64_t floor = ti == 0 ? 2 * cd::kFramesPerSecond : d.tracks[ti - 1].indexes.back().sector + 1;
+                if (k > 0) floor = juce::jmax(floor, t.indexes[k - 1].sector + 1);
+                int64_t want = t.indexes[k].sector - offsetFrames;
+                if (want < floor) { want = juce::jmin(t.indexes[k].sector, floor); ++clamped; }
+                t.indexes[k].sector = want;
+            }
+        }
+        if (adj) {
+            adj->add("PQ offset: track starts moved " + juce::String(offsetFrames) + " frame(s) earlier.");
+            if (clamped) adj->add(juce::String(clamped) + " track start(s) couldn't take the full offset (pregap or previous marker in the way).");
+        }
+    }
     return d;
+}
+
+}  // namespace
+
+cd::Disc Session::toDisc(juce::StringArray* adj) const {
+    Session s = *this;
+    s.sortMarkers();
+    cd::Disc d = buildDisc(s.markers, end(), pqOffsetFrames, adj);
+    d.upcEan = upcEan.retainCharacters("0123456789").toStdString();
+    d.masterId = (masterId.isNotEmpty() ? masterId : catalogue).toStdString();
+    d.text.title = discTitle.toStdString();
+    d.text.performer = discPerformer.toStdString();
+    d.discId = cdTextDiscId.toStdString();
+    d.genreCode = cdTextGenre;
+    d.genreText = genreText.toStdString();
+    if (adj && !d.tracks.empty()) {
+        int64_t pre = d.tracks[0].startSector();
+        if (htoa && pre > 2 * cd::kFramesPerSecond)
+            adj->add("Hidden track one audio: " + juce::String(cd::Msf::fromSectors(pre).str()) + " of audio before track 1.");
+        else if (!htoa && pre > 3 * cd::kFramesPerSecond)
+            adj->add("Track 1 pregap is " + juce::String(cd::Msf::fromSectors(pre).str()) + "; turn on HTOA if audio there is intended.");
+    }
+    return d;
+}
+
+cd::Disc Session::toDiscForUnit(const Unit& u, int unitNumber, int unitCount, double& lead, juce::StringArray* notes) const {
+    Session s = *this;
+    s.sortMarkers();
+    const Marker* current = nullptr;   // track playing at the unit's start
+    juce::Array<Marker> inside;
+    for (auto& m : s.markers) {
+        if (m.type == Marker::EndOfDisc) continue;
+        if (m.t <= u.start + 1e-6 && m.type == Marker::TrackStart) current = &m;
+        if (m.t >= u.start - 1e-6 && m.t < u.end - 1e-6) inside.add(m);
+    }
+    double firstTrack = -1;
+    for (auto& m : inside)
+        if (m.type == Marker::TrackStart) { firstTrack = m.t - u.start; break; }
+
+    // The unit starts inside a track's audio when no track starts within 4 s (Red Book minimum).
+    const bool continued = current != nullptr && (firstTrack < 0 || firstTrack >= 4.0) && current->t < u.start - 1e-6;
+    if (continued) {
+        Marker c = *current;
+        c.id = 0;
+        c.t = u.start;
+        c.text.title = (juce::String::fromUTF8(c.text.title.c_str()) + " (cont.)").toStdString();
+        inside.insert(0, c);
+        firstTrack = 0;
+        if (notes) notes->add("Disc " + juce::String(unitNumber) + " starts mid-track: \"" + juce::String::fromUTF8(c.text.title.c_str()) +
+                              "\" added as track 1" + (c.isrc.empty() ? juce::String() : " (ISRC reused)") + ".");
+    }
+    // Remove anything before the first track (index/pause markers in the pre-roll).
+    while (!inside.isEmpty() && inside.getFirst().type != Marker::TrackStart) inside.remove(0);
+
+    lead = firstTrack < 0 ? 2.0 : juce::jmax(0.0, 2.0 - firstTrack);
+    lead = std::ceil(lead * cd::kFramesPerSecond - 1e-9) / cd::kFramesPerSecond;
+    for (auto& m : inside) m.t = m.t - u.start + lead;
+
+    cd::Disc d = buildDisc(inside, u.length() + lead, pqOffsetFrames, notes);
+    d.upcEan = upcEan.retainCharacters("0123456789").toStdString();
+    auto id = masterId.isNotEmpty() ? masterId : catalogue;
+    if (unitCount > 1 && id.isNotEmpty()) id << "-D" << unitNumber;
+    d.masterId = id.substring(0, 48).toStdString();
+    auto title = discTitle;
+    if (unitCount > 1 && title.isNotEmpty()) title << " (Disc " << unitNumber << ")";
+    d.text.title = title.toStdString();
+    d.text.performer = discPerformer.toStdString();
+    d.discId = cdTextDiscId.toStdString();
+    d.genreCode = cdTextGenre;
+    d.genreText = genreText.toStdString();
+    return d;
+}
+
+Product* Session::findProduct(int id) {
+    for (auto& p : products)
+        if (p.id == id) return &p;
+    return nullptr;
+}
+
+const ProductSpec& productSpec(ProductKind k) {
+    // Targets are conservative cutting/duplication norms; hard limits are what can be made at all.
+    static const ProductSpec specs[] = {
+        {"CD", "Disc", 79 * 60 + 40, 79 * 60 + 57, false, true},
+        {"12\" LP (33 1/3)", "Side", 22 * 60, 26 * 60, true, false},
+        {"12\" (45)", "Side", 12 * 60, 15 * 60, true, false},
+        {"10\" (33 1/3)", "Side", 14 * 60, 16 * 60, true, false},
+        {"7\" (45)", "Side", 5 * 60, 7 * 60, true, false},
+        {"Cassette", "Side", 30 * 60, 60 * 60, true, false},
+    };
+    int i = juce::jlimit(0, int(ProductKind::kCount) - 1, int(k));
+    return specs[i];
 }
 
 // ---- persistence ------------------------------------------------------------------
@@ -462,6 +571,9 @@ juce::var Session::toVar() const {
         o->setProperty("pre", m.preEmphasis);
         o->setProperty("scms", m.scms);
         o->setProperty("text", textToVar(m.text));
+        if (!m.publisher.empty()) o->setProperty("publisher", juce::String::fromUTF8(m.publisher.c_str()));
+        if (!m.pro.empty()) o->setProperty("pro", juce::String::fromUTF8(m.pro.c_str()));
+        if (m.explicitContent) o->setProperty("explicit", true);
         ml.add(o);
     }
     root->setProperty("markers", ml);
@@ -478,6 +590,37 @@ juce::var Session::toVar() const {
     root->setProperty("activeReference", activeReference);
     root->setProperty("levelMatchReference", levelMatchReference);
     root->setProperty("loudnessTarget", loudnessTarget);
+    auto* meta = new juce::DynamicObject();
+    meta->setProperty("label", label);
+    meta->setProperty("catalogue", catalogue);
+    meta->setProperty("releaseDate", releaseDate);
+    meta->setProperty("pLine", pLine);
+    meta->setProperty("cLine", cLine);
+    meta->setProperty("genreText", genreText);
+    meta->setProperty("notes", notes);
+    meta->setProperty("cdTextDiscId", cdTextDiscId);
+    meta->setProperty("cdTextGenre", cdTextGenre);
+    meta->setProperty("pqOffsetFrames", pqOffsetFrames);
+    meta->setProperty("htoa", htoa);
+    root->setProperty("release", meta);
+    juce::Array<juce::var> pl;
+    for (auto& p : products) {
+        auto* o = new juce::DynamicObject();
+        o->setProperty("id", p.id);
+        o->setProperty("kind", int(p.kind));
+        o->setProperty("name", p.name);
+        o->setProperty("catalogue", p.catalogue);
+        o->setProperty("upc", p.upc);
+        o->setProperty("maxUnit", p.maxUnit);
+        o->setProperty("flipGap", p.flipGap);
+        o->setProperty("evenUnits", p.evenUnits);
+        juce::Array<juce::var> ul;
+        for (auto& u : p.units)
+            ul.add(juce::Array<juce::var>{u.start, u.end, u.fadeIn, u.fadeOut, int(u.inShape), int(u.outShape)});
+        o->setProperty("units", ul);
+        pl.add(o);
+    }
+    root->setProperty("products", pl);
     return root;
 }
 
@@ -583,6 +726,46 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     if (activeReference >= references.size()) activeReference = -1;
     levelMatchReference = v.hasProperty("levelMatchReference") ? bool(v["levelMatchReference"]) : true;
     loudnessTarget = v.hasProperty("loudnessTarget") ? double(v["loudnessTarget"]) : -14.0;
+    {
+        auto meta = v["release"];
+        label = meta["label"].toString();
+        catalogue = meta["catalogue"].toString();
+        releaseDate = meta["releaseDate"].toString();
+        pLine = meta["pLine"].toString();
+        cLine = meta["cLine"].toString();
+        genreText = meta["genreText"].toString();
+        notes = meta["notes"].toString();
+        cdTextDiscId = meta["cdTextDiscId"].toString();
+        cdTextGenre = juce::jlimit(0, cd::kGenreCount - 1, int(meta["cdTextGenre"]));
+        pqOffsetFrames = juce::jlimit(0, 75, int(meta["pqOffsetFrames"]));
+        htoa = bool(meta["htoa"]);
+    }
+    products.clear();
+    if (auto* arr = v["products"].getArray())
+        for (auto& o : *arr) {
+            Product p;
+            p.id = int(o["id"]);
+            p.kind = ProductKind(juce::jlimit(0, int(ProductKind::kCount) - 1, int(o["kind"])));
+            p.name = o["name"].toString();
+            p.catalogue = o["catalogue"].toString();
+            p.upc = o["upc"].toString();
+            p.maxUnit = double(o["maxUnit"]);
+            p.flipGap = o.hasProperty("flipGap") ? double(o["flipGap"]) : 2.0;
+            p.evenUnits = o.hasProperty("evenUnits") ? bool(o["evenUnits"]) : true;
+            if (auto* ul = o["units"].getArray())
+                for (auto& u : *ul) {
+                    Unit x;
+                    x.start = double(u[0]);
+                    x.end = double(u[1]);
+                    x.fadeIn = double(u[2]);
+                    x.fadeOut = double(u[3]);
+                    x.inShape = FadeShape(juce::jlimit(0, 4, int(u[4])));
+                    x.outShape = FadeShape(juce::jlimit(0, 4, int(u[5])));
+                    p.units.add(x);
+                }
+            nextId = juce::jmax(nextId, p.id + 1);
+            products.add(p);
+        }
     if (auto* arr = v["markers"].getArray()) {
         for (auto& o : *arr) {
             Marker m;
@@ -595,6 +778,9 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             m.preEmphasis = bool(o["pre"]);
             m.scms = bool(o["scms"]);
             m.text = textFromVar(o["text"]);
+            m.publisher = o["publisher"].toString().toStdString();
+            m.pro = o["pro"].toString().toStdString();
+            m.explicitContent = bool(o["explicit"]);
             nextId = juce::jmax(nextId, m.id + 1);
             markers.add(m);
         }

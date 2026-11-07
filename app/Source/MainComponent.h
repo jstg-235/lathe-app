@@ -5,6 +5,7 @@
 #include "ControlSurface.h"
 #include "DdpFormat.h"
 #include "DdpPlayer.h"
+#include "DeliveryPanels.h"
 #include "Restore.h"
 #include "Commands.h"
 #include "EditPanels.h"
@@ -129,6 +130,17 @@ private:
     double referenceGainDb(juce::String* explain = nullptr) const;
     double masterLoudnessAt(double t) const;
     void showBatchDialog();
+    // Delivery
+    void showProducts();
+    void openBreakEditor(int productId, int breakIndex);
+    void breakNearPlayhead();
+    void showReleaseInfo();
+    void showTrackCredits();
+    void showStudioProfile();
+    void exportPaperworkOnly();
+    void saveStudio();
+    void refreshDeliveryPanels();
+    DeliveryData previewDelivery() const;
     int markerRowToTrackNumber(int row) const;
 
     Session session_;
@@ -182,6 +194,12 @@ private:
     std::unique_ptr<ControlSurface> surface_;
     std::unique_ptr<juce::DocumentWindow> restoreWindow_, spectralWindow_;
     std::shared_ptr<dsp::NoiseProfile> noise_;
+    StudioProfile studio_;
+    std::unique_ptr<juce::DocumentWindow> productsWindow_, breakWindow_, releaseWindow_, creditsWindow_, studioWindow_;
+    juce::Component::SafePointer<ProductsPanel> productsPanel_;
+    juce::Component::SafePointer<BreakEditor> breakEditor_;
+    juce::Component::SafePointer<ReleaseInfoPanel> releasePanel_;
+    juce::Component::SafePointer<TrackCreditsPanel> creditsPanel_;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

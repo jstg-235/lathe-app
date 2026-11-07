@@ -22,6 +22,26 @@ run your AU/VST3 mastering chain, and deliver a verified DDP 2.0 image for repli
 Signal path on export: clips → plugin chain at project rate → r8brain SRC to 44.1 kHz →
 TPDF dither (flat, light or strong noise shaping) → 16-bit.
 
+## Products and delivery paperwork (v0.8)
+
+- **Products & Splitting** (Delivery menu): cut one programme into CDs, 12"/10"/7" vinyl sides or
+  cassette sides. Each unit is a window on the timeline with its own fade-in and fade-out, applied
+  after the master chain and before dither, to that unit only; the full programme still renders as
+  one piece for digital delivery. Units may overlap so music can fade out at the end of side A and
+  fade back in on side B.
+- **Auto-Split** balances unit lengths under each format's limit, breaking at track starts where it
+  can and at the quietest moment near the ideal point where it can't (run Analyse first).
+- **Break Editor** (K): the outgoing unit's fade-out and the incoming unit's fade-in over the
+  waveform, draggable, with an audition that plays through the flip gap (or no gap).
+- **Rendering**: a verified DDP per disc (a "(cont.)" track reusing the ISRC when a disc starts
+  mid-track, 2 s pregap added automatically, -D1/-D2 master IDs) and a hi-res WAV per side.
+- **Paperwork**: CD PQ sheet per disc, cutting / duplication sheet per side, label copy and a
+  delivery manifest (every file with size and MD5), as PDFs with the studio name, contact details
+  and logo, plus Track Metadata.csv and Delivery.json.
+- **Metadata**: Release Info (label, catalogue, release date, (P)/(C), CD-Text genre and disc ID,
+  PQ offset, hidden track one audio) and Track Credits (writers, arranger, publisher, PRO, explicit).
+  CD-Text now includes packs 0x86 (disc ID), 0x87 (genre) and 0x8E (UPC/ISRC).
+
 ## Stability by design
 
 - Audio is streamed from disk on a background thread; the audio callback never touches the disk.
@@ -32,7 +52,7 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
 
 ## Not yet
 
-CD-R burning, DDP playback, spectral repair/noise reduction, and 0x8E (UPC/ISRC) CD-Text packs.
+CD-R burning, Japanese (MS-JIS) CD-Text, and a sign-off sheet.
 
 ## Building
 

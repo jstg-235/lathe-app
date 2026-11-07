@@ -54,16 +54,20 @@ CdTextResult encodeCdText(const Disc& disc) {
     std::array<int, 16> packCount{};   // per type 0x80..0x8F
     std::vector<std::array<uint8_t, 16>> raw;  // header + payload, CRC added at the end
 
-    for (int type = 0x80; type <= 0x85; ++type) {
-        bool present = !field(disc.text, type).empty();
-        for (auto& t : disc.tracks) present = present || !field(t.text, type).empty();
-        if (!present) continue;
-
-        // Concatenate the disc string then each track string, NUL-terminated, remembering
-        // which track owns each byte so the header bytes can be filled in.
+    // Text packs: 0x80-0x85 (disc + per-track strings), 0x86 disc ID and 0x87 genre (disc
+    // only), 0x8E UPC/EAN + ISRC (disc + per-track).
+    const int types[] = {0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x8E};
+    for (int type : types) {
         std::string bytes;
         std::vector<int> owner;
         std::vector<int> posInString;
+        auto addRaw = [&](const std::string& latin, int trackNo) {
+            for (size_t i = 0; i < latin.size(); ++i) {
+                bytes += latin[i];
+                owner.push_back(trackNo);
+                posInString.push_back(int(i));
+            }
+        };
         auto add = [&](const std::string& utf8, int trackNo, const char* what) -> bool {
             std::string latin;
             if (!utf8ToLatin1(utf8, latin)) {
@@ -71,17 +75,42 @@ CdTextResult encodeCdText(const Disc& disc) {
                 return false;
             }
             latin += '\0';
-            for (size_t i = 0; i < latin.size(); ++i) {
-                bytes += latin[i];
-                owner.push_back(trackNo);
-                posInString.push_back(int(i));
-            }
+            addRaw(latin, trackNo);
             return true;
         };
-        if (!add(field(disc.text, type), 0, "Disc text")) return res;
-        for (size_t ti = 0; ti < disc.tracks.size(); ++ti)
-            if (!add(field(disc.tracks[ti].text, type), int(ti + 1), ("Track " + std::to_string(ti + 1) + " text").c_str()))
-                return res;
+
+        if (type <= 0x85) {
+            bool present = !field(disc.text, type).empty();
+            for (auto& t : disc.tracks) present = present || !field(t.text, type).empty();
+            if (!present) continue;
+            // Concatenate the disc string then each track string, NUL-terminated, remembering
+            // which track owns each byte so the header bytes can be filled in.
+            if (!add(field(disc.text, type), 0, "Disc text")) return res;
+            for (size_t ti = 0; ti < disc.tracks.size(); ++ti)
+                if (!add(field(disc.tracks[ti].text, type), int(ti + 1), ("Track " + std::to_string(ti + 1) + " text").c_str()))
+                    return res;
+        } else if (type == 0x86) {
+            if (disc.discId.empty()) continue;
+            if (!add(disc.discId, 0, "Disc ID")) return res;
+        } else if (type == 0x87) {
+            if (disc.genreCode <= 0 && disc.genreText.empty()) continue;
+            std::string latin;
+            if (!utf8ToLatin1(disc.genreText, latin)) { res.error = "Genre text contains a character CD-Text can't show (Latin-1 only)."; return res; }
+            int code = disc.genreCode > 0 ? disc.genreCode : 1;
+            std::string g;
+            g += char((code >> 8) & 0xFF);
+            g += char(code & 0xFF);
+            g += latin;
+            g += '\0';
+            addRaw(g, 0);
+        } else {   // 0x8E
+            if (!disc.codesInCdText) continue;
+            bool present = !disc.upcEan.empty();
+            for (auto& t : disc.tracks) present = present || !t.isrc.empty();
+            if (!present) continue;
+            addRaw(disc.upcEan + std::string(1, '\0'), 0);
+            for (size_t ti = 0; ti < disc.tracks.size(); ++ti) addRaw(disc.tracks[ti].isrc + std::string(1, '\0'), int(ti + 1));
+        }
 
         for (size_t off = 0; off < bytes.size(); off += 12) {
             std::array<uint8_t, 16> p{};

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "AudioEngine.h"
+#include "Products.h"
 #include "Session.h"
 
 #include "../../core/ddp/Ddp.h"
@@ -32,6 +33,37 @@ struct BatchSettings {
     bool wavHi = true;      // per-track hi-res WAV at the project rate
     bool flacHi = false;    // per-track hi-res FLAC at the project rate, tagged
     bool programme = false; // one hi-res WAV of the whole programme
+    bool products = true;   // each product's units: a DDP per CD, a hi-res file per vinyl/tape side
+    bool paperwork = true;  // PQ sheets, cutting sheets, label copy, manifest (PDF + CSV + JSON)
+    int hiBits = 24;
+};
+
+// One rendered unit (a CD of a multi-disc set, an LP side), for the paperwork.
+struct UnitRender {
+    int product = 0, unit = 0;          // indexes into Session::products / Product::units
+    juce::String label, longLabel;      // "Side C", "Record 2, Side C"
+    Unit window;
+    cd::Disc disc;                      // CD units: the disc as written
+    double lead = 0;                    // CD units: seconds of pregap added in front
+    juce::StringArray notes;
+    juce::String path;                  // relative: DDP folder or side file
+    double rate = 44100;
+    int bits = 16;
+    double lufs = -INFINITY, truePeakDb = -INFINITY;
+    bool verified = false;
+    juce::String imageMd5;
+};
+
+// Everything the paperwork needs from a render.
+struct DeliveryData {
+    cd::Disc disc;                      // the full-programme disc
+    juce::StringArray discNotes;
+    bool fullDdp = false, ddpVerified = false;
+    QcReport qc;
+    std::vector<UnitRender> units;
+    juce::StringArray files;            // every deliverable, relative to the output folder
+    juce::String settingsText, dither;
+    double hiRate = 0;
     int hiBits = 24;
 };
 
@@ -41,6 +73,7 @@ struct BatchResult {
     juce::StringArray files;     // relative to the output folder
     juce::String report;         // also written as Render Report.txt
     bool ddpVerified = false;
+    DeliveryData delivery;
 };
 
 struct ExportSettings {

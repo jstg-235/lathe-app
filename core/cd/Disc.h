@@ -58,6 +58,10 @@ struct Disc {
     std::string upcEan;     // 13-digit EAN-13 or 12-digit UPC-A, or empty
     std::string masterId;   // free text, max 48 chars, not written to disc
     CdText text;            // disc-level CD-Text
+    std::string discId;     // CD-Text pack 0x86 (usually the catalogue number), disc only
+    int genreCode = 0;      // CD-Text pack 0x87 genre code (0 = none, 1 = not used, 2..27 = see genreName)
+    std::string genreText;  // supplementary genre text in pack 0x87
+    bool codesInCdText = true;  // also write UPC/EAN and ISRCs as CD-Text pack 0x8E
     std::vector<Track> tracks;
     int64_t leadOutSector = 0;  // total program length in sectors
 
@@ -75,6 +79,9 @@ bool hasErrors(const std::vector<Issue>& issues);
 
 // Helpers exposed for tests and the UI.
 bool isValidIsrc(const std::string& isrc);
+// CD-Text genre names for codes 0..27 (Red Book / MMC list); empty for unknown codes.
+std::string genreName(int code);
+constexpr int kGenreCount = 28;
 bool isValidUpcEan(const std::string& code, bool* checkDigitOk = nullptr);
 std::string normaliseIsrc(std::string isrc);   // strips dashes/spaces, uppercases
 

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "PluginChain.h"
+#include "Products.h"
 #include "ProgramRenderer.h"
 #include "Session.h"
 
@@ -36,6 +37,26 @@ public:
     bool isLooping() const override { return false; }
 private:
     ProgramRenderer r_;
+    juce::AudioBuffer<double> dbl_{2, 8192};
+};
+
+// Break audition source: the end of one unit, the flip gap, then the top of the next, as
+// one continuous stream (so the read-ahead buffer makes the jump seamless).
+class BreakSource : public juce::PositionableAudioSource {
+public:
+    BreakSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx, BreakPlan plan);
+    void prepareToPlay(int, double) override {}
+    void releaseResources() override {}
+    void getNextAudioBlock(const juce::AudioSourceChannelInfo& info) override;
+    void setNextReadPosition(juce::int64 p) override { pos_ = p; }
+    juce::int64 getNextReadPosition() const override { return pos_; }
+    juce::int64 getTotalLength() const override { return juce::int64(plan_.length() * rate_); }
+    bool isLooping() const override { return false; }
+private:
+    ProgramRenderer r_;
+    BreakPlan plan_;
+    double rate_;
+    juce::int64 pos_ = 0;
     juce::AudioBuffer<double> dbl_{2, 8192};
 };
 
@@ -110,6 +131,14 @@ public:
     void setPlayerPosition(double s) { playerTransport_.setPosition(s); }
     void clearPlayer();
 
+    // ---- Break audition: unit k's tail (with its fade), the flip gap, unit k+1's head ----
+    // Plays through the master chain; unit fades are applied after it, as in the render.
+    void startBreakAudition(const Session& s, const BreakPlan& plan);
+    void stopBreakAudition();
+    bool isAuditioningBreak() const { return breakTransport_.isPlaying(); }
+    // Timeline seconds being heard, or -1 during the flip gap / when stopped.
+    double breakAuditionTimeline() const;
+
     // ---- Reference track A/B (plays alongside the master; switching crossfades in 10 ms) ----
     bool loadReference(const juce::File& f);
     void clearReference();
@@ -152,6 +181,11 @@ private:
     juce::AudioTransportSource sourceTransport_;
     juce::AudioTransportSource refTransport_;
     juce::AudioTransportSource playerTransport_;
+    juce::AudioTransportSource breakTransport_;
+    std::unique_ptr<BreakSource> breakSource_;
+    std::unique_ptr<juce::BufferingAudioSource> breakBuffered_;
+    BreakPlan breakPlan_;
+    juce::CriticalSection breakLock_;
     std::unique_ptr<juce::AudioFormatReaderSource> playerReader_;
     juce::CriticalSection playerLock_;
     std::unique_ptr<juce::AudioFormatReaderSource> refReader_;

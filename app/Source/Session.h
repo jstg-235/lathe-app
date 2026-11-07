@@ -54,6 +54,44 @@ struct Marker {
     std::string isrc;
     bool copyPermitted = false, preEmphasis = false, scms = false;
     cd::CdText text;
+    // Label-copy credits (paperwork and tags only, not written to the disc)
+    std::string publisher, pro;
+    bool explicitContent = false;
+};
+
+// ---- Products: the same programme cut into physical units (CDs, LP sides, tape sides) ----
+enum class ProductKind { CD = 0, LP12_33, LP12_45, LP10_33, Single7_45, Cassette, kCount };
+
+struct ProductSpec {
+    const char* name;        // "CD", "12\" LP (33 1/3)"
+    const char* unitNoun;    // "Disc", "Side"
+    double target;           // recommended maximum per unit, seconds
+    double hardMax;          // beyond this the unit can't be made
+    bool sides;              // units come in pairs (A/B) on one physical item
+    bool cdFormat;           // 44.1 kHz / 16-bit DDP per unit; otherwise hi-res side files
+};
+const ProductSpec& productSpec(ProductKind k);
+
+// One unit is a window on the timeline with its own fades. Fades belong to the unit only:
+// the full programme (digital delivery) is untouched. Neighbouring units may overlap, so
+// music can fade out at the end of side A and fade back in at the top of side B.
+struct Unit {
+    double start = 0, end = 0;          // timeline seconds, [start, end)
+    double fadeIn = 0, fadeOut = 0;     // seconds, inside the window
+    FadeShape inShape = FadeShape::EqualPower, outShape = FadeShape::EqualPower;
+    double length() const { return end - start; }
+};
+
+struct Product {
+    int id = 0;
+    ProductKind kind = ProductKind::CD;
+    juce::String name;          // e.g. "CD", "LP"; shown on paperwork
+    juce::String catalogue, upc;   // per product (the CD and the LP usually have different numbers)
+    double maxUnit = 0;         // per-unit limit used by auto-split (0 = the spec's target)
+    double flipGap = 2.0;       // break audition: silence between units (0 = no gap)
+    bool evenUnits = true;      // vinyl/cassette: always an even number of sides
+    juce::Array<Unit> units;
+    double limit() const { return maxUnit > 0 ? maxUnit : productSpec(kind).target; }
 };
 
 // Effective fade lengths after automatic crossfades, per region index.
@@ -80,6 +118,12 @@ public:
     juce::Array<Marker> markers;
     int lanes = 2;
     juce::String discTitle, discPerformer, upcEan, masterId, client, engineer;
+    // Release metadata for paperwork, CD-Text and tags
+    juce::String label, catalogue, releaseDate, pLine, cLine, genreText, notes, cdTextDiscId;
+    int cdTextGenre = 0;          // CD-Text genre code (0 = none)
+    int pqOffsetFrames = 0;       // track starts are moved earlier by this many CD frames on delivery
+    bool htoa = false;            // hidden track one audio: audio before track 1 index 01 is intended
+    juce::Array<Product> products;
     double projectRate = 0;                 // 0 = follow the first region's rate
     juce::MemoryBlock pluginChainState;
     juce::File file;
@@ -121,8 +165,14 @@ public:
     void removeMarker(int id);
     void moveMarker(int id, double t);
 
-    // Converts markers to a Red Book disc (index positions rounded to CD frames).
+    // Converts markers to a Red Book disc (index positions rounded to CD frames, PQ offset
+    // applied to track starts).
     cd::Disc toDisc(juce::StringArray* adjustments = nullptr) const;
+    // The disc for one CD unit: markers inside the unit's window, re-timed to the unit, with
+    // a pregap added in front and a "(cont.)" track when the unit starts mid-track (it reuses
+    // the track's ISRC). `leadSeconds` is the silence added before the window's audio.
+    cd::Disc toDiscForUnit(const Unit& u, int unitNumber, int unitCount, double& leadSeconds, juce::StringArray* notes = nullptr) const;
+    Product* findProduct(int id);
     // Each CD track's [start, end) in seconds (index 01 to next track's index 01 / end).
     juce::Array<juce::Range<double>> trackRanges() const;
 

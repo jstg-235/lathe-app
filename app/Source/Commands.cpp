@@ -17,6 +17,13 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::exportProgram32, "Export Programme WAV (32-bit float)...", "File", "The whole programme at the project rate, 32-bit float", ""},
         {cmd::batchRender, "Render Album (Batch)...", "File", "DDP plus WAV / FLAC deliverables in one go, with a QC and checksum report", "command + R"},
         // Edit
+        // Delivery
+        {cmd::products, "Products & Splitting...", "Delivery", "Cut the programme into CDs, LP sides or tape sides, each with its own fades", "command + shift + U"},
+        {cmd::breakEditor, "Break Editor", "Delivery", "Edit the side / disc break nearest the playhead: fades, overlap and flip audition", "K"},
+        {cmd::releaseInfo, "Release Info...", "Delivery", "Label, catalogue number, release date, (P)/(C), CD-Text genre and disc ID, PQ offset, HTOA", "command + shift + I"},
+        {cmd::trackCredits, "Track Credits...", "Delivery", "Per-track writers, arranger, publisher, PRO, explicit flag and CD-Text message", "command + shift + T"},
+        {cmd::studioProfile, "Studio Profile...", "Delivery", "Studio name, contact details and logo for the paperwork", ""},
+        {cmd::exportPaperwork, "Export Paperwork...", "Delivery", "PQ sheets, cutting sheets, label copy and manifest from the session (no render)", "command + option + P"},
         {cmd::undo, "Undo", "Edit", "Undo the last change", "command + Z"},
         {cmd::redo, "Redo", "Edit", "Redo the last undone change", "command + shift + Z"},
         {cmd::splitAtPlayhead, "Split at Playhead", "Edit", "Cut the selected region (or all regions under the playhead) in two", "B"},

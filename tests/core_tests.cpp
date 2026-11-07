@@ -6,6 +6,7 @@
 #include "../core/dsp/Meters.h"
 #include "../core/dsp/Restoration.h"
 #include "../core/util/Hash.h"
+#include "../core/doc/Pdf.h"
 
 #include <cmath>
 #include <cstdio>
@@ -503,6 +504,85 @@ static void testRestoration() {
     }
 }
 
+
+static void testCdTextExtras() {
+    using namespace lathe;
+    cd::Disc d;
+    d.upcEan = "0123456789012";
+    d.text.title = "Album";
+    d.discId = "CAT-001";
+    d.genreCode = 14;
+    d.genreText = "Modal";
+    cd::Track t;
+    t.indexes = {{0, 0}, {1, 150}};
+    t.isrc = "USABC2600001";
+    t.text.title = "Song";
+    d.tracks.push_back(t);
+    d.leadOutSector = 75 * 60;
+    auto r = cd::encodeCdText(d);
+    CHECK(r.error.empty() && r.packs.size() % 18 == 0);
+    int n86 = 0, n87 = 0, n8e = 0;
+    std::string s86, s8e;
+    std::vector<uint8_t> g;
+    for (size_t i = 0; i + 18 <= r.packs.size(); i += 18) {
+        uint8_t type = r.packs[i];
+        if (type == 0x86) { ++n86; for (int k = 4; k < 16; ++k) s86 += char(r.packs[i + k]); }
+        if (type == 0x87) { ++n87; for (int k = 4; k < 16; ++k) g.push_back(r.packs[i + k]); }
+        if (type == 0x8E) { ++n8e; for (int k = 4; k < 16; ++k) s8e += char(r.packs[i + k]); }
+    }
+    CHECK(n86 == 1 && s86.substr(0, 7) == "CAT-001");
+    CHECK(n87 == 1 && g[0] == 0 && g[1] == 14 && std::string(g.begin() + 2, g.begin() + 7) == "Modal");
+    CHECK(n8e == 3 && s8e.find("0123456789012") == 0 && s8e.find("USABC2600001") == 14);
+    // Size pack counts the new types.
+    size_t sizeAt = r.packs.size() - 3 * 18;
+    CHECK(r.packs[sizeAt] == 0x8F && r.packs[sizeAt + 4 + 4 + 6] == 1 && r.packs[sizeAt + 4 + 4 + 7] == 1);
+    CHECK(cd::genreName(14) == "Jazz" && cd::genreName(99).empty());
+    d.codesInCdText = false;
+    auto r2 = cd::encodeCdText(d);
+    bool none = true;
+    for (size_t i = 0; i < r2.packs.size(); i += 18) none = none && r2.packs[i] != 0x8E;
+    CHECK(none);
+}
+
+static void testPdf() {
+    using namespace lathe;
+    doc::Pdf pdf;
+    pdf.setInfo("PQ (Sheet)", "Studio");
+    pdf.setFont(true, 12);
+    pdf.text(40, 60, "Caf\xC3\xA9 \xE2\x80\x94 Side A (cont.)");
+    CHECK(doc::Pdf::toWinAnsi("Caf\xC3\xA9 \xE2\x80\x94 \xE2\x84\x97") == std::string("Caf\xE9 \x97 (P)"));
+    CHECK(std::abs(doc::Pdf::textWidth("AV", false, 10) - (6.67 + 6.67)) < 0.01);
+    pdf.setFont(false, 10);
+    CHECK(pdf.textWidth(pdf.fit("A very long title that will not fit", 60)) <= 60.0);
+    auto lines = pdf.wrap("one two three four five six seven eight nine ten", 60);
+    CHECK(lines.size() > 2);
+    pdf.line(40, 70, 300, 70);
+    pdf.rect(40, 80, 100, 20, true, true);
+    pdf.newPage();
+    pdf.text(40, 60, "Page two");
+    CHECK(pdf.addJpeg({1, 2, 3}) == -1);
+    auto bytes = pdf.finish();
+    std::string s(bytes.begin(), bytes.end());
+    CHECK(s.rfind("%PDF-1.4", 0) == 0 && s.find("/Count 2") != std::string::npos && s.find("(PQ \\(Sheet\\))") != std::string::npos);
+    // Every xref offset must point at its object header.
+    size_t sx = s.rfind("startxref");
+    size_t xref = size_t(std::stoll(s.substr(sx + 10)));
+    CHECK(s.compare(xref, 4, "xref") == 0);
+    std::istringstream in(s.substr(xref));
+    std::string word;
+    int first = 0, count = 0;
+    in >> word >> first >> count;
+    bool ok = count > 5;
+    for (int i = 0; i < count; ++i) {
+        std::string off, gen, kind;
+        in >> off >> gen >> kind;
+        if (i == 0) continue;
+        size_t o = size_t(std::stoll(off));
+        ok = ok && s.compare(o, std::to_string(i).size() + 6, std::to_string(i) + " 0 obj") == 0;
+    }
+    CHECK(ok);
+}
+
 int main() {
     testRestoration();
     testAnalyzer();
@@ -515,6 +595,8 @@ int main() {
     testLoudness();
     testTruePeak();
     testDither();
+    testCdTextExtras();
+    testPdf();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

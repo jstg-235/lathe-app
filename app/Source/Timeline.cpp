@@ -1,5 +1,7 @@
 #include "Timeline.h"
 
+#include "Products.h"
+
 namespace lathe {
 
 juce::AudioThumbnail* ThumbPool::get(const juce::File& f, juce::ChangeListener* l) {
@@ -24,20 +26,20 @@ Timeline::Timeline(Session& s, ThumbPool& pool) : s_(s), pool_(pool) {
 Timeline::~Timeline() { hscroll_.removeListener(this); }
 
 int Timeline::laneHeight() const {
-    int avail = getHeight() - kRuler - kMarkers - kScroll;
+    int avail = getHeight() - top() - kScroll;
     return juce::jmax(40, avail / juce::jmax(1, s_.lanes));
 }
 
 juce::Rectangle<int> Timeline::laneBounds(int lane) const {
-    return {0, kRuler + kMarkers + lane * laneHeight(), getWidth(), laneHeight()};
+    return {0, top() + lane * laneHeight(), getWidth(), laneHeight()};
 }
 
 int Timeline::laneAt(int y) const {
-    return juce::jlimit(0, s_.lanes - 1, (y - kRuler - kMarkers) / laneHeight());
+    return juce::jlimit(0, s_.lanes - 1, (y - top()) / laneHeight());
 }
 
 int Timeline::regionAt(juce::Point<int> p) const {
-    if (p.y < kRuler + kMarkers) return 0;
+    if (p.y < top()) return 0;
     int lane = laneAt(p.y);
     double t = xToTime(float(p.x));
     // Topmost = latest in the list (drawn last).
@@ -49,7 +51,7 @@ int Timeline::regionAt(juce::Point<int> p) const {
 }
 
 int Timeline::markerAt(juce::Point<int> p) const {
-    if (p.y < kRuler || p.y >= kRuler + kMarkers) return 0;
+    if (p.y < kRuler || p.y >= kRuler + kMarkerStrip) return 0;
     int best = 0;
     float bestD = 7.0f;
     for (auto& m : s_.markers) {
@@ -115,7 +117,7 @@ int Timeline::problemAt(juce::Point<int> p) const {
 
 void Timeline::paintLoudness(juce::Graphics& g) {
     if (!an_ || !showLoudness_) return;
-    auto area = juce::Rectangle<float>(0, float(kRuler + kMarkers), float(getWidth()), float(getHeight() - kRuler - kMarkers - kScroll));
+    auto area = juce::Rectangle<float>(0, float(top()), float(getWidth()), float(getHeight() - top() - kScroll));
     const float lo = -36.0f, hi = 0.0f;
     auto yOf = [&](float lufs) { return area.getBottom() - (juce::jlimit(lo, hi, lufs) - lo) / (hi - lo) * area.getHeight(); };
     const float alpha = stale_ ? 0.35f : 1.0f;
@@ -248,7 +250,7 @@ void Timeline::paintRuler(juce::Graphics& g) {
 }
 
 void Timeline::paintMarkers(juce::Graphics& g) {
-    auto strip = juce::Rectangle<int>(0, kRuler, getWidth(), kMarkers);
+    auto strip = juce::Rectangle<int>(0, kRuler, getWidth(), kMarkerStrip);
     g.setColour(colours::panel2);
     g.fillRect(strip);
     int track = 0;
@@ -396,6 +398,7 @@ void Timeline::paint(juce::Graphics& g) {
     paintLoudness(g);
     paintRuler(g);
     paintMarkers(g);
+    paintProducts(g);
     // Problem ticks on the ruler (red = serious, amber = warning); click to jump.
     if (an_ && showLoudness_)
         for (auto& p : an_->problems) {
@@ -414,7 +417,7 @@ void Timeline::paint(juce::Graphics& g) {
     if (s_.regions.isEmpty()) {
         g.setColour(colours::dim);
         g.drawText("Drag audio files here, open them in the Source window, or use Import",
-                   getLocalBounds().withTrimmedTop(kRuler + kMarkers), juce::Justification::centred);
+                   getLocalBounds().withTrimmedTop(top()), juce::Justification::centred);
     }
 }
 
@@ -467,7 +470,7 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
         repaint();
         return;
     }
-    if (e.y < kRuler + kMarkers) { drag_ = Drag::Locate; if (onSeek) onSeek(dragT0_); return; }
+    if (e.y < top()) { drag_ = Drag::Locate; if (onSeek) onSeek(dragT0_); return; }
 
     selLane_ = laneAt(e.y);
     int id = regionAt(p);
@@ -610,6 +613,7 @@ void Timeline::mouseUp(const juce::MouseEvent&) {
 
 void Timeline::mouseDoubleClick(const juce::MouseEvent& e) {
     if (int m = markerAt(e.getPosition())) { if (onMarkerDoubleClicked) onMarkerDoubleClicked(m); return; }
+    if (int k = breakAt(e.getPosition()); k >= 0) { if (onBreakEdit) onBreakEdit(productView(), k); return; }
     double t = xToTime(float(e.x));
     int lane = laneAt(e.y);
     for (auto& a : s_.regions)
@@ -646,5 +650,67 @@ void Timeline::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelD
 }
 
 void Timeline::mouseMagnify(const juce::MouseEvent& e, float scale) { zoomBy(scale, xToTime(float(e.x))); }
+
+int Timeline::productView() const {
+    for (auto& p : s_.products)
+        if (p.id == productView_) return p.id;
+    return s_.products.isEmpty() ? 0 : s_.products.getFirst().id;
+}
+
+int Timeline::breakAt(juce::Point<int> p) const {
+    int pid = productView();
+    if (!pid || p.y < kRuler + kMarkerStrip || p.y >= top()) return -1;
+    const Product* prod = nullptr;
+    for (auto& x : s_.products) if (x.id == pid) prod = &x;
+    if (!prod) return -1;
+    int best = -1;
+    float bestD = 12.0f;
+    for (int k = 0; k + 1 < prod->units.size(); ++k) {
+        double mid = (prod->units[k].end + prod->units[k + 1].start) * 0.5;
+        float d = std::abs(timeToX(mid) - float(p.x));
+        float span = std::abs(timeToX(prod->units[k].end) - timeToX(prod->units[k + 1].start)) * 0.5f + 12.0f;
+        if (d < juce::jmax(bestD, span) && (best < 0 || d < bestD)) { best = k; bestD = d; }
+    }
+    return best;
+}
+
+void Timeline::paintProducts(juce::Graphics& g) {
+    int pid = productView();
+    if (!pid) return;
+    const Product* prod = nullptr;
+    for (auto& x : s_.products) if (x.id == pid) prod = &x;
+    if (!prod) return;
+    const auto& spec = productSpec(prod->kind);
+    auto strip = juce::Rectangle<int>(0, kRuler + kMarkerStrip, getWidth(), kProductStrip);
+    g.setColour(colours::panel);
+    g.fillRect(strip);
+    g.setColour(colours::line);
+    g.drawHorizontalLine(strip.getBottom() - 1, 0.0f, float(getWidth()));
+    g.setFont(10.0f);
+    for (int i = 0; i < prod->units.size(); ++i) {
+        const auto& u = prod->units.getReference(i);
+        float x0 = timeToX(u.start), x1 = timeToX(u.end);
+        if (x1 < 0 || x0 > getWidth()) continue;
+        // Alternate rows so overlapping units stay visible.
+        auto row = juce::Rectangle<float>(x0, float(strip.getY() + 2 + (i % 2) * 9), x1 - x0, 9.0f);
+        auto c = u.length() > spec.hardMax ? colours::error : u.length() > prod->limit() ? colours::accent : colours::ok;
+        juce::ColourGradient grad(c.withAlpha(0.15f), x0, 0, c.withAlpha(0.65f), x0 + float(u.fadeIn * pps_), 0, false);
+        if (u.fadeIn > 0) {
+            g.setGradientFill(grad);
+            g.fillRect(row.withWidth(float(juce::jmin(u.fadeIn * pps_, double(row.getWidth())))));
+        }
+        auto body = row.withTrimmedLeft(float(u.fadeIn * pps_)).withTrimmedRight(float(u.fadeOut * pps_));
+        g.setColour(c.withAlpha(0.65f));
+        g.fillRect(body);
+        if (u.fadeOut > 0) {
+            juce::ColourGradient go(c.withAlpha(0.65f), x1 - float(u.fadeOut * pps_), 0, c.withAlpha(0.15f), x1, 0, false);
+            g.setGradientFill(go);
+            g.fillRect(row.withTrimmedLeft(juce::jmax(0.0f, row.getWidth() - float(u.fadeOut * pps_))));
+        }
+        g.setColour(colours::bg);
+        auto label = prod->name + " " + unitLabel(*prod, i) + "  " + msfString(u.length()).substring(0, 5);
+        if (body.getWidth() > 40) g.drawText(label, body.reduced(3, 0).toNearestInt(), juce::Justification::centredLeft, true);
+    }
+}
 
 }  // namespace lathe
