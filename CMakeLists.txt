@@ -59,7 +59,9 @@ juce_add_gui_app(Lathe
     BUNDLE_ID "com.newconstellation.lathe"
     VERSION ${PROJECT_VERSION}
     DOCUMENT_EXTENSIONS lathe
-    MICROPHONE_PERMISSION_ENABLED FALSE
+    ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/resources/AppIcon.png"
+    MICROPHONE_PERMISSION_ENABLED TRUE
+    MICROPHONE_PERMISSION_TEXT "Lathe records from your audio interface's inputs."
     PLUGINHOST_AU TRUE)
 
 target_sources(Lathe PRIVATE
