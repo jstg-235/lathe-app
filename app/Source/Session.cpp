@@ -482,6 +482,38 @@ Product* Session::findProduct(int id) {
     return nullptr;
 }
 
+juce::Array<juce::File> Session::missingAudio() const {
+    juce::Array<juce::File> out;
+    for (auto& r : regions)
+        if (!r.file.existsAsFile()) out.addIfNotAlreadyThere(r.file);
+    for (auto& r : references)
+        if (!r.file.existsAsFile()) out.addIfNotAlreadyThere(r.file);
+    return out;
+}
+
+int Session::relinkAudio(const juce::File& from, const juce::File& to) {
+    int n = 0;
+    for (auto& r : regions)
+        if (r.file == from) { r.file = to; ++n; }
+    for (auto& r : references)
+        if (r.file == from) { r.file = to; ++n; }
+    return n;
+}
+
+int Session::findMissingAudioIn(const juce::Array<juce::File>& folders) {
+    int found = 0;
+    for (auto& m : missingAudio())
+        for (auto& dir : folders) {
+            auto candidate = dir.getChildFile(m.getFileName());
+            if (dir.isDirectory() && candidate.existsAsFile()) {
+                relinkAudio(m, candidate);
+                ++found;
+                break;
+            }
+        }
+    return found;
+}
+
 const ProductSpec& productSpec(ProductKind k) {
     // Targets are conservative cutting/duplication norms; hard limits are what can be made at all.
     static const ProductSpec specs[] = {

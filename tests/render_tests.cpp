@@ -583,6 +583,33 @@ int main() {
         CHECK(back.label == "Night Label" && back.cdTextGenre == 5 && back.htoa && back.pqOffsetFrames == 6 && back.pLine == "2026 Night Label");
         CHECK(back.markers[0].publisher == "Night Songs" && back.markers[0].pro == "ASCAP" && back.markers[0].explicitContent);
     }
+
+    // ---- Missing audio: found beside the session, or relinked by hand ----
+    {
+        auto moved = dir.getChildFile("moved");
+        moved.getChildFile("Audio").createDirectory();
+        auto t1 = makeTone(dir, "m1.wav", 48000, 1.0, 440, 0.3f);
+        auto t2 = makeTone(dir, "m2.wav", 48000, 1.0, 440, 0.3f);
+        Session ms;
+        ms.append(regionFor(ms, fm, t1), 2.0);
+        ms.append(regionFor(ms, fm, t2), 1.0);
+        ms.append(regionFor(ms, fm, t1), 1.0);   // the same file used twice
+        auto sf = dir.getChildFile("missing.lathe");
+        juce::String err;
+        CHECK(ms.save(sf, err));
+        // Move the audio into moved/Audio and the session into moved/.
+        CHECK(t1.moveFileTo(moved.getChildFile("Audio/m1.wav")) && t2.moveFileTo(moved.getChildFile("Audio/m2.wav")));
+        Session back;
+        CHECK(back.load(sf, err));
+        CHECK(back.missingAudio().size() == 2);   // distinct files, not regions
+        CHECK(back.findMissingAudioIn({moved, moved.getChildFile("Audio")}) == 2 && back.missingAudio().isEmpty());
+        CHECK(back.regions[0].file == moved.getChildFile("Audio/m1.wav") && back.regions[2].file == back.regions[0].file);
+        // Manual relink of one file changes every region that used it.
+        Session again;
+        CHECK(again.load(sf, err));
+        CHECK(again.relinkAudio(again.regions[0].file, moved.getChildFile("Audio/m1.wav")) == 2);
+        CHECK(again.missingAudio().size() == 1 && again.missingAudio()[0].getFileName() == "m2.wav");
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

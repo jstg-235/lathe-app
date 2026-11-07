@@ -173,6 +173,15 @@ public:
     // the track's ISRC). `leadSeconds` is the silence added before the window's audio.
     cd::Disc toDiscForUnit(const Unit& u, int unitNumber, int unitCount, double& leadSeconds, juce::StringArray* notes = nullptr) const;
     Product* findProduct(int id);
+
+    // ---- Missing audio (moved folders, another computer) ----
+    // Distinct audio files used by regions or references that don't exist on this machine.
+    juce::Array<juce::File> missingAudio() const;
+    // Points every region / reference using `from` at `to`. Returns how many were changed.
+    int relinkAudio(const juce::File& from, const juce::File& to);
+    // Looks for each missing file by name in `folders` and relinks the ones it finds.
+    // Returns how many files were found.
+    int findMissingAudioIn(const juce::Array<juce::File>& folders);
     // Each CD track's [start, end) in seconds (index 01 to next track's index 01 / end).
     juce::Array<juce::Range<double>> trackRanges() const;
 

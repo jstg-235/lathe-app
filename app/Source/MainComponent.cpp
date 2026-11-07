@@ -504,6 +504,7 @@ bool MainComponent::perform(const InvocationInfo& info) {
             engine_.loadSession(session_);   // re-time the regions (latency changes when bypassed)
             break;
         case cmd::batchRender: showBatchDialog(); break;
+        case cmd::locateMissingAudio: locateMissingAudio(true); break;
         case cmd::sourceIn: source_.markIn(); break;
         case cmd::sourceOut: source_.markOut(); break;
         case cmd::destIn: { auto s = timeline_.selection(); timeline_.setSelection({pos, juce::jmax(pos, s.getEnd())}); break; }
@@ -592,7 +593,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
         case 0:
             add({cmd::newSession, cmd::openSession, cmd::saveSession, cmd::saveSessionAs});
             m.addSeparator();
-            add({cmd::importAudio, cmd::openSource, cmd::openDdpSession});
+            add({cmd::importAudio, cmd::openSource, cmd::openDdpSession, cmd::locateMissingAudio});
             m.addSeparator();
             add({cmd::batchRender});
             m.addSeparator();
@@ -1837,24 +1838,22 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
     restoreWindow_.reset();
     spectralWindow_.reset();
     session_ = s;
+    // Audio that moved with the session (same folder, or an Audio folder beside it) is found silently.
+    const auto dir = f.getParentDirectory();
+    const int foundBeside = session_.findMissingAudioIn({dir, dir.getChildFile("Audio"), dir.getChildFile("Audio Files")});
     juce::StringArray problems;
     engine_.chain().setState(session_.pluginChainState, problems);
-    if (session_.activeReference >= 0) engine_.loadReference(session_.references[session_.activeReference].file);
-    juce::StringArray missing;
-    for (auto& r : session_.regions)
-        if (!r.file.existsAsFile()) missing.addIfNotAlreadyThere(r.file.getFullPathName());
+    if (juce::isPositiveAndBelow(session_.activeReference, session_.references.size()))
+        engine_.loadReference(session_.references[session_.activeReference].file);
+    const bool missing = !session_.missingAudio().isEmpty();
     undo_.clear();
     redo_.clear();
     lastState_ = juce::JSON::toString(session_.toVar(), true);
     refreshAll();
     timeline_.zoomToFit();
-    dirty_ = false;
-    if (!problems.isEmpty() || !missing.isEmpty()) {
-        juce::String msg;
-        if (!missing.isEmpty()) msg << "These audio files are missing:\n" << missing.joinIntoString("\n") << "\n\n";
-        if (!problems.isEmpty()) msg << "Plugin problems:\n" << problems.joinIntoString("\n");
-        showText("Session opened with problems", msg);
-    }
+    dirty_ = foundBeside > 0;   // new locations: worth saving
+    if (!problems.isEmpty()) showText("Session opened with plugin problems", "Plugin problems:\n" + problems.joinIntoString("\n"));
+    if (missing) juce::MessageManager::callAsync([this] { locateMissingAudio(false); });
     return true;
 }
 
@@ -2590,6 +2589,116 @@ void MainComponent::exportPaperworkOnly() {
         }
         folder.getChildFile("Paperwork").revealToUser();
     });
+}
+
+// ---------------------------------------------------------------- missing audio
+
+struct RelinkState {
+    int located = 0, foundAutomatically = 0, total = 0;
+    juce::Array<juce::File> skipped;
+    juce::File lastFolder;
+};
+
+namespace {
+juce::String describeAudio(double rate, juce::int64 frames) {
+    return juce::String(rate / 1000.0, 1) + " kHz, " + msfString(rate > 0 ? double(frames) / rate : 0.0).substring(0, 5) + " long";
+}
+}  // namespace
+
+void MainComponent::locateMissingAudio(bool fromMenu) {
+    auto st = std::make_shared<RelinkState>();
+    if (session_.file.existsAsFile()) {
+        auto dir = session_.file.getParentDirectory();
+        st->foundAutomatically = session_.findMissingAudioIn({dir, dir.getChildFile("Audio"), dir.getChildFile("Audio Files")});
+    }
+    auto missing = session_.missingAudio();
+    st->total = missing.size() + st->foundAutomatically;
+    if (missing.isEmpty()) {
+        if (st->foundAutomatically > 0) finishRelink(st);
+        else if (fromMenu)
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Locate Missing Audio", "Every audio file in this session is where it should be.");
+        return;
+    }
+    juce::String msg;
+    msg << missing.size() << (missing.size() == 1 ? " audio file this session uses can't be found:" : " audio files this session uses can't be found:") << "\n\n";
+    for (int i = 0; i < juce::jmin(8, missing.size()); ++i) msg << "    " << missing[i].getFileName() << "\n";
+    if (missing.size() > 8) msg << "    ...and " << (missing.size() - 8) << " more\n";
+    msg << "\nLocate them now? Lathe asks for each one; when you find one, any others in the same folder are picked up automatically.";
+    juce::AlertWindow::showOkCancelBox(juce::MessageBoxIconType::WarningIcon, "Audio Missing", msg, "Locate...", "Not Now", nullptr,
+                                       juce::ModalCallbackFunction::create([this, st](int r) {
+                                           if (r == 1) locateNextMissing(st);
+                                           else if (st->foundAutomatically > 0) finishRelink(st);
+                                       }));
+}
+
+void MainComponent::locateNextMissing(std::shared_ptr<RelinkState> st) {
+    juce::File target;
+    int remaining = 0;
+    for (auto& m : session_.missingAudio())
+        if (!st->skipped.contains(m)) { if (target == juce::File()) target = m; ++remaining; }
+    if (target == juce::File()) { finishRelink(st); return; }
+
+    // What the session expects, to catch the wrong file being picked.
+    double rate = 0;
+    juce::int64 frames = -1;
+    for (auto& r : session_.regions)
+        if (r.file == target) { rate = r.fileRate; frames = r.fileLength; break; }
+
+    auto start = st->lastFolder.isDirectory() ? st->lastFolder
+               : target.getParentDirectory().isDirectory() ? target.getParentDirectory()
+               : juce::File::getSpecialLocation(juce::File::userMusicDirectory);
+    chooser_ = std::make_unique<juce::FileChooser>("Locate \"" + target.getFileName() + "\"" + (remaining > 1 ? " (" + juce::String(remaining) + " missing)" : juce::String()),
+                                                   start, engine_.formats().getWildcardForAllFormats());
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles, [this, st, target, rate, frames](const juce::FileChooser& fc) {
+        auto chosen = fc.getResult();
+        if (!chosen.existsAsFile()) { finishRelink(st); return; }   // cancelled: stop asking
+        std::unique_ptr<juce::AudioFormatReader> reader(engine_.formats().createReaderFor(chosen));
+        if (!reader) {
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Can't read that file",
+                                                   chosen.getFileName() + " isn't an audio file Lathe can read. Choose another.");
+            juce::MessageManager::callAsync([this, st] { locateNextMissing(st); });
+            return;
+        }
+        auto apply = [this, st, target, chosen] {
+            session_.relinkAudio(target, chosen);
+            ++st->located;
+            st->lastFolder = chosen.getParentDirectory();
+            st->foundAutomatically += session_.findMissingAudioIn({st->lastFolder, st->lastFolder.getChildFile("Audio")});
+            juce::MessageManager::callAsync([this, st] { locateNextMissing(st); });
+        };
+        const bool rateDiffers = rate > 0 && std::abs(reader->sampleRate - rate) > 0.5;
+        const bool lengthDiffers = frames >= 0 && reader->lengthInSamples != frames;
+        if (!rateDiffers && !lengthDiffers) { apply(); return; }
+        juce::String msg;
+        msg << chosen.getFileName() << " is " << describeAudio(reader->sampleRate, reader->lengthInSamples) << ", but the session expects "
+            << describeAudio(rate, frames) << ".\n\nIf it's a different version of the file, edits and markers may land on the wrong audio. Use it anyway?";
+        juce::AlertWindow::showOkCancelBox(juce::MessageBoxIconType::QuestionIcon, "Different File?", msg, "Use It", "Choose Another", nullptr,
+                                           juce::ModalCallbackFunction::create([this, st, apply](int r) {
+                                               if (r == 1) apply();
+                                               else juce::MessageManager::callAsync([this, st] { locateNextMissing(st); });
+                                           }));
+    });
+}
+
+void MainComponent::finishRelink(std::shared_ptr<RelinkState> st) {
+    const int found = st->located + st->foundAutomatically;
+    if (found > 0) {
+        if (juce::isPositiveAndBelow(session_.activeReference, session_.references.size()))
+            engine_.loadReference(session_.references[session_.activeReference].file);
+        sessionChanged();
+        refreshAll();
+    }
+    auto still = session_.missingAudio();
+    if (found == 0 && !still.isEmpty()) return;   // nothing changed; the user chose not to look
+    juce::String msg;
+    msg << "Found " << found << " of " << st->total << " missing file" << (st->total == 1 ? "" : "s") << ".";
+    if (!still.isEmpty()) {
+        msg << "\n\nStill missing:\n";
+        for (int i = 0; i < juce::jmin(8, still.size()); ++i) msg << "    " << still[i].getFileName() << "\n";
+        msg << "\nUse File > Locate Missing Audio to try again.";
+    }
+    msg << "\n\nSave the session to keep the new locations.";
+    juce::AlertWindow::showMessageBoxAsync(still.isEmpty() ? juce::MessageBoxIconType::InfoIcon : juce::MessageBoxIconType::WarningIcon, "Locate Missing Audio", msg);
 }
 
 }  // namespace lathe

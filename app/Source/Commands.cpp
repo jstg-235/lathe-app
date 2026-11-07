@@ -11,6 +11,7 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::saveSessionAs, "Save Session As...", "File", "Save the session under a new name", "command + shift + S"},
         {cmd::importAudio, "Import Audio as Tracks...", "File", "Add audio files to the end, each with a track marker", "command + I"},
         {cmd::openSource, "Open in Source Window...", "File", "Load a file into the Source window for auditioning and editing", "command + shift + O"},
+        {cmd::locateMissingAudio, "Locate Missing Audio...", "File", "Find audio files the session can't find (moved, renamed, or on another computer)", "command + shift + M"},
         {cmd::exportDdp, "Export DDP Image...", "File", "Write and verify a DDP 2.0 master for replication", "command + E"},
         {cmd::exportTrackWavs, "Export Track WAVs...", "File", "16-bit / 44.1 kHz WAV per track, cut at the PQ marks", "command + shift + E"},
         {cmd::exportProgram24, "Export Programme WAV (24-bit)...", "File", "The whole programme at the project rate, 24-bit dithered", ""},

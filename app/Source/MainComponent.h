@@ -19,6 +19,7 @@
 namespace lathe {
 
 class LevelMeters;
+struct RelinkState;
 
 class MainComponent : public juce::Component,
                       public juce::TableListBoxModel,
@@ -141,6 +142,10 @@ private:
     void saveStudio();
     void refreshDeliveryPanels();
     DeliveryData previewDelivery() const;
+    // Missing audio: search next to the session, then ask for each file still missing.
+    void locateMissingAudio(bool fromMenu);
+    void locateNextMissing(std::shared_ptr<RelinkState> st);
+    void finishRelink(std::shared_ptr<RelinkState> st);
     int markerRowToTrackNumber(int row) const;
 
     Session session_;

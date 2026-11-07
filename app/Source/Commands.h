@@ -12,7 +12,7 @@ namespace cmd {
 enum : juce::CommandID {
     // File
     newSession = 0x1000, openSession, saveSession, saveSessionAs, importAudio, openSource,
-    exportDdp, exportTrackWavs, exportProgram24, exportProgram32, batchRender,
+    exportDdp, exportTrackWavs, exportProgram24, exportProgram32, batchRender, locateMissingAudio = 0x1080,
     // Edit
     undo = 0x1100, redo, splitAtPlayhead, deleteClose, deleteLeave, muteRegion, nudgeLeft, nudgeRight,
     nudgeLeftBig, nudgeRightBig, clearSelection, selectRegionRange, regionEffects, bypassRegionFx,
