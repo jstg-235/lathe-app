@@ -71,6 +71,8 @@ target_sources(Lathe PRIVATE
     app/Source/ProgramRenderer.cpp
     app/Source/AudioEngine.cpp
     app/Source/PluginChain.cpp
+    app/Source/PluginScan.cpp
+    app/Source/PluginManager.cpp
     app/Source/Exporter.cpp
     app/Source/Timeline.cpp
     app/Source/EditPanels.cpp
@@ -112,7 +114,7 @@ target_link_libraries(Lathe PRIVATE
 
 if(LATHE_BUILD_TESTS)
     juce_add_console_app(lathe_render_tests PRODUCT_NAME "lathe_render_tests")
-    target_sources(lathe_render_tests PRIVATE tests/render_tests.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp app/Source/Products.cpp app/Source/NullTest.cpp app/Source/Commands.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp)
+    target_sources(lathe_render_tests PRIVATE tests/render_tests.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp app/Source/Products.cpp app/Source/NullTest.cpp app/Source/Commands.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp app/Source/PluginScan.cpp)
     target_include_directories(lathe_render_tests PRIVATE ${r8b_SOURCE_DIR})
     target_compile_definitions(lathe_render_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1 JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)
     target_link_libraries(lathe_render_tests PRIVATE lathe_core juce::juce_audio_formats juce::juce_gui_basics juce::juce_audio_processors
@@ -123,7 +125,7 @@ endif()
 if(LATHE_BUILD_TESTS)
     juce_add_console_app(lathe_batch_tests PRODUCT_NAME "lathe_batch_tests")
     target_sources(lathe_batch_tests PRIVATE tests/batch_tests.cpp app/Source/Exporter.cpp app/Source/AudioEngine.cpp
-        app/Source/PluginChain.cpp app/Source/RegionFx.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp
+        app/Source/PluginChain.cpp app/Source/PluginScan.cpp app/Source/RegionFx.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp
         app/Source/DdpFormat.cpp app/Source/ControlSurface.cpp app/Source/Commands.cpp app/Source/Restore.cpp
         app/Source/Products.cpp app/Source/Paperwork.cpp)
     target_include_directories(lathe_batch_tests PRIVATE ${r8b_SOURCE_DIR})
@@ -132,4 +134,11 @@ if(LATHE_BUILD_TESTS)
     target_link_libraries(lathe_batch_tests PRIVATE lathe_core juce::juce_audio_utils juce::juce_audio_processors
         juce::juce_audio_formats juce::juce_audio_devices juce::juce_gui_extra juce::juce_recommended_config_flags)
     add_test(NAME batch COMMAND lathe_batch_tests)
+
+    # Crash-proof plugin scanning: the test binary is also its own scan helper.
+    juce_add_console_app(lathe_scan_tests PRODUCT_NAME "lathe_scan_tests")
+    target_sources(lathe_scan_tests PRIVATE tests/scan_tests.cpp app/Source/PluginScan.cpp)
+    target_compile_definitions(lathe_scan_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)
+    target_link_libraries(lathe_scan_tests PRIVATE juce::juce_audio_processors juce::juce_gui_basics juce::juce_recommended_config_flags)
+    add_test(NAME scan COMMAND lathe_scan_tests)
 endif()

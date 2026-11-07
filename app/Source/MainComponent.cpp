@@ -563,7 +563,7 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::toggleLoudness: timeline_.setShowLoudness(!timeline_.showLoudness()); break;
         case cmd::verifyDdp: verifyDdp(); break;
         case cmd::nullTest: runNullTest(); break;
-        case cmd::pluginManager: showPluginScanner(); break;
+        case cmd::pluginManager: showPluginManager(); break;
         case cmd::audioSetup: showAudioSettings(); break;
         case cmd::followProjectRate:
             followRate_ = !followRate_;
@@ -821,7 +821,7 @@ void MainComponent::openRegionFx(int regionId) {
         sessionChanged();
         engine_.loadSession(session_);   // pick up the new latency/plugins in playback
     };
-    panel->onScan = [this] { showPluginScanner(); };
+    panel->onScan = [this] { showPluginManager(); };
     auto* w = new FxWindow(panel, "Region Effects - " + r->name);
     w->onClose = [this] { juce::MessageManager::callAsync([this] { fxWindow_.reset(); }); };
     fxWindow_.reset(w);
@@ -2138,23 +2138,32 @@ void MainComponent::showPluginScanner() {
     list->setSize(700, 500);
     juce::DialogWindow::LaunchOptions o;
     o.content.setOwned(list);
-    o.dialogTitle = "Plugins (Options > Scan to find new ones)";
+    o.dialogTitle = "Scan for Plugins (Options > Scan). Each plugin is checked in a separate helper, so a crash can't stop Lathe.";
     o.dialogBackgroundColour = colours::bg;
     o.useNativeTitleBar = true;
     o.resizable = true;
     o.launchAsync();
 }
 
+void MainComponent::showPluginManager() {
+    if (pluginManagerWindow_) { pluginManagerWindow_->toFront(true); return; }
+    auto* panel = new PluginManagerPanel(engine_.pluginHost());
+    panel->onScan = [this] { showPluginScanner(); };
+    auto* w = new PlainWindow(panel, "Plugin Manager", false);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { pluginManagerWindow_.reset(); }); };
+    pluginManagerWindow_.reset(w);
+}
+
 void MainComponent::showPluginMenu() {
     auto& ch = engine_.chain();
     juce::PopupMenu m;
-    auto types = ch.known().getTypes();
-    if (types.isEmpty()) m.addItem(1, "No plugins found yet; scan first", false);
+    auto types = ch.host().activeTypes();
+    if (types.isEmpty()) m.addItem(1, ch.known().getNumTypes() ? "Every plugin is deactivated" : "No plugins found yet; scan first", false);
     juce::KnownPluginList::addToMenu(m, types, juce::KnownPluginList::sortByManufacturer, {});
     m.addSeparator();
-    m.addItem(-1, "Scan / manage plugins...");
+    m.addItem(-1, "Plugin Manager (scan, activate / deactivate)...");
     m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&pluginsBtn_), [this, types](int r) {
-        if (r == -1) { showPluginScanner(); return; }
+        if (r == -1) { showPluginManager(); return; }
         int idx = juce::KnownPluginList::getIndexChosenByMenu(types, r);
         if (idx < 0) return;
         juce::String err;

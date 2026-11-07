@@ -5,11 +5,11 @@ namespace lathe {
 void showPluginPicker(PluginHost& host, juce::Component* target, std::function<void(const juce::PluginDescription&)> chosen,
                       std::function<void()> scan) {
     juce::PopupMenu m;
-    auto types = host.known().getTypes();
-    if (types.isEmpty()) m.addItem(1, "No plugins found yet; scan first", false);
+    auto types = host.activeTypes();
+    if (types.isEmpty()) m.addItem(1, host.known().getNumTypes() ? "Every plugin is deactivated" : "No plugins found yet; scan first", false);
     juce::KnownPluginList::addToMenu(m, types, juce::KnownPluginList::sortByManufacturer, {});
     m.addSeparator();
-    m.addItem(-1, "Scan / manage plugins...");
+    m.addItem(-1, "Plugin Manager (scan, activate / deactivate)...");
     m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(target), [types, chosen, scan](int r) {
         if (r == -1) { if (scan) scan(); return; }
         int idx = juce::KnownPluginList::getIndexChosenByMenu(types, r);

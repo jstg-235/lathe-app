@@ -1,5 +1,6 @@
 // Lathe application: window, autosave every 60 s, and crash recovery on the next launch.
 #include "MainComponent.h"
+#include "PluginScan.h"
 
 namespace lathe {
 
@@ -7,9 +8,19 @@ class LatheApp : public juce::JUCEApplication, private juce::Timer {
 public:
     const juce::String getApplicationName() override { return "Lathe"; }
     const juce::String getApplicationVersion() override { return LATHE_VERSION; }
-    bool moreThanOneInstanceAllowed() override { return false; }
+    // The plugin-scan helper is a second copy of Lathe; everything else stays single-instance.
+    bool moreThanOneInstanceAllowed() override { return scan::isWorkerCommandLine(getCommandLineParameters()); }
 
     void initialise(const juce::String& commandLine) override {
+        // Started as the plugin-scan helper: no window, no Dock icon, no autosave or recovery.
+        if (auto w = scan::startWorkerIfRequested(commandLine, [](juce::AudioPluginFormatManager& f) { f.addDefaultFormats(); })) {
+            scanWorker_ = std::move(w);
+#if JUCE_MAC
+            juce::Process::setDockIconVisible(false);
+#endif
+            return;
+        }
+        if (scan::isWorkerCommandLine(commandLine)) { quit(); return; }   // helper with no app to serve: never show a window
         auto dir = appData();
         bool crashed = runningFlag().existsAsFile() && autosaveFile().existsAsFile();
         runningFlag().replaceWithText(juce::Time::getCurrentTime().toISO8601(true));
@@ -37,11 +48,13 @@ public:
     }
 
     void shutdown() override {
+        if (scanWorker_ || !window_) { scanWorker_.reset(); return; }   // the helper never touches the app's files
         window_.reset();
         runningFlag().deleteFile();   // clean exit: no recovery prompt next time
     }
 
     void systemRequestedQuit() override {
+        if (scanWorker_) { quit(); return; }
         if (window_ && window_->main().hasUnsavedChanges()) {
             auto options = juce::MessageBoxOptions::makeOptionsYesNoCancel(
                 juce::MessageBoxIconType::QuestionIcon, "Save changes?", "Save the session before quitting?", "Save", "Don't Save", "Cancel");
@@ -56,6 +69,7 @@ public:
     }
 
     void anotherInstanceStarted(const juce::String& commandLine) override {
+        if (scanWorker_ || scan::isWorkerCommandLine(commandLine)) return;
         auto arg = commandLine.unquoted().trim();
         if (window_ && arg.endsWithIgnoreCase(".lathe")) window_->main().loadSessionFile(juce::File(arg));
     }
@@ -97,6 +111,7 @@ private:
     static juce::File autosaveFile() { return appData().getChildFile("autosave.lathe"); }
 
     std::unique_ptr<Window> window_;
+    std::unique_ptr<juce::ChildProcessWorker> scanWorker_;
 };
 
 }  // namespace lathe

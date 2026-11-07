@@ -6,6 +6,7 @@
 #include "DdpFormat.h"
 #include "DdpPlayer.h"
 #include "DeliveryPanels.h"
+#include "PluginManager.h"
 #include "Restore.h"
 #include "Commands.h"
 #include "EditPanels.h"
@@ -93,6 +94,7 @@ private:
     void refreshAll();
     void refreshIssues();
     void showPluginScanner();
+    void showPluginManager();
     void showPluginMenu();
     void showExportMenu();
     void exportDdp();
@@ -200,6 +202,7 @@ private:
     std::unique_ptr<juce::DocumentWindow> restoreWindow_, spectralWindow_;
     std::shared_ptr<dsp::NoiseProfile> noise_;
     StudioProfile studio_;
+    std::unique_ptr<juce::DocumentWindow> pluginManagerWindow_;
     std::unique_ptr<juce::DocumentWindow> productsWindow_, breakWindow_, releaseWindow_, creditsWindow_, studioWindow_;
     juce::Component::SafePointer<ProductsPanel> productsPanel_;
     juce::Component::SafePointer<BreakEditor> breakEditor_;

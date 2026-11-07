@@ -610,6 +610,49 @@ int main() {
         CHECK(again.relinkAudio(again.regions[0].file, moved.getChildFile("Audio/m1.wav")) == 2);
         CHECK(again.missingAudio().size() == 1 && again.missingAudio()[0].getFileName() == "m2.wav");
     }
+
+    // ---- Deactivated plugins: hidden from menus, never loaded, settings kept in the session ----
+    {
+        lathe::PluginHost host(false);
+        lathe::PluginChain chain(host);
+        juce::PluginDescription d;
+        d.name = "Missing Comp";
+        d.pluginFormatName = "VST3";
+        d.manufacturerName = "Nobody";
+        d.fileOrIdentifier = "/Library/Audio/Plug-Ins/VST3/LatheTestMissingComp.vst3";
+        d.uniqueId = d.deprecatedUid = 0x1a7e;
+        juce::XmlElement root("LATHE_CHAIN");
+        auto* e = root.createNewChildElement("SLOT");
+        e->setAttribute("bypassed", true);
+        e->addChildElement(d.createXml().release());
+        e->setAttribute("state", juce::String("c2V0dGluZ3M="));
+        const auto text = root.toString();
+        const juce::MemoryBlock state(text.toRawUTF8(), text.getNumBytesAsUTF8());
+
+        host.known().addType(d);
+        host.setDeactivated(d, true);
+        bool inMenu = false;
+        for (auto& t : host.activeTypes()) inMenu = inMenu || t.createIdentifierString() == d.createIdentifierString();
+        CHECK(host.isDeactivated(d) && !inMenu);
+        juce::StringArray problems;
+        chain.setState(state, problems);
+        CHECK(chain.size() == 1 && chain.isDormant(0) && chain.nameAt(0) == "Missing Comp (deactivated)" && chain.isBypassed(0));
+        CHECK(problems.size() == 1 && problems[0].contains("deactivated"));
+        auto back = juce::XmlDocument::parse(chain.getState().toString());
+        CHECK(back && back->getChildByName("SLOT") && back->getChildByName("SLOT")->getStringAttribute("state") == "c2V0dGluZ3M=");
+        chain.prepare(44100, 512);
+        juce::AudioBuffer<float> b(2, 512);
+        for (int ch = 0; ch < 2; ++ch) juce::FloatVectorOperations::fill(b.getWritePointer(ch), 0.25f, 512);
+        chain.process(b, 0, 512);
+        CHECK(b.getSample(1, 100) == 0.25f && chain.latencySamples() == 0);   // passes straight through
+
+        // Switched back on: the session tries to load it again (it doesn't exist here, so that fails normally).
+        host.setDeactivated(d, false);
+        problems.clear();
+        chain.setState(state, problems);
+        CHECK(!host.isDeactivated(d) && chain.size() == 0 && problems.size() == 1 && !problems[0].contains("deactivated"));
+        host.known().removeType(d);
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

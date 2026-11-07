@@ -1,5 +1,7 @@
 #include "PluginChain.h"
 
+#include "PluginScan.h"
+
 namespace lathe {
 
 namespace {
@@ -17,13 +19,37 @@ public:
 };
 }  // namespace
 
-PluginHost::PluginHost() {
+PluginHost::PluginHost(bool scanOutOfProcess) {
     formats_.addDefaultFormats();
     if (auto xml = juce::XmlDocument::parse(appData().getChildFile("plugins.xml")))
         known_.recreateFromXml(*xml);
+    deactivated_.addLines(deactivatedFile().loadFileAsString());
+    deactivated_.removeEmptyStrings();
+    if (scanOutOfProcess) known_.setCustomScanner(scan::makeOutOfProcessScanner());
+    // Save as the list changes (each plugin found, each one blacklisted), not only at quit.
+    known_.addChangeListener(this);
 }
 
-PluginHost::~PluginHost() { saveKnownList(); }
+PluginHost::~PluginHost() {
+    known_.removeChangeListener(this);
+    saveKnownList();
+}
+
+bool PluginHost::isDeactivated(const juce::PluginDescription& d) const { return deactivated_.contains(d.createIdentifierString()); }
+
+void PluginHost::setDeactivated(const juce::PluginDescription& d, bool off) {
+    const auto id = d.createIdentifierString();
+    if (off) deactivated_.addIfNotAlreadyThere(id);
+    else deactivated_.removeString(id);
+    deactivatedFile().replaceWithText(deactivated_.joinIntoString("\n"));
+}
+
+juce::Array<juce::PluginDescription> PluginHost::activeTypes() const {
+    juce::Array<juce::PluginDescription> out;
+    for (auto& d : known_.getTypes())
+        if (!isDeactivated(d)) out.add(d);
+    return out;
+}
 
 juce::File PluginHost::appData() const {
     auto d = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("Lathe");
@@ -43,13 +69,19 @@ PluginChain::~PluginChain() { closeAllEditors(); }
 
 void PluginChain::reset() {
     const juce::ScopedLock sl(lock_);
-    for (auto* s : slots_) s->plugin->reset();
+    for (auto* s : slots_)
+        if (s->plugin) s->plugin->reset();
 }
 
 juce::String PluginChain::nameAt(int i) const {
     auto* s = slots_[i];
-    return s && s->plugin ? s->plugin->getName() : juce::String();
+    if (s && s->plugin) return s->plugin->getName();
+    if (s && s->dormant)
+        if (auto* d = s->dormant->getChildByName("PLUGIN")) return d->getStringAttribute("name") + " (deactivated)";
+    return {};
 }
+
+bool PluginChain::isDormant(int i) const { return slots_[i] && !slots_[i]->plugin; }
 
 bool PluginChain::isBypassed(int i) const { return slots_[i] && slots_[i]->bypassed; }
 
@@ -98,7 +130,7 @@ void PluginChain::remove(int i) {
         gone.reset(slots_.removeAndReturn(i));
     }
     gone->window.reset();   // editor must die before its plugin
-    gone->plugin->releaseResources();
+    if (gone->plugin) gone->plugin->releaseResources();
 }
 
 void PluginChain::move(int from, int to) {
@@ -130,6 +162,7 @@ void PluginChain::prepare(double rate, int block, bool doublePrecision) {
     scratch_.setSize(2, juce::jmax(block, 8192));
     dscratch_.setSize(2, juce::jmax(block, 8192));
     for (auto* s : slots_) {
+        if (!s->plugin) continue;
         s->plugin->releaseResources();
         s->plugin->setRateAndBufferSizeDetails(rate, block);
         // 64-bit processing for plugins that offer it (offline renders); 32-bit otherwise.
@@ -143,7 +176,7 @@ void PluginChain::prepare(double rate, int block, bool doublePrecision) {
 int PluginChain::countDoublePrecision() const {
     int n = 0;
     for (auto* s : slots_)
-        if (!s->bypassed && s->plugin->getProcessingPrecision() == juce::AudioProcessor::doublePrecision) ++n;
+        if (s->plugin && !s->bypassed && s->plugin->getProcessingPrecision() == juce::AudioProcessor::doublePrecision) ++n;
     return n;
 }
 
@@ -156,7 +189,7 @@ void PluginChain::process(juce::AudioBuffer<double>& b, int start, int n) {
         juce::AudioBuffer<float> fview(scratch_.getArrayOfWritePointers(), 2, k);
         for (int ch = 0; ch < 2; ++ch) dview.copyFrom(ch, 0, b, juce::jmin(ch, b.getNumChannels() - 1), start + done, k);
         for (auto* s : slots_) {
-            if (s->bypassed) continue;
+            if (s->bypassed || !s->plugin) continue;
             midi_.clear();
             if (s->plugin->getProcessingPrecision() == juce::AudioProcessor::doublePrecision) {
                 s->plugin->processBlock(dview, midi_);
@@ -187,7 +220,8 @@ void PluginChain::process(juce::AudioBuffer<double>& b, int start, int n) {
 
 void PluginChain::release() {
     const juce::ScopedLock sl(lock_);
-    for (auto* s : slots_) s->plugin->releaseResources();
+    for (auto* s : slots_)
+        if (s->plugin) s->plugin->releaseResources();
     prepared_ = false;
 }
 
@@ -200,7 +234,7 @@ void PluginChain::process(juce::AudioBuffer<float>& b, int start, int n) {
         juce::AudioBuffer<float> view(scratch_.getArrayOfWritePointers(), 2, k);
         for (int ch = 0; ch < 2; ++ch) view.copyFrom(ch, 0, b, juce::jmin(ch, b.getNumChannels() - 1), start + done, k);
         for (auto* s : slots_) {
-            if (s->bypassed) continue;
+            if (s->bypassed || !s->plugin) continue;
             midi_.clear();
             s->plugin->processBlock(view, midi_);
         }
@@ -218,18 +252,23 @@ void PluginChain::process(juce::AudioBuffer<float>& b, int start, int n) {
 int PluginChain::latencySamples() const {
     int l = 0;
     for (auto* s : slots_)
-        if (!s->bypassed) l += s->plugin->getLatencySamples();
+        if (s->plugin && !s->bypassed) l += s->plugin->getLatencySamples();
     return l;
 }
 
 void PluginChain::setNonRealtime(bool offline) {
     const juce::ScopedLock sl(lock_);
-    for (auto* s : slots_) s->plugin->setNonRealtime(offline);
+    for (auto* s : slots_)
+        if (s->plugin) s->plugin->setNonRealtime(offline);
 }
 
 juce::MemoryBlock PluginChain::getState() const {
     juce::XmlElement root("LATHE_CHAIN");
     for (auto* s : slots_) {
+        if (!s->plugin) {   // deactivated: write back exactly what was loaded
+            if (s->dormant) root.addChildElement(new juce::XmlElement(*s->dormant));
+            continue;
+        }
         auto* e = root.createNewChildElement("SLOT");
         e->setAttribute("bypassed", s->bypassed);
         e->addChildElement(s->plugin->getPluginDescription().createXml().release());
@@ -254,6 +293,15 @@ void PluginChain::setState(const juce::MemoryBlock& state, juce::StringArray& pr
         juce::PluginDescription d;
         auto* de = e->getChildByName("PLUGIN");
         if (!de || !d.loadFromXml(*de)) continue;
+        if (host_.isDeactivated(d)) {
+            auto slot = std::make_unique<Slot>();
+            slot->dormant = std::make_unique<juce::XmlElement>(*e);
+            slot->bypassed = e->getBoolAttribute("bypassed");
+            const juce::ScopedLock sl(lock_);
+            slots_.add(slot.release());
+            problems.add(d.name + " is deactivated (Plugin Manager), so it wasn't loaded. Its settings are kept in the session.");
+            continue;
+        }
         juce::String err;
         if (!add(d, err)) { problems.add(d.name + ": " + err); continue; }
         juce::MemoryBlock st;
