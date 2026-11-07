@@ -436,7 +436,7 @@ void cuttingSheet(Sheet& sh, const Session& s, const Product& p, const std::vect
             {"Resolution", juce::String(u->rate / 1000.0, 1) + " kHz / " + juce::String(u->bits) + "-bit WAV"},
             {"File MD5", md5Of(f)},
             {"File size", f.existsAsFile() ? sizeText(f.getSize()) : juce::String("-")}};
-        if (!tape) kv.push_back({"EQ", "Flat (RIAA is applied by the cutting system)"});
+        if (!tape) kv.push_back({"EQ", "Flat (RIAA at the cutter)"});
         sh.fields(kv);
         if (u->unit > 0 && p.units[u->unit - 1].end > u->window.start + 0.01)
             sh.paragraph("Overlap: the first " + juce::String(p.units[u->unit - 1].end - u->window.start, 1) + " s of this side repeat the end of " +
