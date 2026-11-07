@@ -134,7 +134,9 @@ std::vector<Cand> choose(const std::vector<Cand>& cands, double T, int n, double
     c.push_back({T, false});
     const size_t C = c.size();
     const double ideal = T / n;
-    const double midPenalty = 45.0 * 45.0;   // a track boundary wins unless it costs ~45 s of balance
+    // Breaking inside music is a last resort: fewer mid-music breaks always wins, balance decides
+    // between choices with the same number.
+    const double midPenalty = 1e12;
     const double inf = 1e300;
     std::vector<std::vector<double>> dp(size_t(n + 1), std::vector<double>(C, inf));
     std::vector<std::vector<int>> from(size_t(n + 1), std::vector<int>(C, -1));
@@ -182,9 +184,11 @@ juce::String autoSplit(const Session& s, Product& p, const dsp::LoudnessMap* map
         if (even && n % 2 == 1) ++n;
         std::vector<Cand> cands = trackStarts;
         // Mid-music candidates near each ideal break, for tracks longer than a unit.
+        // Search only where both neighbouring units can still fit, so a quiet point is usable.
+        const double slack = juce::jmax(5.0, juce::jmin(o.searchWindow, limit - T / n - 2.0 * o.overlap));
         for (int k = 1; k < n; ++k) {
             double ideal = T * k / n;
-            double lo = juce::jmax(1.0, ideal - o.searchWindow), hi = juce::jmin(T - 1.0, ideal + o.searchWindow);
+            double lo = juce::jmax(1.0, ideal - slack), hi = juce::jmin(T - 1.0, ideal + slack);
             cands.push_back({map ? quietestNear(*map, lo, hi) : ideal, true});
         }
         std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.t < b.t; });

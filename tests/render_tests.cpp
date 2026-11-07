@@ -460,6 +460,19 @@ int main() {
         auto ut = unitTracks(lp, vinyl.units[1]);
         CHECK(ut.size() == 3 && ut[0].number == 4 && std::abs(ut[0].start) < 1e-6 && !ut[0].continuesFromPrevious);
 
+        // Uneven tracks that still fit at track starts: no song is broken for better balance.
+        {
+            Session uneven = fakeSession(4, 600.0, 0.0);             // 4 x 10 min
+            uneven.regions.getReference(3).srcOut = juce::int64(1000.0 * 44100);   // last one 16:40
+            Product lpU;
+            lpU.kind = ProductKind::LP12_33;
+            lpU.name = "LP";
+            autoSplit(uneven, lpU, nullptr);
+            bool noMid = true;
+            for (auto& x : lpU.units) noMid = noMid && x.fadeIn == 0 && x.fadeOut == 0;
+            CHECK(lpU.units.size() == 4 && noMid && std::abs(lpU.units[3].start - 1802.0) < 1e-6);
+        }
+
         // One 3-hour performance on CD: three discs, mid-music breaks with overlap and fades.
         Session live = fakeSession(1, 3 * 3600.0, 0.0);
         Product cdp;

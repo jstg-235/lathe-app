@@ -30,8 +30,8 @@ struct UnitIssue { bool error; juce::String message; };
 std::vector<UnitIssue> validateProduct(const Session& s, const Product& p);
 
 // Splits the programme into units no longer than the product's limit, as evenly as possible.
-// Breaks prefer track starts; when a single track is longer than a unit, it breaks at the
-// quietest moment near the ideal point (needs `map`; otherwise at the ideal point itself).
+// Breaks are at track starts whenever every unit can fit that way; otherwise it breaks inside
+// music at the quietest moment near the ideal point (needs `map`; otherwise at the ideal point).
 // Mid-music breaks get an overlap with fades (`overlap` seconds each side).
 struct SplitOptions {
     double overlap = 5.0;
