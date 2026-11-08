@@ -51,7 +51,8 @@ AudioEngine::~AudioEngine() {
     writerThread_.stopThread(2000);
     transport_.setSource(nullptr);
     sourceTransport_.setSource(nullptr);
-    sourceReader_.reset();
+    sourceBuffered_.reset();
+    sourceProgram_.reset();
     refTransport_.setSource(nullptr);
     refReader_.reset();
     playerTransport_.setSource(nullptr);
@@ -79,16 +80,18 @@ void AudioEngine::loadSession(const Session& s) {
     if (wasPlaying) transport_.start();
 }
 
-bool AudioEngine::loadSource(const juce::File& f) {
+void AudioEngine::loadSourceSession(const Session& s) {
+    const bool wasPlaying = sourceTransport_.isPlaying();
+    const double pos = sourceTransport_.getCurrentPosition();
     sourceTransport_.stop();
     sourceTransport_.setSource(nullptr);
-    sourceReader_.reset();
-    auto* reader = formats_.createReaderFor(f);
-    if (!reader) return false;
-    double rate = reader->sampleRate;
-    sourceReader_ = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
-    sourceTransport_.setSource(sourceReader_.get(), int(rate * 2), &readAhead_, rate, 2);
-    return true;
+    sourceBuffered_.reset();
+    sourceProgram_ = std::make_unique<ProgramSource>(formats_, s, rate_, nullptr);
+    sourceBuffered_ = std::make_unique<juce::BufferingAudioSource>(sourceProgram_.get(), readAhead_, false, int(rate_ * 4), 2, true);
+    sourceTransport_.setSource(sourceBuffered_.get(), 0, nullptr, rate_, 2);
+    sourceTransport_.prepareToPlay(block_, rate_);
+    sourceTransport_.setPosition(juce::jmin(pos, sourceTransport_.getLengthInSeconds()));
+    if (wasPlaying) sourceTransport_.start();
 }
 
 bool AudioEngine::loadReference(const juce::File& f) {
@@ -215,8 +218,17 @@ void AudioEngine::clearReference() {
     refReader_.reset();
 }
 
+void AudioEngine::playLinked() {
+    breakTransport_.stop();
+    playerTransport_.stop();
+    transport_.start();
+    sourceTransport_.start();
+    if (refReader_) refTransport_.start();
+}
+
 void AudioEngine::playSource() {
     transport_.stop();
+    refTransport_.stop();
     if (sourceTransport_.getCurrentPosition() >= sourceTransport_.getLengthInSeconds() - 0.01) sourceTransport_.setPosition(0);
     sourceTransport_.start();
 }
@@ -310,6 +322,7 @@ void AudioEngine::play() {
 
 void AudioEngine::stop() {
     transport_.stop();
+    sourceTransport_.stop();
     breakTransport_.stop();
     refTransport_.stop();
 }
@@ -422,8 +435,8 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
             return;
         }
     }
-    if (sourceTransport_.isPlaying()) {
-        // Source audition: raw file, no processing, still metered.
+    if (sourceTransport_.isPlaying() && !transport_.isPlaying()) {
+        // Source audition: no processing, still metered.
         sourceTransport_.getNextAudioBlock(info);
         tap_.push(*info.buffer, info.startSample, info.numSamples);
         return;
@@ -455,6 +468,23 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
         // Keep the reference's clock running while not heard, so A/B stays in step.
         juce::AudioSourceChannelInfo ri(&refBuf_, 0, info.numSamples);
         refTransport_.getNextAudioBlock(ri);
+    }
+    // Linked play: the source runs in step; a 10 ms ramp switches which one is heard.
+    if (sourceTransport_.isPlaying() && transport_.isPlaying() && sourceBuf_.getNumSamples() >= info.numSamples) {
+        juce::AudioSourceChannelInfo si(&sourceBuf_, 0, info.numSamples);
+        sourceTransport_.getNextAudioBlock(si);
+        const float target = hearSource_ ? 1.0f : 0.0f;
+        const float step = 1.0f / float(juce::jmax(1.0, rate_ * 0.010));
+        for (int i = 0; i < info.numSamples; ++i) {
+            srcMix_ = target > srcMix_ ? juce::jmin(target, srcMix_ + step) : juce::jmax(target, srcMix_ - step);
+            if (srcMix_ <= 0.0f) continue;
+            for (int ch = 0; ch < juce::jmin(2, info.buffer->getNumChannels()); ++ch) {
+                auto* d = info.buffer->getWritePointer(ch, info.startSample);
+                d[i] = d[i] * (1.0f - srcMix_) + sourceBuf_.getSample(ch, i) * srcMix_;
+            }
+        }
+    } else {
+        srcMix_ = 0.0f;
     }
     if (transport_.isPlaying()) tap_.push(*info.buffer, info.startSample, info.numSamples);
 }

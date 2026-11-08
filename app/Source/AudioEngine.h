@@ -95,10 +95,16 @@ public:
     double lengthSeconds() const { return transport_.getLengthInSeconds(); }
     double deviceRate() const { return rate_; }
 
-    // ---- Source window audition (raw file, bypasses the chain) ----
-    bool loadSource(const juce::File& f);
+    // ---- Source timeline (its own session; region effects and the master chain don't apply) ----
+    void loadSourceSession(const Session& s);   // keeps position and play state
     void playSource();
     void stopSource();
+    // Linked play: source and destination run together from their own positions; you hear one
+    // of them (switching crossfades in 10 ms), so takes can be compared in step.
+    void playLinked();
+    void setHearSource(bool b) { hearSource_ = b; }
+    bool hearingSource() const { return hearSource_; }
+    bool isLinkedPlaying() const { return transport_.isPlaying() && sourceTransport_.isPlaying(); }
     bool isSourcePlaying() const { return sourceTransport_.isPlaying(); }
     double sourcePosition() const { return sourceTransport_.getCurrentPosition(); }
     void setSourcePosition(double sec) { sourceTransport_.setPosition(sec); }
@@ -207,8 +213,11 @@ private:
     float latPeak_ = 0;
     float refMix_ = 0.0f;   // audio thread only: 0 = master, 1 = reference
     juce::CriticalSection refLock_;   // UI swaps the reference under this; audio thread only try-locks
-    std::unique_ptr<juce::AudioFormatReaderSource> sourceReader_;
+    std::unique_ptr<ProgramSource> sourceProgram_;
+    std::unique_ptr<juce::BufferingAudioSource> sourceBuffered_;
     juce::AudioBuffer<float> sourceBuf_;
+    std::atomic<bool> hearSource_{false};
+    float srcMix_ = 0.0f;   // audio thread only: 0 = destination, 1 = source
     PluginHost host_;
     PluginChain chain_{host_, "Master"};
     RegionFxBank fx_{host_};

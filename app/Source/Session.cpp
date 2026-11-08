@@ -230,13 +230,204 @@ int Session::split(int id, double t) {
     return b.id;
 }
 
-void Session::ripple(double t, double dt, int except) {
+void Session::ripple(double t, double dt, int except, const juce::Array<int>* onLanes) {
     if (std::abs(dt) < kEps) return;
     for (auto& r : regions)
-        if (r.id != except && r.start >= t - kEps) r.start = juce::jmax(0.0, r.start + dt);
+        if (r.id != except && r.start >= t - kEps && (onLanes == nullptr || onLanes->contains(r.lane))) r.start = juce::jmax(0.0, r.start + dt);
     for (auto& m : markers)
         if (m.t >= t - kEps && (except == 0 || m.attachedRegion != except)) m.t = juce::jmax(0.0, m.t + dt);
+    for (auto& p : srps)
+        if (!p.locked && p.t >= t - kEps) p.t = juce::jmax(0.0, p.t + dt);
     sortMarkers();
+    sortSrps();
+}
+
+juce::String pasteModeName(PasteMode m) {
+    switch (m) {
+        case PasteMode::Insert: return "Insert";
+        case PasteMode::Replace: return "Replace";
+        case PasteMode::ReplaceLeft: return "Replace Left";
+        case PasteMode::Constrained: return "Replace Constrained";
+        case PasteMode::Overlay: return "Overlay";
+    }
+    return {};
+}
+
+juce::Array<int> Session::targetLanes() const {
+    juce::Array<int> out;
+    for (int l = 0; l < lanes; ++l)
+        if (laneTargeted(l)) out.add(l);
+    if (out.isEmpty())
+        for (int l = 0; l < lanes; ++l) out.add(l);
+    return out;
+}
+
+Clip Session::copyRange(double a, double b, const juce::Array<int>& laneList) const {
+    Clip c;
+    if (b <= a) return c;
+    c.length = b - a;
+    auto ls = laneList;
+    ls.sort();
+    c.laneCount = juce::jmax(1, ls.size());
+    for (int i = 0; i < regions.size(); ++i) {
+        const auto& r = regions.getReference(i);
+        const int li = ls.indexOf(r.lane);
+        if (li < 0 || r.end() <= a + kEps || r.start >= b - kEps) continue;
+        Region x = r;
+        // Bake automatic crossfade lengths into the copy so it sounds the same on its own.
+        auto ef = fadesFor(i);
+        x.fadeIn = ef.in;
+        x.fadeOut = ef.out;
+        x.fadeInShape = ef.inShape;
+        x.fadeOutShape = ef.outShape;
+        if (x.start < a) {
+            const auto d = juce::int64(std::llround((a - x.start) * x.fileRate));
+            const double shift = double(d) / x.fileRate;
+            if (!x.envelope.isEmpty()) {
+                const double db = x.envelopeDb(shift);
+                juce::Array<GainPoint> env;
+                env.add({0.0, db});
+                for (auto& p : x.envelope)
+                    if (p.t > shift) env.add({p.t - shift, p.db});
+                x.envelope = env;
+            }
+            x.srcIn += d;
+            x.start += shift;
+            x.fadeIn = 0;
+        }
+        if (x.end() > b) {
+            const double keep = b - x.start;
+            if (!x.envelope.isEmpty()) {
+                const double db = x.envelopeDb(keep);
+                juce::Array<GainPoint> env;
+                for (auto& p : x.envelope)
+                    if (p.t < keep) env.add(p);
+                env.add({keep, db});
+                x.envelope = env;
+            }
+            x.srcOut = juce::jlimit<juce::int64>(x.srcIn + 1, x.fileLength, x.srcIn + juce::int64(std::llround(keep * x.fileRate)));
+            x.fadeOut = 0;
+        }
+        if (x.srcOut - x.srcIn < 1) continue;
+        x.fadeIn = juce::jmin(x.fadeIn, x.length());
+        x.fadeOut = juce::jmin(x.fadeOut, x.length() - x.fadeIn);
+        x.start -= a;
+        x.lane = li;
+        x.id = 0;
+        c.regions.add(x);
+    }
+    return c;
+}
+
+void Session::clearRange(double a, double b, const juce::Array<int>& laneList, bool rippleAfter) {
+    if (b <= a) return;
+    for (int i = regions.size(); --i >= 0;) {
+        if (i >= regions.size()) continue;
+        Region r = regions[i];
+        if (!laneList.contains(r.lane) || r.end() <= a + kEps || r.start >= b - kEps) continue;
+        if (r.start >= a - kEps && r.end() <= b + kEps) {
+            for (int k = markers.size(); --k >= 0;)
+                if (markers.getReference(k).attachedRegion == r.id) markers.getReference(k).attachedRegion = 0;
+            regions.remove(i);
+            continue;
+        }
+        if (r.start < a && r.end() > b) {
+            split(r.id, b);
+            trimRegionEnd(r.id, a);
+            continue;
+        }
+        if (r.start < a) trimRegionEnd(r.id, a);
+        else trimRegionStart(r.id, b);
+    }
+    if (!rippleAfter) return;
+    for (int k = markers.size(); --k >= 0;)
+        if (markers.getReference(k).t >= a - kEps && markers.getReference(k).t < b - kEps) markers.remove(k);
+    for (int k = srps.size(); --k >= 0;)
+        if (!srps.getReference(k).locked && srps.getReference(k).t >= a - kEps && srps.getReference(k).t < b - kEps) srps.remove(k);
+    // Trimmed heads land on b give or take a sample of rounding: catch them too.
+    ripple(b - 1e-4, -(b - a), 0, &laneList);
+}
+
+juce::Array<int> Session::paste(const Clip& c, const juce::Array<int>& laneList, double at, PasteMode mode, double destOut) {
+    juce::Array<int> ids;
+    if (c.isEmpty()) return ids;
+    juce::Array<int> dest = laneList;
+    if (dest.isEmpty()) dest.add(0);
+    while (dest.size() < c.laneCount) dest.add(dest.getLast() + 1);
+    for (int l : dest) lanes = juce::jmax(lanes, l + 1);
+    juce::Array<int> used;
+    for (int k = 0; k < c.laneCount; ++k) used.add(dest[k]);
+
+    // A part of the clip, [a, b) in clip time.
+    auto subClip = [](const Clip& src, double a, double b) {
+        Session tmp;
+        tmp.regions = src.regions;
+        tmp.lanes = src.laneCount;
+        juce::Array<int> all;
+        for (int k = 0; k < src.laneCount; ++k) all.add(k);
+        Clip out = tmp.copyRange(a, b, all);
+        out.laneCount = src.laneCount;
+        return out;
+    };
+    Clip clip = c;
+    double len = clip.length;
+    if (mode == PasteMode::ReplaceLeft) at = (destOut >= 0 ? destOut : at) - len;
+    if (mode == PasteMode::Constrained && destOut > at + kEps && destOut - at < len) {
+        len = destOut - at;
+        clip = subClip(c, 0, len);
+    }
+    if (at < 0) {   // back-timed past zero: drop what would land before the start
+        clip = subClip(clip, -at, len);
+        len = clip.length;
+        at = 0;
+    }
+
+    switch (mode) {
+        case PasteMode::Insert:
+            for (int i = regions.size(); --i >= 0;) {
+                const auto r = regions[i];
+                if (used.contains(r.lane) && r.start < at - kEps && r.end() > at + kEps) split(r.id, at);
+            }
+            ripple(at - 1e-4, len, 0, &used);
+            break;
+        case PasteMode::Replace:
+        case PasteMode::ReplaceLeft:
+        case PasteMode::Constrained: clearRange(at, at + len, used, false); break;
+        case PasteMode::Overlay: break;
+    }
+    for (auto r : clip.regions) {
+        r.id = nextId++;
+        r.start += at;
+        r.lane = dest[juce::jlimit(0, dest.size() - 1, r.lane)];
+        regions.add(r);
+        ids.add(r.id);
+    }
+    return ids;
+}
+
+int Session::addSrp(double t, const juce::String& text) {
+    Srp p;
+    p.id = nextId++;
+    p.t = juce::jmax(0.0, t);
+    p.text = text;
+    srps.add(p);
+    sortSrps();
+    return p.id;
+}
+
+Srp* Session::findSrp(int id) {
+    for (auto& p : srps)
+        if (p.id == id) return &p;
+    return nullptr;
+}
+
+void Session::removeSrp(int id) {
+    for (int i = srps.size(); --i >= 0;)
+        if (srps.getReference(i).id == id) srps.remove(i);
+}
+
+void Session::sortSrps() {
+    std::stable_sort(srps.begin(), srps.end(), [](const Srp& a, const Srp& b) { return a.t < b.t; });
 }
 
 int Session::sourceEdit(const juce::File& f, double rate, juce::int64 len, juce::int64 sIn, juce::int64 sOut, int lane,
@@ -653,6 +844,21 @@ juce::var Session::toVar() const {
         pl.add(o);
     }
     root->setProperty("products", pl);
+    juce::Array<juce::var> sl;
+    for (auto& p : srps) {
+        auto* o = new juce::DynamicObject();
+        o->setProperty("id", p.id);
+        o->setProperty("t", p.t);
+        o->setProperty("text", p.text);
+        o->setProperty("locked", p.locked);
+        sl.add(o);
+    }
+    root->setProperty("srps", sl);
+    juce::Array<juce::var> off;
+    for (int l : lanesOff) off.add(l);
+    root->setProperty("lanesOff", off);
+    if (source != nullptr && (!source->regions.isEmpty() || !source->srps.isEmpty())) root->setProperty("source", source->toVar());
+    else if (source == nullptr && sourceDoc.isObject()) root->setProperty("source", sourceDoc);
     return root;
 }
 
@@ -669,6 +875,9 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     pluginChainState.fromBase64Encoding(v["pluginChain"].toString());
     regions.clear();
     markers.clear();
+    srps.clear();
+    lanesOff.clear();
+    sourceDoc = juce::var();
     nextId = 1;
 
     if (int(v["version"]) < 2) {
@@ -818,6 +1027,28 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
         }
     }
     sortMarkers();
+    if (auto* arr = v["srps"].getArray())
+        for (auto& o : *arr) {
+            Srp p;
+            p.id = int(o["id"]);
+            p.t = double(o["t"]);
+            p.text = o["text"].toString();
+            p.locked = bool(o["locked"]);
+            nextId = juce::jmax(nextId, p.id + 1);
+            srps.add(p);
+        }
+    sortSrps();
+    if (auto* arr = v["lanesOff"].getArray())
+        for (auto& l : *arr) lanesOff.addIfNotAlreadyThere(int(l));
+    sourceDoc = v["source"];
+    if (source != nullptr) {
+        juce::String e;
+        if (!sourceDoc.isObject() || !source->fromVar(sourceDoc, e)) {
+            const auto keepLanes = 1;
+            *source = Session();
+            source->lanes = keepLanes;
+        }
+    }
     return true;
 }
 

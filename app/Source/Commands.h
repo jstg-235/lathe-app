@@ -33,6 +33,16 @@ enum : juce::CommandID {
     keyGuide = 0x1700, editKeyCommands,
     // Delivery
     products = 0x1800, breakEditor, releaseInfo, trackCredits, studioProfile, exportPaperwork,
+    // Source / destination (two timelines)
+    goToIn = 0x1220, goToOut, clearIn, clearOut, moveInToOut, nudgeInLeft, nudgeInRight, nudgeOutLeft, nudgeOutRight,
+    nudgeSizeA, nudgeSizeB, nudgeSizeC, movePoint, replaceLeftEdit, constrainedEdit, overlayEdit, switchTimeline, linkPlay,
+    clearSource, editPointToPlayhead,
+    // Clipboard
+    cutRange = 0x1260, copyRange, pasteInsert, pasteReplace, pasteReplaceLeft, pasteConstrained, pasteOverlay, eraseRange,
+    // Transport
+    playToIn = 0x1320, playFromIn, playToOut, playFromOut, playAroundEdit, repeatPlay, editPointFollowsStop, playbackSettings,
+    // SRPs
+    addSrp = 0x1420, addSrpText, srpsFromSelection, prevSrp, nextSrp, lockSrp, deleteSrp, deleteAllSrps,
 };
 }  // namespace cmd
 

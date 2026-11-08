@@ -16,7 +16,7 @@ juce::AudioThumbnail* ThumbPool::get(const juce::File& f, juce::ChangeListener* 
     return it->second.get();
 }
 
-Timeline::Timeline(Session& s, ThumbPool& pool) : s_(s), pool_(pool) {
+Timeline::Timeline(Session& s, ThumbPool& pool, Role role) : s_(s), pool_(pool), role_(role) {
     addAndMakeVisible(hscroll_);
     hscroll_.addListener(this);
     hscroll_.setAutoHide(false);
@@ -84,10 +84,41 @@ double Timeline::snapTime(double t, int ignore) const {
         if (px < bestPx) { bestPx = px; best = c; }
     };
     consider(playhead_);
+    consider(edit_);
+    if (in_ >= 0) consider(in_);
+    if (out_ >= 0) consider(out_);
+    for (auto& p : s_.srps) consider(p.t);
     consider(0.0);
     for (auto& r : s_.regions)
         if (r.id != ignore) { consider(r.start); consider(r.end()); }
     for (auto& m : s_.markers) consider(m.t);
+    return best;
+}
+
+void Timeline::setEditPoint(double t, bool rev) {
+    edit_ = juce::jmax(0.0, t);
+    if (rev) reveal(edit_);
+    repaint();
+}
+
+void Timeline::reveal(double t) {
+    const double w = getWidth() / pps_;
+    if (t < view0_ || t > view0_ + w * 0.95) { view0_ = juce::jmax(0.0, t - w * 0.25); updateScrollbar(); repaint(); }
+}
+
+juce::Rectangle<int> Timeline::badgeBounds(int lane) const {
+    auto b = laneBounds(lane);
+    return {b.getX() + 3, b.getBottom() - 19, 24, 15};
+}
+
+int Timeline::srpAt(juce::Point<int> p) const {
+    if (p.y < kRuler + kMarkerStrip - 11 || p.y >= kRuler + kMarkerStrip) return 0;
+    int best = 0;
+    float bestD = 6.0f;
+    for (auto& m : s_.srps) {
+        float d = std::abs(timeToX(m.t) - float(p.x));
+        if (d < bestD) { bestD = d; best = m.id; }
+    }
     return best;
 }
 
@@ -368,9 +399,6 @@ void Timeline::paint(juce::Graphics& g) {
         if (l == selLane_) { g.setColour(colours::accent.withAlpha(0.06f)); g.fillRect(b); }
         g.setColour(colours::line);
         g.drawHorizontalLine(b.getBottom() - 1, 0, float(getWidth()));
-        g.setColour(colours::dim);
-        g.setFont(10.0f);
-        g.drawText(juce::String(l + 1), b.getX() + 3, b.getBottom() - 14, 20, 12, juce::Justification::left);
     }
     for (int i = 0; i < s_.regions.size(); ++i) paintRegion(g, i);
 
@@ -387,18 +415,17 @@ void Timeline::paint(juce::Graphics& g) {
                 g.drawLine(xa, lb.getBottom(), xb, lb.getY(), 1.0f);
             }
 
-    if (!sel_.isEmpty()) {
-        float a = timeToX(sel_.getStart()), b = timeToX(sel_.getEnd());
+    if (!selection().isEmpty()) {
+        float a = timeToX(in_), b = timeToX(out_);
         g.setColour(colours::selection);
         g.fillRect(juce::Rectangle<float>(a, float(kRuler), b - a, float(getHeight() - kRuler - kScroll)));
-        g.setColour(colours::wave);
-        g.drawVerticalLine(int(a), float(kRuler), float(getHeight() - kScroll));
-        g.drawVerticalLine(int(b), float(kRuler), float(getHeight() - kScroll));
     }
-    paintLoudness(g);
+    if (role_ == Role::Destination) paintLoudness(g);
     paintRuler(g);
     paintMarkers(g);
-    paintProducts(g);
+    paintSrps(g);
+    if (role_ == Role::Destination) paintProducts(g);
+    paintPoints(g);
     // Problem ticks on the ruler (red = serious, amber = warning); click to jump.
     if (an_ && showLoudness_)
         for (auto& p : an_->problems) {
@@ -416,8 +443,90 @@ void Timeline::paint(juce::Graphics& g) {
 
     if (s_.regions.isEmpty()) {
         g.setColour(colours::dim);
-        g.drawText("Drag audio files here, open them in the Source window, or use Import",
+        g.drawText(role_ == Role::Source ? "Source: open or drop takes and mixes here, mark In / Out, then Insert, Replace or Overwrite into the destination"
+                                         : "Drag audio files here, open them in the Source window, or use Import",
                    getLocalBounds().withTrimmedTop(top()), juce::Justification::centred);
+    }
+    if (active_) {
+        g.setColour(colours::accent);
+        g.fillRect(0, 0, getWidth(), 2);
+    }
+}
+
+void Timeline::paintPoints(juce::Graphics& g) {
+    const float bottom = float(getHeight() - kScroll);
+    // In and Out: bracket flags in the ruler and a line through the lanes.
+    auto point = [&](double t, bool isIn) {
+        if (t < 0) return;
+        const float x = timeToX(t);
+        if (x < -10 || x > getWidth() + 10) return;
+        g.setColour(colours::wave);
+        g.drawLine(x, float(kRuler - 12), x, bottom, 1.2f);
+        juce::Path br;
+        const float d = isIn ? 1.0f : -1.0f;
+        br.addRectangle(isIn ? x : x - 7, float(kRuler - 12), 7, 3);
+        br.addRectangle(isIn ? x : x - 2, float(kRuler - 12), 2, 12);
+        g.fillPath(br);
+        g.setFont(9.0f);
+        g.drawText(isIn ? "IN" : "OUT", int(x + d * 3) - (isIn ? 0 : 24), kRuler - 22, 24, 10,
+                   isIn ? juce::Justification::left : juce::Justification::right);
+    };
+    point(in_, true);
+    point(out_, false);
+    // Edit Point: a yellow triangle in the ruler and a dashed line.
+    const float ex = timeToX(edit_);
+    if (ex >= -8 && ex <= getWidth() + 8) {
+        const juce::Colour y(0xffe8c547);
+        juce::Path tri;
+        tri.addTriangle(ex - 6, float(kRuler - 10), ex + 6, float(kRuler - 10), ex, float(kRuler));
+        g.setColour(y);
+        g.fillPath(tri);
+        juce::Path line, dashed;
+        line.startNewSubPath(ex, float(kRuler));
+        line.lineTo(ex, bottom);
+        const float dashes[] = {3.0f, 3.0f};
+        juce::PathStrokeType(1.0f).createDashedStroke(dashed, line, dashes, 2);
+        g.setColour(y.withAlpha(0.8f));
+        g.fillPath(dashed);
+    }
+    // Lane targets: D / S when edits use the lane, N when they leave it alone.
+    for (int l = 0; l < s_.lanes; ++l) {
+        auto b = badgeBounds(l).toFloat();
+        const bool on = s_.laneTargeted(l);
+        g.setColour(on ? colours::accent : colours::panel2);
+        g.fillRoundedRectangle(b, 3.0f);
+        g.setColour(on ? colours::bg : colours::dim);
+        g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+        g.drawText(juce::String(on ? (role_ == Role::Source ? "S" : "D") : "N") + juce::String(l + 1), b.toNearestInt(), juce::Justification::centred);
+    }
+    // Role label.
+    {
+        const juce::String name = role_ == Role::Source ? "SOURCE" : "DESTINATION";
+        auto pill = juce::Rectangle<float>(float(getWidth() - 92), float(kRuler + 3), 86, 14);
+        g.setColour(active_ ? colours::accent : colours::panel);
+        g.fillRoundedRectangle(pill, 3.0f);
+        g.setColour(active_ ? colours::bg : colours::dim);
+        g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+        g.drawText(name, pill.toNearestInt(), juce::Justification::centred);
+    }
+}
+
+void Timeline::paintSrps(juce::Graphics& g) {
+    const juce::Colour c(0xff5fc7d6);
+    g.setFont(10.0f);
+    const float y = float(kRuler + kMarkerStrip - 6);
+    for (auto& p : s_.srps) {
+        const float x = timeToX(p.t);
+        if (x < -100 || x > getWidth() + 10) continue;
+        const bool sel = p.id == selSrp_;
+        juce::Path d;
+        d.addTriangle(x - 4, y, x, y - 4, x + 4, y);
+        d.addTriangle(x - 4, y, x, y + 4, x + 4, y);
+        g.setColour(sel ? c.brighter(0.5f) : c);
+        if (p.locked) g.strokePath(d, juce::PathStrokeType(1.4f)); else g.fillPath(d);
+        g.drawText(p.text.isNotEmpty() ? p.text : juce::String("SRP"), int(x) + 6, int(y) - 6, 140, 11, juce::Justification::left);
+        g.setColour(c.withAlpha(0.25f));
+        g.drawVerticalLine(int(x), y + 5, float(getHeight() - kScroll));
     }
 }
 
@@ -444,6 +553,41 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
     changed_ = false;
     dragT0_ = xToTime(float(e.x));
     auto p = e.getPosition();
+    if (onFocus) onFocus();
+
+    for (int l = 0; l < s_.lanes; ++l)
+        if (badgeBounds(l).contains(p)) {
+            if (s_.laneTargeted(l)) s_.lanesOff.addIfNotAlreadyThere(l); else s_.lanesOff.removeAllInstancesOf(l);
+            if (onEdit) onEdit();
+            repaint();
+            return;
+        }
+    if (int sp = srpAt(p)) {
+        selSrp_ = sp;
+        if (e.mods.isPopupMenu()) {
+            auto* srp = s_.findSrp(sp);
+            juce::PopupMenu menu;
+            menu.addItem(1, "Edit Text...");
+            menu.addItem(2, "Locked (stays put when material ripples)", true, srp && srp->locked);
+            menu.addItem(3, "Delete SRP");
+            menu.showMenuAsync({}, [this, sp](int r) {
+                auto* q = s_.findSrp(sp);
+                if (!q || r == 0) return;
+                if (r == 1) { if (onSrpEdit) onSrpEdit(sp); return; }
+                if (r == 2) q->locked = !q->locked;
+                if (r == 3) s_.removeSrp(sp);
+                if (onEdit) onEdit();
+            });
+            repaint();
+            return;
+        }
+        auto* srp = s_.findSrp(sp);
+        if (srp && !srp->locked) { drag_ = Drag::SrpMove; dragId_ = sp; }
+        setEditPoint(srp ? srp->t : edit_);
+        if (onEditPointMoved) onEditPointMoved();
+        repaint();
+        return;
+    }
 
     if (int pi = problemAt(p); pi >= 0) {
         if (onProblemClicked) onProblemClicked(an_->problems[size_t(pi)].start);
@@ -451,6 +595,8 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
     }
     if (e.y < kRuler) {
         drag_ = Drag::Locate;
+        setEditPoint(juce::jmax(0.0, dragT0_));
+        if (onEditPointMoved) onEditPointMoved();
         if (onSeek) onSeek(juce::jmax(0.0, dragT0_));
         return;
     }
@@ -470,15 +616,23 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
         repaint();
         return;
     }
-    if (e.y < top()) { drag_ = Drag::Locate; if (onSeek) onSeek(dragT0_); return; }
+    if (e.y < top()) {
+        drag_ = Drag::Locate;
+        setEditPoint(juce::jmax(0.0, dragT0_));
+        if (onEditPointMoved) onEditPointMoved();
+        if (onSeek) onSeek(juce::jmax(0.0, dragT0_));
+        return;
+    }
 
     selLane_ = laneAt(e.y);
     int id = regionAt(p);
     if (!id) {
         selRegion_ = 0;
         drag_ = Drag::Select;
-        sel_ = {};
-        if (onSeek) onSeek(snapTime(dragT0_, 0));
+        const double t = snapTime(juce::jmax(0.0, dragT0_), 0);
+        setEditPoint(t);
+        if (onEditPointMoved) onEditPointMoved();
+        if (onSeek) onSeek(t);
         repaint();
         return;
     }
@@ -512,7 +666,7 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
             if (c == 3) s_.deleteRegion(id, true);
             if (c == 4) s_.deleteRegion(id, false);
             if (c == 5) rr->envelope.clear();
-            if (c == 6) { sel_ = {rr->start, rr->end()}; repaint(); return; }
+            if (c == 6) { setSelection({rr->start, rr->end()}); return; }
             if (onEdit) onEdit();
         });
         repaint();
@@ -552,13 +706,19 @@ void Timeline::mouseDrag(const juce::MouseEvent& e) {
     double t = xToTime(float(e.x));
     switch (drag_) {
         case Drag::Locate:
+            setEditPoint(juce::jmax(0.0, t));
             if (onSeek) onSeek(juce::jmax(0.0, t));
             break;
         case Drag::Select: {
+            if (std::abs(t - dragT0_) * pps_ < 3) break;   // a click, not a drag: keep In / Out
             double a = snapTime(juce::jmax(0.0, juce::jmin(dragT0_, t)), 0), b = snapTime(juce::jmax(dragT0_, t), 0);
-            sel_ = {a, b};
+            in_ = a;
+            out_ = b;
             break;
         }
+        case Drag::SrpMove:
+            if (auto* q = s_.findSrp(dragId_)) { q->t = snapTime(juce::jmax(0.0, t), 0); edit_ = q->t; changed_ = true; }
+            break;
         case Drag::Marker:
             s_.moveMarker(dragId_, snapTime(t, 0));
             changed_ = true;
@@ -604,7 +764,7 @@ void Timeline::mouseDrag(const juce::MouseEvent& e) {
 }
 
 void Timeline::mouseUp(const juce::MouseEvent&) {
-    if (drag_ == Drag::Select && sel_.getLength() < 2.0 / pps_) sel_ = {};
+    if (drag_ == Drag::SrpMove) s_.sortSrps();
     if (changed_ && onEdit) onEdit();
     drag_ = Drag::None;
     changed_ = false;
@@ -612,6 +772,7 @@ void Timeline::mouseUp(const juce::MouseEvent&) {
 }
 
 void Timeline::mouseDoubleClick(const juce::MouseEvent& e) {
+    if (int sp = srpAt(e.getPosition())) { if (onSrpEdit) onSrpEdit(sp); return; }
     if (int m = markerAt(e.getPosition())) { if (onMarkerDoubleClicked) onMarkerDoubleClicked(m); return; }
     if (int k = breakAt(e.getPosition()); k >= 0) { if (onBreakEdit) onBreakEdit(productView(), k); return; }
     double t = xToTime(float(e.x));
@@ -633,8 +794,7 @@ void Timeline::mouseDoubleClick(const juce::MouseEvent& e) {
             }
     if (int id = regionAt(e.getPosition())) {
         auto* r = s_.findRegion(id);
-        sel_ = {r->start, r->end()};
-        repaint();
+        setSelection({r->start, r->end()});
     }
 }
 

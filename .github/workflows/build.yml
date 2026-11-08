@@ -21,7 +21,13 @@ jobs:
         run: cmake --build build --config Release -- -quiet
 
       - name: Run tests
+        env:
+          LATHE_SCAN_LOG: ${{ runner.temp }}/scan.log
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Scan protocol trace
+        if: always()
+        run: cat "${{ runner.temp }}/scan.log" || true
 
       - name: Package
         run: |

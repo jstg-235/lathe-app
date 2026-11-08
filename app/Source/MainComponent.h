@@ -12,6 +12,7 @@
 #include "EditPanels.h"
 #include "Exporter.h"
 #include "Session.h"
+#include "SourceView.h"
 #include "Timeline.h"
 
 #include <juce_audio_utils/juce_audio_utils.h>
@@ -84,13 +85,44 @@ private:
 
     void importFiles(const juce::Array<juce::File>& files);
     void appendSource();
-    void sourceEdit(Session::EditMode mode);
+    // Source-to-destination edits.
+    enum class EditKind { Insert, Replace, ReplaceLeft, Constrained, Fit, Overlay };
+    void sourceEdit(EditKind kind);
+    void openSourceFiles(const juce::Array<juce::File>& files);
+    void showSourceOpenDialog();
+    void attachSource();          // after session_ is replaced or reloaded
+    // Two timelines: one is active (keys, edits, Play act on it).
+    void setActiveTimeline(bool source);
+    Timeline& activeTimeline() { return sourceActive_ ? sourceView_.timeline() : timeline_; }
+    Session& activeSession() { return sourceActive_ ? srcSession_ : session_; }
+    bool activePlaying() const { return sourceActive_ ? engine_.isSourcePlaying() : engine_.isPlaying(); }
+    double activePosition() const { return sourceActive_ ? engine_.sourcePosition() : engine_.positionSeconds(); }
+    double markTime();                  // playhead while playing, else the Edit Point
+    void locate(double t);              // active timeline: Edit Point (and playhead) to t
+    void locateDest(double t);
+    void togglePlay();
+    void stopAll();
+    void playRange(bool source, double from, double to);
+    void playRelative(int which);       // 0 to In, 1 from In, 2 to Out, 3 from Out, 4 through Edit Point
+    void afterStop();                   // Edit Point / playhead bookkeeping when playback ends
+    // Clipboard
+    void copyActive(bool cut);
+    void pasteActive(PasteMode mode);
+    void eraseActive();
+    juce::Array<int> editLanes(const Session& s, const Timeline& t, int clipLanes) const;
+    // Points
+    void nudgePoint(bool in, int dir);
+    void showMovePoint();
+    void showPlaybackSettings();
+    void addSrp(bool withText);
+    void editSrpText(bool source, int id);
+    void jumpToSrp(int dir);
     void addMarkerAtPlayhead(Marker::Type t);
     void splitAtPlayhead();
     void deleteSelection(bool ripple);
     void nudgeSelectedRegion(double dt);
     void openCrossfade(int out, int in);
-    void auditionRange(double from, double to);
+    void auditionRange(double from, double to) { playRange(false, from, to); }
     void refreshAll();
     void refreshIssues();
     void showPluginScanner();
@@ -150,12 +182,21 @@ private:
     void finishRelink(std::shared_ptr<RelinkState> st);
     int markerRowToTrackNumber(int row) const;
 
+    Session srcSession_;
     Session session_;
     AudioEngine engine_;
     Exporter exporter_{engine_};
     ThumbPool thumbs_{engine_.formats()};
-    SourcePanel source_{engine_, thumbs_};
+    SourceView sourceView_{srcSession_, thumbs_};
     Timeline timeline_{session_, thumbs_};
+    bool sourceActive_ = false;
+    Clip clip_;
+    double auditionStart_ = -1;
+    bool auditionSource_ = false, repeat_ = false, editFollowsStop_ = false, wasPlaying_ = false, wasSourcePlaying_ = false;
+    int nudgeSize_ = 0;
+    double preRoll_ = 3.0, postRoll_ = 2.0, nudgeSizes_[3] = {1.0 / 75, 0.1, 1.0};
+    double lastStopDest_ = 0, lastStopSource_ = 0;
+    juce::String lastSourceState_;
     std::unique_ptr<LevelMeters> meters_;
     juce::TableListBox pqList_{"PQ", this};
     ChainModel chainModel_{*this};

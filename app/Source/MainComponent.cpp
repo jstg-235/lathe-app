@@ -157,8 +157,21 @@ MainComponent::MainComponent() {
     getLookAndFeel().setColour(juce::ResizableWindow::backgroundColourId, colours::bg);
     meters_ = std::make_unique<LevelMeters>();
     addAndMakeVisible(*meters_);
-    addAndMakeVisible(source_);
+    srcSession_.lanes = 1;
+    session_.source = &srcSession_;
+    addAndMakeVisible(sourceView_);
     addAndMakeVisible(timeline_);
+    timeline_.setActive(true);
+    {
+        auto* u = props_.getUserSettings();
+        preRoll_ = u->getDoubleValue("preRoll", 3.0);
+        postRoll_ = u->getDoubleValue("postRoll", 2.0);
+        nudgeSizes_[0] = u->getDoubleValue("nudgeA", 1.0 / 75);
+        nudgeSizes_[1] = u->getDoubleValue("nudgeB", 0.1);
+        nudgeSizes_[2] = u->getDoubleValue("nudgeC", 1.0);
+        nudgeSize_ = juce::jlimit(0, 2, u->getIntValue("nudgeSize", 0));
+        editFollowsStop_ = u->getBoolValue("editPointFollowsStop", false);
+    }
 
     for (auto* b : {&newBtn_, &openBtn_, &saveBtn_, &importBtn_, &envBtn_, &snapBtn_, &lanesBtn_, &xfadeBtn_, &trackMk_, &indexMk_,
                     &pauseMk_, &splitBtn_, &playBtn_, &homeBtn_, &pluginsBtn_, &exportBtn_, &analyseBtn_, &verifyBtn_, &audioBtn_,
@@ -200,15 +213,15 @@ MainComponent::MainComponent() {
     indexMk_.onClick = [this] { addMarkerAtPlayhead(Marker::Index); };
     pauseMk_.onClick = [this] { addMarkerAtPlayhead(Marker::PauseStart); };
     splitBtn_.onClick = [this] { splitAtPlayhead(); };
-    playBtn_.onClick = [this] { auditionEnd_ = -1; engine_.isPlaying() ? engine_.stop() : engine_.play(); };
-    homeBtn_.onClick = [this] { engine_.setPositionSeconds(0); meters_->reset(); };
+    playBtn_.onClick = [this] { setActiveTimeline(false); togglePlay(); };
+    homeBtn_.onClick = [this] { locateDest(0); meters_->reset(); };
     pluginsBtn_.onClick = [this] { showPluginMenu(); };
     exportBtn_.onClick = [this] { showExportMenu(); };
     analyseBtn_.onClick = [this] { runAnalysis(); };
     verifyBtn_.onClick = [this] { verifyDdp(); };
     audioBtn_.onClick = [this] { showAudioSettings(); };
-    zoomIn_.onClick = [this] { timeline_.zoomBy(1.5, engine_.positionSeconds()); };
-    zoomOut_.onClick = [this] { timeline_.zoomBy(1 / 1.5, engine_.positionSeconds()); };
+    zoomIn_.onClick = [this] { timeline_.zoomBy(1.5, engine_.isPlaying() ? engine_.positionSeconds() : timeline_.editPoint()); };
+    zoomOut_.onClick = [this] { timeline_.zoomBy(1 / 1.5, engine_.isPlaying() ? engine_.positionSeconds() : timeline_.editPoint()); };
     zoomFit_.onClick = [this] { timeline_.zoomToFit(); };
 
     chainAdd_.onClick = [this] { showPluginMenu(); };
@@ -229,8 +242,35 @@ MainComponent::MainComponent() {
         if (i >= 0 && i + 1 < engine_.chain().size()) { engine_.chain().move(i, i + 1); chainList_.selectRow(i + 1); chainList_.updateContent(); sessionChanged(); }
     };
 
-    source_.onEdit = [this](Session::EditMode m) { sourceEdit(m); };
-    source_.onAppend = [this] { appendSource(); };
+    sourceView_.onOpen = [this] { showSourceOpenDialog(); };
+    sourceView_.onClear = [this] { commands_.invokeDirectly(cmd::clearSource, true); };
+    sourceView_.onPlay = [this] {
+        if (engine_.isSourcePlaying()) { stopAll(); return; }
+        setActiveTimeline(true);
+        togglePlay();
+    };
+    sourceView_.onMarkIn = [this] { setActiveTimeline(true); sourceView_.timeline().setInPoint(markTime()); };
+    sourceView_.onMarkOut = [this] { setActiveTimeline(true); sourceView_.timeline().setOutPoint(markTime()); };
+    sourceView_.onInsert = [this] { sourceEdit(EditKind::Insert); };
+    sourceView_.onReplace = [this] { sourceEdit(EditKind::Replace); };
+    sourceView_.onReplaceLeft = [this] { sourceEdit(EditKind::ReplaceLeft); };
+    sourceView_.onConstrained = [this] { sourceEdit(EditKind::Constrained); };
+    sourceView_.onFit = [this] { sourceEdit(EditKind::Fit); };
+    sourceView_.onOverlay = [this] { sourceEdit(EditKind::Overlay); };
+    sourceView_.onAppend = [this] { appendSource(); };
+    sourceView_.onLinkChanged = [this] {
+        if (!sourceView_.linked() && engine_.isLinkedPlaying()) stopAll();
+    };
+    {
+        auto& st = sourceView_.timeline();
+        st.onFocus = [this] { setActiveTimeline(true); };
+        st.onEdit = [this] { sessionChanged(); };
+        st.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setSourcePosition(t); sourceView_.timeline().setPlayhead(t, false); };
+        st.onSrpEdit = [this](int id) { editSrpText(true, id); };
+        st.onCrossfade = [this](int, int) {};
+    }
+    timeline_.onFocus = [this] { setActiveTimeline(false); };
+    timeline_.onSrpEdit = [this](int id) { editSrpText(false, id); };
 
     timeline_.onEdit = [this] { sessionChanged(); };
     timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
@@ -239,7 +279,7 @@ MainComponent::MainComponent() {
     timeline_.onRegionFx = [this](int id) { openRegionFx(id); };
     timeline_.onRegionRestore = [this](int id) { showRestore(id); };
     timeline_.onRegionSpectral = [this](int id) { showSpectral(id); };
-    timeline_.onProblemClicked = [this](double t) { engine_.setPositionSeconds(juce::jmax(0.0, t - 1.0)); };
+    timeline_.onProblemClicked = [this](double t) { locateDest(juce::jmax(0.0, t - 1.0)); };
     recordBtn_.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff7a2622));
     recordBtn_.setColour(juce::TextButton::buttonOnColourId, colours::error);
     recordBtn_.setColour(juce::TextButton::textColourOffId, colours::text);
@@ -259,7 +299,7 @@ MainComponent::MainComponent() {
             if (session_.markers[i].id == id) { pqList_.selectRow(i); break; }
     };
     timeline_.onMarkerDoubleClicked = [this](int id) {
-        if (auto* m = session_.findMarker(id)) engine_.setPositionSeconds(m->t);
+        if (auto* m = session_.findMarker(id)) locateDest(m->t);
     };
 
     auto& h = pqList_.getHeader();
@@ -343,7 +383,10 @@ MainComponent::MainComponent() {
     surface_->position = [this] { return engine_.positionSeconds(); };
     surface_->isPlaying = [this] { return engine_.isPlaying(); };
     surface_->isRecording = [this] { return engine_.isRecording(); };
-    surface_->jog = [this](double dt) { engine_.setPositionSeconds(juce::jmax(0.0, engine_.positionSeconds() + dt)); };
+    surface_->jog = [this](double dt) {
+        if (engine_.isPlaying()) engine_.setPositionSeconds(juce::jmax(0.0, engine_.positionSeconds() + dt));
+        else locateDest(juce::jmax(0.0, timeline_.editPoint() + dt));
+    };
     setWantsKeyboardFocus(true);
     setSize(1440, 900);
     newSession();
@@ -410,7 +453,7 @@ void MainComponent::resized() {
     right.removeFromBottom(6);
     chainList_.setBounds(right);
 
-    source_.setBounds(r.removeFromTop(150));
+    sourceView_.setBounds(r.removeFromTop(juce::jlimit(170, 260, r.getHeight() / 4)));
     r.removeFromTop(6);
 
     auto transport = r.removeFromTop(34);
@@ -456,6 +499,20 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::toggleEnvelope: info.setTicked(timeline_.envelopeMode()); break;
         case cmd::toggleSnap: info.setTicked(snapBtn_.getToggleState()); break;
         case cmd::followProjectRate: info.setTicked(followRate_); break;
+        case cmd::repeatPlay: info.setTicked(repeat_); break;
+        case cmd::linkPlay: info.setTicked(sourceView_.linked()); break;
+        case cmd::editPointFollowsStop: info.setTicked(editFollowsStop_); break;
+        case cmd::nudgeSizeA: case cmd::nudgeSizeB: case cmd::nudgeSizeC: {
+            const int k = int(id - cmd::nudgeSizeA);
+            info.setTicked(nudgeSize_ == k);
+            const double v = nudgeSizes_[k];
+            info.shortName << "  (" << (std::abs(v * 75 - std::round(v * 75)) < 1e-6 && v < 1 ? juce::String(juce::roundToInt(v * 75)) + " frame" + (juce::roundToInt(v * 75) == 1 ? "" : "s")
+                                                                                              : juce::String(v * 1000, 0) + " ms") << ")";
+            break;
+        }
+        case cmd::pasteInsert: case cmd::pasteReplace: case cmd::pasteReplaceLeft: case cmd::pasteConstrained: case cmd::pasteOverlay:
+            info.setActive(!clip_.isEmpty());
+            break;
         case cmd::muteRegion:
         case cmd::nudgeLeft: case cmd::nudgeRight: case cmd::nudgeLeftBig: case cmd::nudgeRightBig:
         case cmd::selectRegionRange:
@@ -477,7 +534,7 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::saveSession: saveSession(false); break;
         case cmd::saveSessionAs: saveSession(true); break;
         case cmd::importAudio: importBtn_.onClick(); break;
-        case cmd::openSource: source_.showOpenDialog(); break;
+        case cmd::openSource: showSourceOpenDialog(); break;
         case cmd::exportDdp: exportDdp(); break;
         case cmd::exportTrackWavs: exportTrackWavs(); break;
         case cmd::exportProgram24:
@@ -505,29 +562,133 @@ bool MainComponent::perform(const InvocationInfo& info) {
             break;
         case cmd::batchRender: showBatchDialog(); break;
         case cmd::locateMissingAudio: locateMissingAudio(true); break;
-        case cmd::sourceIn: source_.markIn(); break;
-        case cmd::sourceOut: source_.markOut(); break;
-        case cmd::destIn: { auto s = timeline_.selection(); timeline_.setSelection({pos, juce::jmax(pos, s.getEnd())}); break; }
-        case cmd::destOut: { auto s = timeline_.selection(); timeline_.setSelection({juce::jmin(pos, s.isEmpty() ? pos : s.getStart()), pos}); break; }
-        case cmd::insertEdit: sourceEdit(Session::EditMode::Insert); break;
-        case cmd::overwriteEdit: sourceEdit(Session::EditMode::Overwrite); break;
-        case cmd::replaceEdit: sourceEdit(Session::EditMode::Replace); break;
+        case cmd::sourceIn: activeTimeline().setInPoint(markTime()); break;
+        case cmd::sourceOut: activeTimeline().setOutPoint(markTime()); break;
+        case cmd::destIn: timeline_.setInPoint(engine_.isPlaying() ? pos : timeline_.editPoint()); break;
+        case cmd::destOut: timeline_.setOutPoint(engine_.isPlaying() ? pos : timeline_.editPoint()); break;
+        case cmd::goToIn: if (activeTimeline().inPoint() >= 0) locate(activeTimeline().inPoint()); break;
+        case cmd::goToOut: if (activeTimeline().outPoint() >= 0) locate(activeTimeline().outPoint()); break;
+        case cmd::clearIn: { auto& t = activeTimeline(); const double o = t.outPoint(); t.clearInOut(); if (o >= 0) t.setOutPoint(o); break; }
+        case cmd::clearOut: { auto& t = activeTimeline(); const double i = t.inPoint(); t.clearInOut(); if (i >= 0) t.setInPoint(i); break; }
+        case cmd::moveInToOut: {
+            auto& t = activeTimeline();
+            if (t.inPoint() >= 0 && t.outPoint() > t.inPoint()) {
+                const double len = t.outPoint() - t.inPoint(), o = t.outPoint();
+                t.setSelection({o, o + len});
+                t.reveal(o + len);
+            }
+            break;
+        }
+        case cmd::nudgeInLeft: nudgePoint(true, -1); break;
+        case cmd::nudgeInRight: nudgePoint(true, 1); break;
+        case cmd::nudgeOutLeft: nudgePoint(false, -1); break;
+        case cmd::nudgeOutRight: nudgePoint(false, 1); break;
+        case cmd::nudgeSizeA: case cmd::nudgeSizeB: case cmd::nudgeSizeC:
+            nudgeSize_ = int(info.commandID - cmd::nudgeSizeA);
+            props_.getUserSettings()->setValue("nudgeSize", nudgeSize_);
+            commands_.commandStatusChanged();
+            break;
+        case cmd::movePoint: showMovePoint(); break;
+        case cmd::editPointToPlayhead: {
+            const double t = activePlaying() ? activePosition() : (sourceActive_ ? lastStopSource_ : lastStopDest_);
+            activeTimeline().setEditPoint(t, true);
+            break;
+        }
+        case cmd::insertEdit: sourceEdit(EditKind::Insert); break;
+        case cmd::overwriteEdit: sourceEdit(EditKind::Replace); break;
+        case cmd::replaceLeftEdit: sourceEdit(EditKind::ReplaceLeft); break;
+        case cmd::constrainedEdit: sourceEdit(EditKind::Constrained); break;
+        case cmd::replaceEdit: sourceEdit(EditKind::Fit); break;
+        case cmd::overlayEdit: sourceEdit(EditKind::Overlay); break;
         case cmd::appendEdit: appendSource(); break;
-        case cmd::playSourceInOut: source_.playInOut(); break;
-        case cmd::playStop: playBtn_.onClick(); break;
-        case cmd::playSource: source_.togglePlay(); break;
-        case cmd::returnToStart: homeBtn_.onClick(); break;
-        case cmd::locateBackFrame: engine_.setPositionSeconds(juce::jmax(0.0, pos - 1.0 / 75)); break;
-        case cmd::locateFwdFrame: engine_.setPositionSeconds(pos + 1.0 / 75); break;
-        case cmd::locateBackSecond: engine_.setPositionSeconds(juce::jmax(0.0, pos - 1.0)); break;
-        case cmd::locateFwdSecond: engine_.setPositionSeconds(pos + 1.0); break;
+        case cmd::playSourceInOut: {
+            auto r = sourceView_.timeline().selection();
+            setActiveTimeline(true);
+            if (!r.isEmpty()) playRange(true, r.getStart(), r.getEnd());
+            break;
+        }
+        case cmd::switchTimeline: setActiveTimeline(!sourceActive_); break;
+        case cmd::linkPlay:
+            sourceView_.setLinked(!sourceView_.linked());
+            sourceView_.onLinkChanged();
+            commands_.commandStatusChanged();
+            break;
+        case cmd::clearSource:
+            if (engine_.isSourcePlaying()) stopAll();
+            srcSession_.regions.clear();
+            srcSession_.srps.clear();
+            srcSession_.markers.clear();
+            sourceView_.timeline().clearInOut();
+            sourceView_.timeline().setEditPoint(0);
+            sessionChanged();
+            break;
+        case cmd::cutRange: copyActive(true); break;
+        case cmd::copyRange: copyActive(false); break;
+        case cmd::pasteInsert: pasteActive(PasteMode::Insert); break;
+        case cmd::pasteReplace: pasteActive(PasteMode::Replace); break;
+        case cmd::pasteReplaceLeft: pasteActive(PasteMode::ReplaceLeft); break;
+        case cmd::pasteConstrained: pasteActive(PasteMode::Constrained); break;
+        case cmd::pasteOverlay: pasteActive(PasteMode::Overlay); break;
+        case cmd::eraseRange: eraseActive(); break;
+        case cmd::playStop: togglePlay(); break;
+        case cmd::playSource:
+            if (engine_.isSourcePlaying() && !engine_.isPlaying()) { stopAll(); break; }
+            setActiveTimeline(true);
+            if (!activePlaying()) togglePlay();
+            break;
+        case cmd::returnToStart: if (sourceActive_) locate(0); else homeBtn_.onClick(); break;
+        case cmd::locateBackFrame: locate(juce::jmax(0.0, markTime() - 1.0 / 75)); break;
+        case cmd::locateFwdFrame: locate(markTime() + 1.0 / 75); break;
+        case cmd::locateBackSecond: locate(juce::jmax(0.0, markTime() - 1.0)); break;
+        case cmd::locateFwdSecond: locate(markTime() + 1.0); break;
         case cmd::prevMarker: jumpToMarker(-1); break;
         case cmd::nextMarker: jumpToMarker(1); break;
         case cmd::playSelection: {
-            auto s = timeline_.selection();
-            if (!s.isEmpty()) auditionRange(s.getStart(), s.getEnd());
+            auto s = activeTimeline().selection();
+            if (!s.isEmpty()) playRange(sourceActive_, s.getStart(), s.getEnd());
             break;
         }
+        case cmd::playToIn: playRelative(0); break;
+        case cmd::playFromIn: playRelative(1); break;
+        case cmd::playToOut: playRelative(2); break;
+        case cmd::playFromOut: playRelative(3); break;
+        case cmd::playAroundEdit: playRelative(4); break;
+        case cmd::repeatPlay: repeat_ = !repeat_; commands_.commandStatusChanged(); break;
+        case cmd::editPointFollowsStop:
+            editFollowsStop_ = !editFollowsStop_;
+            props_.getUserSettings()->setValue("editPointFollowsStop", editFollowsStop_);
+            commands_.commandStatusChanged();
+            break;
+        case cmd::playbackSettings: showPlaybackSettings(); break;
+        case cmd::addSrp: addSrp(false); break;
+        case cmd::addSrpText: addSrp(true); break;
+        case cmd::srpsFromSelection: {
+            auto& t = activeTimeline();
+            auto& ss = activeSession();
+            auto r = t.selection();
+            if (r.isEmpty())
+                if (auto* reg = ss.findRegion(t.selectedRegion())) r = {reg->start, reg->end()};
+            if (r.isEmpty()) break;
+            ss.addSrp(r.getStart(), "In");
+            ss.addSrp(r.getEnd(), "Out");
+            sessionChanged();
+            break;
+        }
+        case cmd::prevSrp: jumpToSrp(-1); break;
+        case cmd::nextSrp: jumpToSrp(1); break;
+        case cmd::lockSrp:
+            if (auto* p = activeSession().findSrp(activeTimeline().selectedSrp())) { p->locked = !p->locked; sessionChanged(); }
+            break;
+        case cmd::deleteSrp:
+            if (activeSession().findSrp(activeTimeline().selectedSrp())) {
+                activeSession().removeSrp(activeTimeline().selectedSrp());
+                activeTimeline().selectSrp(0);
+                sessionChanged();
+            }
+            break;
+        case cmd::deleteAllSrps:
+            if (!activeSession().srps.isEmpty()) { activeSession().srps.clear(); sessionChanged(); }
+            break;
         case cmd::addTrackMarker: addMarkerAtPlayhead(Marker::TrackStart); break;
         case cmd::addIndexMarker: addMarkerAtPlayhead(Marker::Index); break;
         case cmd::addPauseMarker: addMarkerAtPlayhead(Marker::PauseStart); break;
@@ -602,9 +763,24 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
         case 1:
             add({cmd::undo, cmd::redo});
             m.addSeparator();
-            add({cmd::sourceIn, cmd::sourceOut, cmd::destIn, cmd::destOut});
+            add({cmd::cutRange, cmd::copyRange, cmd::pasteInsert, cmd::pasteReplace, cmd::pasteReplaceLeft, cmd::pasteConstrained, cmd::pasteOverlay,
+                 cmd::eraseRange});
             m.addSeparator();
-            add({cmd::insertEdit, cmd::overwriteEdit, cmd::replaceEdit, cmd::appendEdit});
+            {
+                juce::PopupMenu sd;
+                auto addTo = [&](juce::PopupMenu& mm, std::initializer_list<juce::CommandID> ids) { for (auto id : ids) mm.addCommandItem(&commands_, id); };
+                addTo(sd, {cmd::switchTimeline, cmd::linkPlay});
+                sd.addSeparator();
+                addTo(sd, {cmd::sourceIn, cmd::sourceOut, cmd::destIn, cmd::destOut, cmd::goToIn, cmd::goToOut, cmd::clearIn, cmd::clearOut, cmd::moveInToOut});
+                sd.addSeparator();
+                addTo(sd, {cmd::nudgeInLeft, cmd::nudgeInRight, cmd::nudgeOutLeft, cmd::nudgeOutRight, cmd::nudgeSizeA, cmd::nudgeSizeB, cmd::nudgeSizeC,
+                           cmd::movePoint, cmd::editPointToPlayhead});
+                sd.addSeparator();
+                addTo(sd, {cmd::insertEdit, cmd::overwriteEdit, cmd::replaceLeftEdit, cmd::constrainedEdit, cmd::replaceEdit, cmd::overlayEdit, cmd::appendEdit});
+                sd.addSeparator();
+                addTo(sd, {cmd::openSource, cmd::clearSource});
+                m.addSubMenu("Source / Destination", sd);
+            }
             m.addSeparator();
             add({cmd::splitAtPlayhead, cmd::deleteClose, cmd::deleteLeave, cmd::muteRegion, cmd::selectRegionRange, cmd::clearSelection});
             m.addSeparator();
@@ -617,13 +793,21 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
         case 2:
             add({cmd::playStop, cmd::playSource, cmd::playSourceInOut, cmd::playSelection, cmd::returnToStart});
             m.addSeparator();
+            add({cmd::playToIn, cmd::playFromIn, cmd::playToOut, cmd::playFromOut, cmd::playAroundEdit, cmd::repeatPlay});
+            m.addSeparator();
+            add({cmd::editPointFollowsStop, cmd::playbackSettings});
+            m.addSeparator();
             add({cmd::listenReference, cmd::compareUnprocessed});
             m.addSeparator();
             add({cmd::record});
             m.addSeparator();
             add({cmd::locateBackFrame, cmd::locateFwdFrame, cmd::locateBackSecond, cmd::locateFwdSecond, cmd::prevMarker, cmd::nextMarker});
             break;
-        case 3: add({cmd::addTrackMarker, cmd::addIndexMarker, cmd::addPauseMarker, cmd::addEndMarker}); break;
+        case 3:
+            add({cmd::addTrackMarker, cmd::addIndexMarker, cmd::addPauseMarker, cmd::addEndMarker});
+            m.addSeparator();
+            add({cmd::addSrp, cmd::addSrpText, cmd::srpsFromSelection, cmd::prevSrp, cmd::nextSrp, cmd::lockSrp, cmd::deleteSrp, cmd::deleteAllSrps});
+            break;
         case 4:
             add({cmd::zoomIn, cmd::zoomOut, cmd::zoomFit});
             m.addSeparator();
@@ -1144,6 +1328,7 @@ void MainComponent::openDdpAsSession(const juce::File& folder) {
     }
     newSession();
     session_ = s;
+    attachSource();
     lastState_ = juce::JSON::toString(session_.toVar(), true);
     refreshAll();
     timeline_.zoomToFit();
@@ -1157,7 +1342,7 @@ void MainComponent::openDdpAsSession(const juce::File& folder) {
 
 void MainComponent::showAnalysisWindow() {
     if (!analysis_) return;
-    auto* v = new AnalysisView(analysis_, [this](double t) { engine_.setPositionSeconds(juce::jmax(0.0, t - 1.0)); });
+    auto* v = new AnalysisView(analysis_, [this](double t) { locateDest(juce::jmax(0.0, t - 1.0)); });
     auto title = juce::String("Analysis") + (analysisStale_ ? " (out of date: the session changed since)" : "");
     auto* w = new PlainWindow(v, title, false);
     w->onClose = [this] { juce::MessageManager::callAsync([this] { analysisWindow_.reset(); }); };
@@ -1679,15 +1864,15 @@ void MainComponent::showSpectral(int id) {
 }
 
 void MainComponent::jumpToMarker(int dir) {
-    double pos = engine_.positionSeconds();
+    double pos = markTime();
     double best = dir < 0 ? -1.0 : 1e12;
-    for (auto& m : session_.markers) {
+    for (auto& m : activeSession().markers) {
         if (dir < 0 && m.t < pos - 0.02 && m.t > best) best = m.t;
         if (dir > 0 && m.t > pos + 0.02 && m.t < best) best = m.t;
     }
     if (dir < 0 && best < 0) best = 0;
     if (dir > 0 && best > 1e11) return;
-    engine_.setPositionSeconds(best);
+    locate(best);
 }
 
 void MainComponent::applyFollowRate() {
@@ -1727,7 +1912,7 @@ void MainComponent::sessionChanged(bool undoable) {
     if (fxWindow_ && !session_.findRegion(fxWindowRegion_)) fxWindow_.reset();
     session_.pluginChainState = engine_.chain().getState();
     auto now = juce::JSON::toString(session_.toVar(), true);
-    if (now == lastState_) { timeline_.repaint(); return; }
+    if (now == lastState_) { timeline_.repaint(); sourceView_.timeline().repaint(); return; }
     if (undoable && lastState_.isNotEmpty()) {
         undo_.add(lastState_);
         if (undo_.size() > 300) undo_.remove(0);
@@ -1738,7 +1923,12 @@ void MainComponent::sessionChanged(bool undoable) {
     if (analysis_ && !analysisStale_) { analysisStale_ = true; timeline_.setAnalysisStale(true); }
     applyFollowRate();
     engine_.loadSession(session_);
+    if (auto st = juce::JSON::toString(srcSession_.toVar(), true); st != lastSourceState_) {
+        lastSourceState_ = st;
+        engine_.loadSourceSession(srcSession_);
+    }
     timeline_.sessionUpdated();
+    sourceView_.timeline().sessionUpdated();
     pqList_.updateContent();
     pqList_.repaint();
     refreshIssues();
@@ -1789,8 +1979,12 @@ void MainComponent::refreshAll() {
     }
     applyFollowRate();
     engine_.loadSession(session_);
+    engine_.loadSourceSession(srcSession_);
+    lastSourceState_ = juce::JSON::toString(srcSession_.toVar(), true);
     timeline_.sessionUpdated();
     timeline_.resized();
+    sourceView_.timeline().sessionUpdated();
+    sourceView_.timeline().resized();
     pqList_.updateContent();
     pqList_.repaint();
     chainList_.updateContent();
@@ -1810,6 +2004,7 @@ void MainComponent::newSession() {
     refWindow_.reset();
     analysisWindow_.reset();
     session_ = Session();
+    attachSource();
     juce::StringArray problems;
     engine_.chain().setState({}, problems);
     undo_.clear();
@@ -1838,6 +2033,7 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
     restoreWindow_.reset();
     spectralWindow_.reset();
     session_ = s;
+    attachSource();
     // Audio that moved with the session (same folder, or an Audio folder beside it) is found silently.
     const auto dir = f.getParentDirectory();
     const int foundBeside = session_.findMissingAudioIn({dir, dir.getChildFile("Audio"), dir.getChildFile("Audio Files")});
@@ -1916,37 +2112,453 @@ void MainComponent::importFiles(const juce::Array<juce::File>& files) {
         juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Some files couldn't be read", bad.joinIntoString("\n"));
 }
 
-void MainComponent::appendSource() {
-    if (!source_.hasSource()) return;
-    auto io = source_.inOut();
-    Region reg = session_.makeRegion(source_.file(), source_.rate(), source_.lengthSamples());
-    reg.srcIn = juce::int64(io.getStart() * source_.rate());
-    reg.srcOut = juce::jmin(source_.lengthSamples(), juce::int64(io.getEnd() * source_.rate()));
-    session_.append(reg, 2.0);
+void MainComponent::attachSource() {
+    session_.source = &srcSession_;
+    juce::String err;
+    if (!session_.sourceDoc.isObject() || !srcSession_.fromVar(session_.sourceDoc, err)) {
+        srcSession_ = Session();
+        srcSession_.lanes = 1;
+    }
+    srcSession_.source = nullptr;
+    sourceView_.timeline().clearInOut();
+    sourceView_.timeline().setEditPoint(0);
+    timeline_.clearInOut();
+    timeline_.setEditPoint(0);
+    sourceView_.timeline().zoomToFit();
+}
+
+void MainComponent::showSourceOpenDialog() {
+    chooser_ = std::make_unique<juce::FileChooser>("Add to the source timeline", juce::File(), engine_.formats().getWildcardForAllFormats());
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectMultipleItems,
+                          [this](const juce::FileChooser& fc) { openSourceFiles(fc.getResults()); });
+}
+
+void MainComponent::openSourceFiles(const juce::Array<juce::File>& files) {
+    juce::StringArray bad;
+    int first = 0;
+    for (auto& f : files) {
+        std::unique_ptr<juce::AudioFormatReader> r(engine_.formats().createReaderFor(f));
+        if (!r) { bad.add(f.getFileName()); continue; }
+        Region reg = srcSession_.makeRegion(f, r->sampleRate, r->lengthInSamples);
+        // Each file after the last, one second apart, on the first targeted lane.
+        reg.lane = srcSession_.targetLanes().getFirst();
+        double laneEnd = 0;
+        bool any = false;
+        for (auto& o : srcSession_.regions)
+            if (o.lane == reg.lane) { laneEnd = juce::jmax(laneEnd, o.end()); any = true; }
+        reg.start = any ? laneEnd + 1.0 : 0.0;
+        srcSession_.regions.add(reg);
+        if (!first) first = reg.id;
+    }
+    if (first) {
+        auto& st = sourceView_.timeline();
+        if (auto* r = srcSession_.findRegion(first)) {
+            st.setEditPoint(r->start);
+            st.selectRegion(first);
+        }
+        setActiveTimeline(true);
+        sessionChanged();
+        st.zoomToFit();
+    }
+    if (!bad.isEmpty())
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Some files couldn't be read", bad.joinIntoString("\n"));
+}
+
+void MainComponent::setActiveTimeline(bool source) {
+    sourceActive_ = source;
+    sourceView_.timeline().setActive(source);
+    timeline_.setActive(!source);
+    engine_.setHearSource(source);
+}
+
+double MainComponent::markTime() { return activePlaying() ? activePosition() : activeTimeline().editPoint(); }
+
+void MainComponent::locate(double t) {
+    t = juce::jmax(0.0, t);
+    if (sourceActive_) {
+        sourceView_.timeline().setEditPoint(t, true);
+        engine_.setSourcePosition(t);
+        sourceView_.timeline().setPlayhead(t, false);
+    } else {
+        locateDest(t);
+    }
+}
+
+void MainComponent::locateDest(double t) {
+    t = juce::jmax(0.0, t);
+    timeline_.setEditPoint(t, true);
+    engine_.setPositionSeconds(t);
+    timeline_.setPlayhead(t, false);
+}
+
+void MainComponent::stopAll() {
+    lastStopDest_ = engine_.positionSeconds();
+    lastStopSource_ = engine_.sourcePosition();
+    auditionEnd_ = -1;
+    engine_.stop();
+    afterStop();
+    wasPlaying_ = wasSourcePlaying_ = false;
+}
+
+void MainComponent::afterStop() {
+    // Either the Edit Point moves to where playback stopped, or the playhead goes back to it.
+    if (engine_.isPlaying() || engine_.isSourcePlaying()) return;
+    auto& st = sourceView_.timeline();
+    if (editFollowsStop_) {
+        timeline_.setEditPoint(lastStopDest_);
+        st.setEditPoint(lastStopSource_);
+    } else {
+        engine_.setPositionSeconds(timeline_.editPoint());
+        engine_.setSourcePosition(st.editPoint());
+    }
+    timeline_.setPlayhead(engine_.positionSeconds(), false);
+    st.setPlayhead(engine_.sourcePosition(), false);
+}
+
+void MainComponent::togglePlay() {
+    if (engine_.isPlaying() || engine_.isSourcePlaying()) { stopAll(); return; }
+    auditionEnd_ = -1;
+    auto& st = sourceView_.timeline();
+    // Repeat with an In-Out on the active timeline loops it.
+    if (repeat_ && !activeTimeline().selection().isEmpty() && !sourceView_.linked()) {
+        auto r = activeTimeline().selection();
+        playRange(sourceActive_, r.getStart(), r.getEnd());
+        return;
+    }
+    if (sourceView_.linked() && !srcSession_.regions.isEmpty()) {
+        engine_.setPositionSeconds(timeline_.editPoint());
+        engine_.setSourcePosition(st.editPoint());
+        engine_.setHearSource(sourceActive_);
+        engine_.playLinked();
+    } else if (sourceActive_) {
+        engine_.setSourcePosition(st.editPoint());
+        engine_.playSource();
+    } else {
+        engine_.setPositionSeconds(timeline_.editPoint());
+        engine_.play();
+    }
+}
+
+void MainComponent::playRange(bool source, double from, double to) {
+    if (to <= from) return;
+    from = juce::jmax(0.0, from);
+    auditionSource_ = source;
+    auditionStart_ = from;
+    auditionEnd_ = to;
+    if (source) {
+        engine_.setSourcePosition(from);
+        engine_.playSource();
+    } else {
+        engine_.setPositionSeconds(from);
+        engine_.play();
+    }
+    wasPlaying_ = engine_.isPlaying();
+    wasSourcePlaying_ = engine_.isSourcePlaying();
+}
+
+void MainComponent::playRelative(int which) {
+    auto& t = activeTimeline();
+    const double e = t.editPoint();
+    const double in = t.inPoint() >= 0 ? t.inPoint() : e, out = t.outPoint() >= 0 ? t.outPoint() : e;
+    switch (which) {
+        case 0: playRange(sourceActive_, in - preRoll_, in); break;
+        case 1: playRange(sourceActive_, in, in + postRoll_); break;
+        case 2: playRange(sourceActive_, out - preRoll_, out); break;
+        case 3: playRange(sourceActive_, out, out + postRoll_); break;
+        default: playRange(sourceActive_, e - preRoll_, e + postRoll_); break;
+    }
+}
+
+juce::Array<int> MainComponent::editLanes(const Session& s, const Timeline& t, int clipLanes) const {
+    auto targets = s.targetLanes();
+    // A one-lane clip goes on the selected lane when that lane is targeted, else the first target.
+    if (clipLanes <= 1) return {targets.contains(t.selectedLane()) ? t.selectedLane() : targets.getFirst()};
+    juce::Array<int> out;
+    for (int l : targets)
+        if (l >= t.selectedLane() || out.size() + (targets.size() - targets.indexOf(l)) <= clipLanes) out.add(l);
+    return out.isEmpty() ? targets : out;
+}
+
+void MainComponent::sourceEdit(EditKind kind) {
+    auto& st = sourceView_.timeline();
+    if (srcSession_.regions.isEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Nothing in the source",
+                                               "Open or drop audio on the source timeline (above the destination), mark its In and Out, then edit.");
+        return;
+    }
+    double sIn = st.inPoint(), sOut = st.outPoint();
+    const double dIn = timeline_.inPoint(), dOut = timeline_.outPoint();
+    const bool destRange = dIn >= 0 && dOut > dIn;
+    // Source range: In-Out, else the selected source region, else everything.
+    if (sIn < 0 && sOut < 0) {
+        if (auto* r = srcSession_.findRegion(st.selectedRegion())) { sIn = r->start; sOut = r->end(); }
+        else { sIn = 0; sOut = srcSession_.end(); }
+    } else if (sOut < 0) {   // 3-point: the destination range gives the length
+        sOut = destRange && kind != EditKind::Fit ? sIn + (dOut - dIn) : srcSession_.end();
+    } else if (sIn < 0) {    // back-timed source
+        sIn = juce::jmax(0.0, destRange && kind != EditKind::Fit ? sOut - (dOut - dIn) : 0.0);
+    }
+    if (sOut <= sIn) return;
+    if ((kind == EditKind::Fit || kind == EditKind::Constrained) && !destRange) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, kind == EditKind::Fit ? "Fit needs a destination In and Out" : "Replace Constrained needs a destination In and Out",
+                                               "Mark the destination In and Out (drag across the destination, or Shift+I / Shift+O), then try again.");
+        return;
+    }
+    Clip clip = srcSession_.copyRange(sIn, sOut, srcSession_.targetLanes());
+    if (clip.regions.isEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "No audio there", "The source In-Out has no audio on its targeted lanes.");
+        return;
+    }
+    auto lanes = editLanes(session_, timeline_, clip.laneCount);
+    const double at = dIn >= 0 ? dIn : timeline_.editPoint();
+    juce::Array<int> ids;
+    double endT = at + clip.length;
+    switch (kind) {
+        case EditKind::Insert: ids = session_.paste(clip, lanes, at, PasteMode::Insert); break;
+        case EditKind::Replace: ids = session_.paste(clip, lanes, at, PasteMode::Replace); break;
+        case EditKind::Overlay: ids = session_.paste(clip, lanes, at, PasteMode::Overlay); break;
+        case EditKind::Constrained:
+            ids = session_.paste(clip, lanes, dIn, PasteMode::Constrained, dOut);
+            endT = juce::jmin(dOut, dIn + clip.length);
+            break;
+        case EditKind::ReplaceLeft: {
+            const double end = dOut >= 0 ? dOut : (dIn >= 0 ? dIn : timeline_.editPoint());
+            ids = session_.paste(clip, lanes, at, PasteMode::ReplaceLeft, end);
+            endT = end;
+            break;
+        }
+        case EditKind::Fit: {
+            juce::Array<int> used;
+            for (int k = 0; k < clip.laneCount && k < lanes.size(); ++k) used.add(lanes[k]);
+            session_.clearRange(dIn, dOut, used, false);
+            session_.ripple(dOut - 1e-4, clip.length - (dOut - dIn), 0, &used);
+            ids = session_.paste(clip, lanes, dIn, PasteMode::Overlay);
+            break;
+        }
+    }
+    if (!ids.isEmpty()) timeline_.selectRegion(ids.getFirst());
+    timeline_.clearInOut();
+    locateDest(endT);   // ready for the next edit
+    setActiveTimeline(false);
     sessionChanged();
 }
 
-void MainComponent::sourceEdit(Session::EditMode mode) {
-    if (!source_.hasSource()) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "No source", "Open a file in the Source window first.");
-        return;
+void MainComponent::appendSource() {
+    auto& st = sourceView_.timeline();
+    if (srcSession_.regions.isEmpty()) return;
+    auto r = st.selection();
+    if (r.isEmpty()) {
+        if (auto* reg = srcSession_.findRegion(st.selectedRegion())) r = {reg->start, reg->end()};
+        else r = {0.0, srcSession_.end()};
     }
-    auto io = source_.inOut();
-    auto sel = timeline_.selection();
-    double dIn = sel.isEmpty() ? engine_.positionSeconds() : sel.getStart();
-    double dOut = sel.isEmpty() ? -1.0 : sel.getEnd();
-    if (mode == Session::EditMode::Replace && sel.isEmpty()) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Replace needs a destination range",
-                                               "Drag across the timeline (or use Shift+I / Shift+O) to mark the destination In and Out, "
-                                               "and mark the source In and Out, then Replace.");
-        return;
+    Clip clip = srcSession_.copyRange(r.getStart(), r.getEnd(), srcSession_.targetLanes());
+    if (clip.regions.isEmpty()) return;
+    double laneEnd = 0;
+    bool any = false;
+    for (auto& o : session_.regions) { laneEnd = juce::jmax(laneEnd, o.end()); any = true; }
+    const double at = any ? laneEnd + 2.0 : 2.0;
+    auto ids = session_.paste(clip, editLanes(session_, timeline_, clip.laneCount), at, PasteMode::Overlay);
+    if (!ids.isEmpty()) {
+        const int m = session_.addMarker(Marker::TrackStart, at, ids.getFirst());
+        if (auto* mk = session_.findMarker(m)) {
+            mk->text.title = clip.regions.getFirst().name.toStdString();
+            mk->text.performer = session_.discPerformer.toStdString();
+        }
+        if (any) session_.addMarker(Marker::PauseStart, laneEnd, ids.getFirst());
     }
-    const double rate = source_.rate();
-    auto sIn = juce::int64(io.getStart() * rate), sOut = juce::jmin(source_.lengthSamples(), juce::int64(io.getEnd() * rate));
-    int id = session_.sourceEdit(source_.file(), rate, source_.lengthSamples(), sIn, sOut, timeline_.selectedLane(), dIn, dOut, mode);
-    timeline_.selectRegion(id);
-    timeline_.setSelection({});
     sessionChanged();
+}
+
+void MainComponent::copyActive(bool cut) {
+    auto& t = activeTimeline();
+    auto& ss = activeSession();
+    auto r = t.selection();
+    if (r.isEmpty())
+        if (auto* reg = ss.findRegion(t.selectedRegion())) r = {reg->start, reg->end()};
+    if (r.isEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, cut ? "Cut" : "Copy", "Mark an In and Out (or select a region) first.");
+        return;
+    }
+    clip_ = ss.copyRange(r.getStart(), r.getEnd(), ss.targetLanes());
+    commands_.commandStatusChanged();
+    if (!cut) return;
+    ss.clearRange(r.getStart(), r.getEnd(), ss.targetLanes(), true);
+    t.clearInOut();
+    t.selectRegion(0);
+    locate(r.getStart());
+    sessionChanged();
+}
+
+void MainComponent::eraseActive() {
+    auto& t = activeTimeline();
+    auto r = t.selection();
+    if (r.isEmpty()) return;
+    activeSession().clearRange(r.getStart(), r.getEnd(), activeSession().targetLanes(), false);
+    sessionChanged();
+}
+
+void MainComponent::pasteActive(PasteMode mode) {
+    if (clip_.isEmpty()) return;
+    auto& t = activeTimeline();
+    auto& ss = activeSession();
+    const double in = t.inPoint(), out = t.outPoint();
+    if (mode == PasteMode::Constrained && !(in >= 0 && out > in)) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Paste Constrained", "Mark an In and Out to paste into.");
+        return;
+    }
+    const double at = in >= 0 ? in : t.editPoint();
+    const double destOut = mode == PasteMode::ReplaceLeft ? (out >= 0 ? out : (in >= 0 ? in : t.editPoint())) : out;
+    auto ids = ss.paste(clip_, editLanes(ss, t, clip_.laneCount), at, mode, destOut);
+    if (!ids.isEmpty()) t.selectRegion(ids.getFirst());
+    double end = at + clip_.length;
+    if (mode == PasteMode::ReplaceLeft) end = destOut;
+    if (mode == PasteMode::Constrained) end = juce::jmin(out, at + clip_.length);
+    t.clearInOut();
+    locate(end);
+    sessionChanged();
+}
+
+void MainComponent::nudgePoint(bool in, int dir) {
+    auto& t = activeTimeline();
+    const double d = nudgeSizes_[nudgeSize_] * dir;
+    if (in) {
+        if (t.inPoint() < 0) return;
+        const double o = t.outPoint();
+        const double v = juce::jmax(0.0, t.inPoint() + d);
+        if (o >= 0 && v >= o) return;
+        t.setInPoint(v);
+        if (o >= 0) t.setOutPoint(o);
+        t.reveal(v);
+        playRange(sourceActive_, v, v + postRoll_);   // audition the new In
+    } else {
+        if (t.outPoint() < 0) return;
+        const double v = juce::jmax(0.0, t.outPoint() + d);
+        if (t.inPoint() >= 0 && v <= t.inPoint()) return;
+        t.setOutPoint(v);
+        t.reveal(v);
+        playRange(sourceActive_, v - preRoll_, v);   // audition up to the new Out
+    }
+}
+
+void MainComponent::showMovePoint() {
+    auto& t = activeTimeline();
+    auto* w = new juce::AlertWindow("Move Point", "Move a point on the " + juce::String(sourceActive_ ? "source" : "destination") +
+                                                      " timeline by an amount (e.g. +0.250, -1.5, +3f for CD frames) or to a time (m:ss.fff or m:ss:ff).",
+                                    juce::MessageBoxIconType::NoIcon);
+    juce::StringArray pts{"Edit Point", "In", "Out", "Selected SRP"};
+    w->addComboBox("point", pts, "Point");
+    w->getComboBoxComponent("point")->setSelectedItemIndex(0);
+    w->addTextEditor("amount", "+0.000", "Move by / to");
+    w->addButton("Move", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    w->enterModalState(true, juce::ModalCallbackFunction::create([this, w, &t](int r) {
+        std::unique_ptr<juce::AlertWindow> owner(w);
+        if (r != 1) return;
+        const int which = w->getComboBoxComponent("point")->getSelectedItemIndex();
+        auto txt = w->getTextEditorContents("amount").trim();
+        double cur = which == 0 ? t.editPoint() : which == 1 ? t.inPoint() : which == 2 ? t.outPoint() : -1;
+        Srp* srp = nullptr;
+        if (which == 3) { srp = activeSession().findSrp(t.selectedSrp()); if (srp) cur = srp->t; }
+        if (cur < 0) return;
+        double v;
+        auto secondsOf = [](juce::String x) {
+            x = x.trim();
+            if (x.endsWithIgnoreCase("f")) return x.dropLastCharacters(1).getDoubleValue() / 75.0;
+            if (x.endsWithIgnoreCase("ms")) return x.dropLastCharacters(2).getDoubleValue() / 1000.0;
+            auto parts = juce::StringArray::fromTokens(x, ":", "");
+            if (parts.size() == 3) return parts[0].getDoubleValue() * 60 + parts[1].getDoubleValue() + parts[2].getDoubleValue() / 75.0;
+            if (parts.size() == 2) return parts[0].getDoubleValue() * 60 + parts[1].getDoubleValue();
+            return x.getDoubleValue();
+        };
+        if (txt.startsWith("+") || txt.startsWith("-")) v = cur + (txt.startsWith("-") ? -1.0 : 1.0) * secondsOf(txt.substring(1));
+        else v = secondsOf(txt);
+        v = juce::jmax(0.0, v);
+        switch (which) {
+            case 0: locate(v); break;
+            case 1: { const double o = t.outPoint(); t.setInPoint(v); if (o > v) t.setOutPoint(o); break; }
+            case 2: { const double i = t.inPoint(); t.setOutPoint(v); if (i >= 0 && i < v) t.setInPoint(i); t.setOutPoint(v); break; }
+            default:
+                if (srp) { srp->t = v; activeSession().sortSrps(); sessionChanged(); }
+                break;
+        }
+        t.reveal(v);
+    }), false);
+}
+
+void MainComponent::showPlaybackSettings() {
+    auto* w = new juce::AlertWindow("Playback & Nudge Settings", "Pre-roll and post-roll are used by Play to / from In and Out and by the "
+                                                                  "nudge auditions. Nudge sizes: seconds, or CD frames with an f (e.g. 1f).",
+                                    juce::MessageBoxIconType::NoIcon);
+    auto fmt = [](double v) { const double f = v * 75; return std::abs(f - std::round(f)) < 1e-6 && v < 1 ? juce::String(juce::roundToInt(f)) + "f" : juce::String(v, 3); };
+    w->addTextEditor("pre", juce::String(preRoll_, 2), "Pre-roll (s)");
+    w->addTextEditor("post", juce::String(postRoll_, 2), "Post-roll (s)");
+    w->addTextEditor("a", fmt(nudgeSizes_[0]), "Nudge A");
+    w->addTextEditor("b", fmt(nudgeSizes_[1]), "Nudge B");
+    w->addTextEditor("c", fmt(nudgeSizes_[2]), "Nudge C");
+    w->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    w->enterModalState(true, juce::ModalCallbackFunction::create([this, w](int r) {
+        std::unique_ptr<juce::AlertWindow> owner(w);
+        if (r != 1) return;
+        auto val = [&](const char* k, double dflt) {
+            auto x = w->getTextEditorContents(k).trim();
+            double v = x.endsWithIgnoreCase("f") ? x.dropLastCharacters(1).getDoubleValue() / 75.0 : x.getDoubleValue();
+            return v > 0 ? juce::jmin(v, 60.0) : dflt;
+        };
+        preRoll_ = val("pre", preRoll_);
+        postRoll_ = val("post", postRoll_);
+        nudgeSizes_[0] = val("a", nudgeSizes_[0]);
+        nudgeSizes_[1] = val("b", nudgeSizes_[1]);
+        nudgeSizes_[2] = val("c", nudgeSizes_[2]);
+        auto* u = props_.getUserSettings();
+        u->setValue("preRoll", preRoll_);
+        u->setValue("postRoll", postRoll_);
+        u->setValue("nudgeA", nudgeSizes_[0]);
+        u->setValue("nudgeB", nudgeSizes_[1]);
+        u->setValue("nudgeC", nudgeSizes_[2]);
+        commands_.commandStatusChanged();
+    }), false);
+}
+
+void MainComponent::addSrp(bool withText) {
+    const bool src = sourceActive_;
+    auto& ss = activeSession();
+    const int id = ss.addSrp(markTime());
+    activeTimeline().selectSrp(id);
+    sessionChanged();
+    if (withText) editSrpText(src, id);
+}
+
+void MainComponent::editSrpText(bool source, int id) {
+    auto& ss = source ? srcSession_ : session_;
+    auto* p = ss.findSrp(id);
+    if (!p) return;
+    auto* w = new juce::AlertWindow("SRP", "Name this reference point.", juce::MessageBoxIconType::NoIcon);
+    w->addTextEditor("text", p->text, "Text");
+    w->addComboBox("lock", {"Moves with the material", "Locked (keeps its time when material ripples)"}, "Position");
+    w->getComboBoxComponent("lock")->setSelectedItemIndex(p->locked ? 1 : 0);
+    w->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    w->enterModalState(true, juce::ModalCallbackFunction::create([this, w, source, id](int r) {
+        std::unique_ptr<juce::AlertWindow> owner(w);
+        if (r != 1) return;
+        auto& s2 = source ? srcSession_ : session_;
+        if (auto* q = s2.findSrp(id)) {
+            q->text = w->getTextEditorContents("text").trim();
+            q->locked = w->getComboBoxComponent("lock")->getSelectedItemIndex() == 1;
+            sessionChanged();
+        }
+    }), false);
+}
+
+void MainComponent::jumpToSrp(int dir) {
+    const double pos = markTime();
+    double best = -1;
+    for (auto& p : activeSession().srps) {
+        if (dir < 0 && p.t < pos - 0.005 && p.t > best) best = p.t;
+        if (dir > 0 && p.t > pos + 0.005 && (best < 0 || p.t < best)) best = p.t;
+    }
+    if (best >= 0) locate(best);
 }
 
 void MainComponent::addMarkerAtPlayhead(Marker::Type t) {
@@ -2001,11 +2613,6 @@ void MainComponent::openCrossfade(int out, int in) {
     xfadeWindow_.reset(w);
 }
 
-void MainComponent::auditionRange(double from, double to) {
-    engine_.setPositionSeconds(juce::jmax(0.0, from));
-    auditionEnd_ = to;
-    engine_.play();
-}
 
 // ---------------------------------------------------------------- PQ list
 
@@ -2042,7 +2649,7 @@ juce::Component* MainComponent::refreshComponentForCell(int row, int col, bool, 
 void MainComponent::cellClicked(int row, int, const juce::MouseEvent&) {
     if (row >= session_.markers.size()) return;
     timeline_.selectMarker(session_.markers[row].id);
-    engine_.setPositionSeconds(session_.markers[row].t);
+    locateDest(session_.markers[row].t);
 }
 
 void MainComponent::cellDoubleClicked(int row, int col, const juce::MouseEvent&) {
@@ -2364,7 +2971,7 @@ void MainComponent::filesDropped(const juce::StringArray& files, int x, int y) {
     }
     audio.sort();
     // Dropped on the source window: open the first file there. Anywhere else: import as tracks.
-    if (source_.getBounds().contains(x, y) && !audio.isEmpty()) { source_.open(audio.getFirst()); return; }
+    if (sourceView_.getBounds().contains(x, y) && !audio.isEmpty()) { openSourceFiles(audio); return; }
     importFiles(audio);
 }
 
@@ -2373,15 +2980,40 @@ void MainComponent::changeListenerCallback(juce::ChangeBroadcaster* src) {
     if (std::abs(engine_.deviceRate() - lastDeviceRate_) > 0.5) {
         lastDeviceRate_ = engine_.deviceRate();
         engine_.loadSession(session_);
+        engine_.loadSourceSession(srcSession_);
     }
 }
 
 void MainComponent::timerCallback() {
     double pos = engine_.positionSeconds();
-    if (auditionEnd_ >= 0 && engine_.isPlaying() && pos >= auditionEnd_) { engine_.stop(); auditionEnd_ = -1; }
+    const double spos = engine_.sourcePosition();
+    if (auditionEnd_ >= 0) {
+        const bool playing = auditionSource_ ? engine_.isSourcePlaying() : engine_.isPlaying();
+        const double p = auditionSource_ ? spos : pos;
+        if (playing && p >= auditionEnd_) {
+            if (repeat_ && auditionStart_ >= 0) {
+                if (auditionSource_) engine_.setSourcePosition(auditionStart_); else engine_.setPositionSeconds(auditionStart_);
+            } else {
+                auditionEnd_ = -1;
+                stopAll();
+            }
+        } else if (!playing) {
+            auditionEnd_ = -1;
+        }
+    }
+    // Playback ended on its own (end of material): same bookkeeping as Stop.
+    if ((wasPlaying_ && !engine_.isPlaying()) || (wasSourcePlaying_ && !engine_.isSourcePlaying())) {
+        if (wasPlaying_ && !engine_.isPlaying()) lastStopDest_ = pos;
+        if (wasSourcePlaying_ && !engine_.isSourcePlaying()) lastStopSource_ = spos;
+        afterStop();
+    }
+    wasPlaying_ = engine_.isPlaying();
+    wasSourcePlaying_ = engine_.isSourcePlaying();
+    pos = engine_.positionSeconds();
     timeline_.setPlayhead(pos, engine_.isPlaying());
+    sourceView_.timeline().setPlayhead(engine_.sourcePosition(), engine_.isSourcePlaying());
+    sourceView_.setPlaying(engine_.isSourcePlaying());
     if (xfadeEditor_) xfadeEditor_->setPlayhead(pos);
-    source_.tick();
     timeDisplay_.setText(msfString(pos), juce::dontSendNotification);
 
     juce::String tr;
@@ -2396,6 +3028,11 @@ void MainComponent::timerCallback() {
                                                               "  (" + msfString(sel.getLength()) + ")",
                         juce::dontSendNotification);
     playBtn_.setButtonText(engine_.isPlaying() ? "Stop" : "Play");
+    if (sourceActive_ || engine_.isSourcePlaying()) {
+        const double sp = engine_.sourcePosition();
+        timeDisplay_.setText(msfString(engine_.isSourcePlaying() ? sp : sourceView_.timeline().editPoint()), juce::dontSendNotification);
+        timeDisplay_.setColour(juce::Label::textColourId, colours::wave);
+    }
     recordBtn_.setToggleState(engine_.isRecording(), juce::dontSendNotification);
     if (engine_.isRecording()) {
         timeDisplay_.setColour(juce::Label::textColourId, colours::error);
@@ -2403,7 +3040,7 @@ void MainComponent::timerCallback() {
         if (rec_.print && rec_.autoPunch && !recPunch_.isEmpty() && pos > recPunch_.getEnd() + 1.0) finishRecording();
         if (rec_.print && !engine_.isPlaying()) finishRecording();   // playback reached the end
     } else {
-        timeDisplay_.setColour(juce::Label::textColourId, colours::text);
+        timeDisplay_.setColour(juce::Label::textColourId, (sourceActive_ || engine_.isSourcePlaying()) ? colours::wave : colours::text);
     }
     {
         juce::String why;
@@ -2465,7 +3102,7 @@ void MainComponent::showProducts() {
         }
     };
     panel->onEditBreak = [this](int pid, int k) { openBreakEditor(pid, k); };
-    panel->onLocate = [this](double t) { engine_.setPositionSeconds(t); timeline_.setPlayhead(t, true); };
+    panel->onLocate = [this](double t) { locateDest(t); };
     panel->onProductSelected = [this](int pid) { timeline_.setProductView(pid); };
     productsPanel_ = panel;
     auto* w = new PlainWindow(panel, "Products & Splitting", false);

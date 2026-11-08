@@ -1,5 +1,7 @@
-// The destination timeline: ruler, PQ marker strip, and lanes of regions.
-// Mouse: click to locate, drag empty space to select a destination range, drag a region
+// A timeline: ruler, PQ marker strip (plus SRPs), and lanes of regions. Used twice: the
+// destination (the master) and the source (material edits are taken from), each with its own
+// zoom, In / Out points and Edit Point.
+// Mouse: click to set the Edit Point, drag empty space to set In / Out, drag a region
 // to move it (snaps to edges and the playhead), drag its edges to trim, drag the corner
 // handles to fade, double-click an overlap to open the crossfade editor. With envelope
 // mode on, click the gain line to add a point, drag points, Alt-click to remove.
@@ -26,7 +28,9 @@ private:
 
 class Timeline : public juce::Component, public juce::ChangeListener, private juce::ScrollBar::Listener {
 public:
-    Timeline(Session& s, ThumbPool& pool);
+    enum class Role { Destination, Source };
+    Timeline(Session& s, ThumbPool& pool, Role role = Role::Destination);
+    Role role() const { return role_; }
     ~Timeline() override;
 
     std::function<void()> onEdit;                      // session changed (commit: undo + reload)
@@ -43,8 +47,30 @@ public:
 
     void setPlayhead(double sec, bool follow);
     double playhead() const { return playhead_; }
-    juce::Range<double> selection() const { return sel_; }
-    void setSelection(juce::Range<double> r) { sel_ = r; repaint(); }
+    // In / Out points (-1 = not set). selection() is In-Out when both are set, else empty.
+    juce::Range<double> selection() const { return in_ >= 0 && out_ > in_ ? juce::Range<double>(in_, out_) : juce::Range<double>(); }
+    void setSelection(juce::Range<double> r) {
+        if (r.isEmpty()) in_ = out_ = -1; else { in_ = r.getStart(); out_ = r.getEnd(); }
+        repaint();
+    }
+    double inPoint() const { return in_; }
+    double outPoint() const { return out_; }
+    void setInPoint(double t) { in_ = juce::jmax(0.0, t); if (out_ >= 0 && out_ <= in_) out_ = -1; repaint(); }
+    void setOutPoint(double t) { out_ = juce::jmax(0.0, t); if (in_ >= out_) in_ = -1; repaint(); }
+    void clearInOut() { in_ = out_ = -1; repaint(); }
+    // The Edit Point: where edits and pastes land and where Play starts. Separate from the
+    // playhead, which shows what is being heard.
+    double editPoint() const { return edit_; }
+    void setEditPoint(double t, bool reveal = false);
+    void reveal(double t);   // scroll so t is visible
+    // The timeline keys and edits act on.
+    void setActive(bool a) { if (active_ != a) { active_ = a; repaint(); } }
+    bool isActive() const { return active_; }
+    std::function<void()> onFocus;               // clicked: make this the active timeline
+    std::function<void()> onEditPointMoved;
+    int selectedSrp() const { return selSrp_; }
+    void selectSrp(int id) { selSrp_ = id; repaint(); }
+    std::function<void(int srpId)> onSrpEdit;    // double-click / Edit... : rename an SRP
     int selectedRegion() const { return selRegion_; }
     void selectRegion(int id) { selRegion_ = id; repaint(); }
     int selectedLane() const { return selLane_; }
@@ -81,11 +107,15 @@ public:
 
 private:
     static constexpr int kRuler = 22, kMarkerStrip = 26, kProductStrip = 22, kScroll = 12;
-    int productH() const { return productView() ? kProductStrip : 0; }
+    int productH() const { return role_ == Role::Destination && productView() ? kProductStrip : 0; }
+    int srpAt(juce::Point<int> p) const;
+    juce::Rectangle<int> badgeBounds(int lane) const;
+    void paintSrps(juce::Graphics&);
+    void paintPoints(juce::Graphics&);
     int top() const { return kRuler + kMarkerStrip + productH(); }   // first lane's y
     void paintProducts(juce::Graphics&);
     int breakAt(juce::Point<int> p) const;   // break index in the shown product, -1 = none
-    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint };
+    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint, SrpMove };
 
     double xToTime(float x) const { return view0_ + double(x) / pps_; }
     float timeToX(double t) const { return float((t - view0_) * pps_); }
@@ -107,10 +137,13 @@ private:
 
     Session& s_;
     ThumbPool& pool_;
+    const Role role_;
+    double in_ = -1, out_ = -1, edit_ = 0;
+    bool active_ = false;
+    int selSrp_ = 0;
     juce::ScrollBar hscroll_{false};
     double pps_ = 20.0, view0_ = 0.0;
     double playhead_ = 0;
-    juce::Range<double> sel_;
     int selRegion_ = 0, selLane_ = 0, selMarker_ = 0;
     bool envelopeMode_ = false, snap_ = true;
 

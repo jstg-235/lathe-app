@@ -16,6 +16,15 @@ namespace lathe::scan {
 namespace {
 
 constexpr const char* kWorkerUID = "latheScanWorker";
+
+// Set LATHE_SCAN_LOG=/path/file to trace the scan protocol (both sides append to the file).
+void trace(const juce::String& what) {
+    static const auto path = juce::SystemStats::getEnvironmentVariable("LATHE_SCAN_LOG", {});
+    if (path.isEmpty()) return;
+    static std::mutex m;
+    const std::lock_guard<std::mutex> lock(m);
+    juce::File(path).appendText(juce::String(juce::Time::getMillisecondCounterHiRes() / 1000.0, 3) + " " + what + "\n");
+}
 constexpr const char* kPidPrefix = "LATHE_PID:";
 
 // ------------------------------------------------------------------ helper side
@@ -23,6 +32,7 @@ constexpr const char* kPidPrefix = "LATHE_PID:";
 class Worker final : public juce::ChildProcessWorker, private juce::AsyncUpdater {
 public:
     explicit Worker(std::function<void(juce::AudioPluginFormatManager&)> addFormats) {
+        trace("helper: starting");
         if (addFormats) addFormats(formats_);
         else formats_.addDefaultFormats();
 #if JUCE_MAC || JUCE_LINUX
@@ -45,6 +55,7 @@ private:
     // Tell the app our process id so it can stop us if a plugin hangs this helper: the normal
     // "quit" request is delivered on the message thread, which a hung plugin is holding.
     void handleConnectionMade() override {
+        trace("helper: connected");
 #if JUCE_MAC || JUCE_LINUX
         const auto s = juce::String(kPidPrefix) + juce::String(int(getpid()));
         sendMessageToCoordinator({s.toRawUTF8(), s.getNumBytesAsUTF8()});
@@ -53,6 +64,7 @@ private:
 
     void handleMessageFromCoordinator(const juce::MemoryBlock& mb) override {
         if (mb.isEmpty()) return;
+        trace("helper: request");
         const std::lock_guard<std::mutex> lock(mutex_);
         juce::MemoryInputStream in(mb, false);
         const auto formatName = in.readString();
@@ -83,14 +95,16 @@ private:
                 pending_.pop();
             }
             juce::OwnedArray<juce::PluginDescription> found;
+            trace("helper: scanning " + job.second);
             if (auto* format = findFormat(job.first)) format->findAllTypesForFile(found, job.second);
             send(found);
+            trace("helper: answered " + job.second);
         }
     }
 
     // The coordinator went away or told us to stop. Leave at once: a plugin may be holding the
     // message thread, so a polite quit could never run.
-    void handleConnectionLost() override { juce::Process::terminate(); }
+    void handleConnectionLost() override { trace("helper: connection lost"); juce::Process::terminate(); }
 
     juce::AudioPluginFormat* findFormat(const juce::String& name) {
         for (auto* f : formats_.getFormats())
@@ -119,7 +133,9 @@ class Helper final : private juce::ChildProcessCoordinator {
 public:
     explicit Helper(const juce::File& exe) {
         // No stdout/stderr pipes: a chatty plugin could fill an unread pipe and stall.
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
         launched_ = launchWorkerProcess(exe, kWorkerUID, 0, 0);
+        trace("app: launch " + juce::String(launched_ ? "ok" : "FAILED") + " in " + juce::String(juce::Time::getMillisecondCounterHiRes() - t0, 0) + " ms");
     }
     ~Helper() override { stop(false); }
 
@@ -148,6 +164,7 @@ public:
 private:
     void handleMessageFromWorker(const juce::MemoryBlock& mb) override {
         const auto text = mb.toString();
+        trace("app: from helper " + text.substring(0, 40));
         if (text.startsWith(kPidPrefix)) { pid_ = text.fromFirstOccurrenceOf(kPidPrefix, false, false).getIntValue(); return; }
         const std::lock_guard<std::mutex> lock(mutex_);
         result_ = juce::parseXML(text);
@@ -155,6 +172,7 @@ private:
         cv_.notify_one();
     }
     void handleConnectionLost() override {
+        trace("app: helper connection lost");
         const std::lock_guard<std::mutex> lock(mutex_);
         lost_ = true;
         cv_.notify_one();
@@ -201,6 +219,7 @@ public:
             const auto state = helper_->wait(50, xml);
             if (state == Helper::State::waiting) {
                 if (juce::Time::getMillisecondCounterHiRes() - start > timeoutMs_) {   // hung
+                    trace("app: timed out on " + fileOrIdentifier);
                     helper_->stop(true);
                     helper_.reset();
                     return false;
@@ -236,8 +255,10 @@ bool isWorkerCommandLine(const juce::String& commandLine) { return commandLine.c
 std::unique_ptr<juce::ChildProcessWorker> startWorkerIfRequested(const juce::String& commandLine,
                                                                  std::function<void(juce::AudioPluginFormatManager&)> addFormats) {
     if (!isWorkerCommandLine(commandLine)) return nullptr;
+    trace("helper: command line [" + commandLine + "]");
     auto w = std::make_unique<Worker>(std::move(addFormats));
-    if (!w->initialiseFromCommandLine(commandLine, kWorkerUID)) return nullptr;
+    if (!w->initialiseFromCommandLine(commandLine, kWorkerUID)) { trace("helper: could not connect"); return nullptr; }
+    trace("helper: pipe open");
     return w;
 }
 

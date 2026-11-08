@@ -398,7 +398,15 @@ int main() {
                 if (k.trim().isEmpty()) continue;
                 auto kp = juce::KeyPress::createFromDescription(k.trim());
                 if (!kp.isValid()) { ++unparsed; std::printf("unparsed key: %s\n", k.toRawUTF8()); }
-                auto key = kp.getTextDescription().toLowerCase();
+                // Compare as the Mac sees them (Control and Command are different keys there,
+                // while on Linux / Windows JUCE folds Command into Control).
+                auto parts = juce::StringArray::fromTokens(k.trim().toLowerCase(), "+", "");
+                parts.trim();
+                juce::String keyName = parts[parts.size() - 1];
+                parts.remove(parts.size() - 1);
+                for (auto& m : parts) m = m == "ctrl" ? "control" : m == "alt" ? "option" : m == "cmd" ? "command" : m;
+                parts.sort(false);
+                auto key = parts.joinIntoString("+") + "+" + juce::KeyPress::createFromDescription(keyName).getTextDescription().toLowerCase();
                 if (seen.count(key)) { ++dupes; std::printf("duplicate key %s: %s / %s\n", key.toRawUTF8(), seen[key].toRawUTF8(), d.name); }
                 seen[key] = d.name;
             }
@@ -652,6 +660,142 @@ int main() {
         chain.setState(state, problems);
         CHECK(!host.isDeactivated(d) && chain.size() == 0 && problems.size() == 1 && !problems[0].contains("deactivated"));
         host.known().removeType(d);
+    }
+    // ---- Source / destination edits, clipboard, lane targets, SRPs ----
+    {
+        auto loud = makeTone(dir, "dest.wav", 44100, 10.0, 500, 0.5f);
+        auto quiet = makeTone(dir, "src.wav", 44100, 10.0, 500, 0.1f);
+        auto fresh = [&] {
+            Session d;
+            d.lanes = 1;
+            Region r = regionFor(d, fm, loud);
+            r.start = 0;
+            d.regions.add(r);
+            d.addMarker(Marker::TrackStart, 0.0, r.id);
+            d.addMarker(Marker::Index, 6.0, r.id);
+            return d;
+        };
+        Session src;
+        src.lanes = 1;
+        Region q = regionFor(src, fm, quiet);
+        q.start = 0;
+        src.regions.add(q);
+        const juce::Array<int> lane0{0};
+        Clip c = src.copyRange(2.0, 4.0, lane0);   // 2 s of the quiet take
+        NEAR(c.length, 2.0, 1e-9);
+        CHECK(c.regions.size() == 1 && c.regions[0].start == 0.0 && c.regions[0].srcIn == 88200 && c.regions[0].srcOut == 176400);
+
+        auto levelAt = [&](const Session& ss, double t0, double len) {
+            ProgramRenderer pr(fm);
+            pr.setSession(ss, 44100);
+            juce::AudioBuffer<float> buf(2, int(44100 * len));
+            pr.seek(juce::int64(t0 * 44100));
+            pr.render(buf, 0, buf.getNumSamples());
+            return rms(buf, 0, buf.getNumSamples());
+        };
+        const double loudRms = 0.5 / std::sqrt(2.0), quietRms = 0.1 / std::sqrt(2.0);
+
+        {   // Insert: later material (and its markers) moves right by the clip length.
+            Session d = fresh();
+            auto ids = d.paste(c, lane0, 5.0, PasteMode::Insert);
+            CHECK(ids.size() == 1);
+            NEAR(d.end(), 12.0, 1e-3);
+            Marker* idx = nullptr;
+            for (auto& m : d.markers) if (m.type == Marker::Index) idx = &m;
+            CHECK(idx && std::abs(idx->t - 8.0) < 1e-3);
+            NEAR(levelAt(d, 5.2, 1.5), quietRms, 0.003);
+            NEAR(levelAt(d, 7.2, 1.0), loudRms, 0.003);
+        }
+        {   // Replace: overwrite from the point, nothing moves.
+            Session d = fresh();
+            d.paste(c, lane0, 3.0, PasteMode::Replace);
+            NEAR(d.end(), 10.0, 1e-3);
+            NEAR(levelAt(d, 3.1, 1.8), quietRms, 0.003);
+            NEAR(levelAt(d, 5.2, 1.0), loudRms, 0.003);
+        }
+        {   // Replace Left: the clip ends at the Out.
+            Session d = fresh();
+            auto ids = d.paste(c, lane0, 0.0, PasteMode::ReplaceLeft, 8.0);
+            auto* r = d.findRegion(ids[0]);
+            CHECK(r && std::abs(r->start - 6.0) < 1e-9 && std::abs(r->end() - 8.0) < 1e-6);
+            NEAR(levelAt(d, 6.1, 1.8), quietRms, 0.003);
+            NEAR(d.end(), 10.0, 1e-3);
+        }
+        {   // Replace Constrained: only the destination In-Out changes, the clip is cut to fit.
+            Session d = fresh();
+            auto ids = d.paste(c, lane0, 4.0, PasteMode::Constrained, 5.0);
+            auto* r = d.findRegion(ids[0]);
+            CHECK(r && std::abs(r->length() - 1.0) < 1e-6);
+            NEAR(levelAt(d, 4.1, 0.8), quietRms, 0.003);
+            NEAR(levelAt(d, 5.1, 1.0), loudRms, 0.003);
+            NEAR(d.end(), 10.0, 1e-3);
+        }
+        {   // Back-timed past zero: what would land before the start is dropped.
+            Session d = fresh();
+            auto ids = d.paste(c, lane0, 0.0, PasteMode::ReplaceLeft, 0.5);
+            auto* r = d.findRegion(ids[0]);
+            CHECK(r && r->start == 0.0 && std::abs(r->length() - 0.5) < 1e-6);
+        }
+        {   // Overlay: nothing removed, the regions overlap (and crossfade).
+            Session d = fresh();
+            d.paste(c, lane0, 2.0, PasteMode::Overlay);
+            CHECK(d.regions.size() == 2);
+            NEAR(d.end(), 10.0, 1e-3);
+        }
+        {   // Cut: copy + clear with ripple; marks inside the range go, later ones move up.
+            Session d = fresh();
+            d.addMarker(Marker::Index, 3.0, d.regions[0].id);
+            Clip cut = d.copyRange(2.0, 4.0, lane0);
+            d.clearRange(2.0, 4.0, lane0, true);
+            NEAR(cut.length, 2.0, 1e-9);
+            NEAR(d.end(), 8.0, 1e-3);
+            int idxCount = 0;
+            for (auto& m : d.markers) if (m.type == Marker::Index) { ++idxCount; NEAR(m.t, 4.0, 1e-3); }
+            CHECK(idxCount == 1);
+            // Paste it back where it was: the original programme returns.
+            d.paste(cut, lane0, 2.0, PasteMode::Insert);
+            NEAR(d.end(), 10.0, 1e-3);
+            NEAR(levelAt(d, 0.5, 9.0), loudRms, 0.003);
+        }
+        {   // Lane targets: an untargeted lane is left alone by ripples.
+            Session d = fresh();
+            d.lanes = 2;
+            Region r2 = regionFor(d, fm, loud);
+            r2.lane = 1;
+            r2.start = 6.0;
+            d.regions.add(r2);
+            d.lanesOff.add(1);
+            CHECK(d.targetLanes() == juce::Array<int>{0});
+            d.paste(c, d.targetLanes(), 1.0, PasteMode::Insert);
+            CHECK(std::abs(d.findRegion(r2.id)->start - 6.0) < 1e-9);
+        }
+        {   // SRPs: unlocked ones ripple, locked ones stay; they and the source timeline survive a save.
+            Session d = fresh();
+            const int a1 = d.addSrp(7.0, "check edit");
+            const int a2 = d.addSrp(8.0, "locked");
+            d.findSrp(a2)->locked = true;
+            d.paste(c, lane0, 1.0, PasteMode::Insert);
+            NEAR(d.findSrp(a1)->t, 9.0, 1e-9);
+            NEAR(d.findSrp(a2)->t, 8.0, 1e-9);
+            Session srcLive = src;
+            srcLive.addSrp(1.5, "take 2 best");
+            d.source = &srcLive;
+            d.lanesOff.add(3);
+            auto f = dir.getChildFile("srp.lathe");
+            juce::String err;
+            CHECK(d.save(f, err));
+            Session back, backSrc;
+            back.source = &backSrc;
+            CHECK(back.load(f, err));
+            CHECK(back.srps.size() == 2 && back.srps[0].text == "locked" && back.srps[0].locked && back.srps[1].text == "check edit");
+            CHECK(back.lanesOff.contains(3));
+            CHECK(backSrc.regions.size() == 1 && backSrc.srps.size() == 1 && backSrc.srps[0].text == "take 2 best");
+            CHECK(backSrc.regions[0].file == quiet);
+            // Loaded without a live source: kept as-is and written back out unchanged.
+            Session plain;
+            CHECK(plain.load(f, err) && plain.sourceDoc.isObject());
+            CHECK(plain.toVar()["source"].isObject());
+        }
     }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);

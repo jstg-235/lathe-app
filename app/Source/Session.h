@@ -94,6 +94,30 @@ struct Product {
     double limit() const { return maxUnit > 0 ? maxUnit : productSpec(kind).target; }
 };
 
+// Session reference point: a named locator that isn't a PQ mark (a note, an edit to check,
+// "client comment at 2:31"). Locked points stay at their time when material ripples.
+struct Srp {
+    int id = 0;
+    double t = 0;
+    juce::String text;
+    bool locked = false;
+};
+
+// A piece of a timeline copied for pasting (also how source material reaches the destination).
+// Region starts are relative to the clip start; lanes are relative to the first copied lane.
+struct Clip {
+    juce::Array<Region> regions;
+    double length = 0;
+    int laneCount = 1;
+    bool isEmpty() const { return length <= 0; }
+};
+
+// Insert: later material moves right. Replace: overwrite from the point for the clip length.
+// ReplaceLeft: overwrite so the clip ends at the point (back-timed). Constrained: overwrite the
+// destination In-Out only (the clip is cut to fit). Overlay: lay over the top (overlaps crossfade).
+enum class PasteMode { Insert = 0, Replace, ReplaceLeft, Constrained, Overlay };
+juce::String pasteModeName(PasteMode m);
+
 // Effective fade lengths after automatic crossfades, per region index.
 struct EffectiveFades {
     double in = 0, out = 0;
@@ -124,6 +148,12 @@ public:
     int pqOffsetFrames = 0;       // track starts are moved earlier by this many CD frames on delivery
     bool htoa = false;            // hidden track one audio: audio before track 1 index 01 is intended
     juce::Array<Product> products;
+    juce::Array<Srp> srps;
+    juce::Array<int> lanesOff;    // lanes set to None: edits, pastes and ripples leave them alone
+    // The source timeline (the material edits are taken from) is a session of its own, saved
+    // inside this one. `source` points at the live one; `sourceDoc` is what was last read from file.
+    Session* source = nullptr;
+    juce::var sourceDoc;
     double projectRate = 0;                 // 0 = follow the first region's rate
     juce::MemoryBlock pluginChainState;
     juce::File file;
@@ -148,8 +178,28 @@ public:
     void deleteRegion(int id, bool ripple);
     // Cuts the region at time t into two regions (no audio change).
     int split(int id, double t);
-    // Shifts everything (regions + markers) at or after t by dt seconds.
-    void ripple(double t, double dt, int exceptRegion = 0);
+    // Shifts everything (regions + markers + unlocked SRPs) at or after t by dt seconds.
+    // With `onLanes`, only regions on those lanes move (markers always move).
+    void ripple(double t, double dt, int exceptRegion = 0, const juce::Array<int>* onLanes = nullptr);
+
+    // ---- Lane targets, clipboard edits ----
+    bool laneTargeted(int lane) const { return !lanesOff.contains(lane); }
+    juce::Array<int> targetLanes() const;   // targeted lanes in order (all lanes if none are)
+    // Copies [a, b) on `lanes` (cutting regions at the edges).
+    Clip copyRange(double a, double b, const juce::Array<int>& lanes) const;
+    // Removes the audio in [a, b) on `lanes`. With ripple, later material on those lanes moves up
+    // and PQ marks / unlocked SRPs inside the range go.
+    void clearRange(double a, double b, const juce::Array<int>& lanes, bool ripple);
+    // Pastes a clip: clip lane k goes to lanes[k] (lanes are added if needed). `destOut` is the
+    // destination Out point (ReplaceLeft ends there; Constrained fills `at`..destOut). Returns
+    // the new region ids.
+    juce::Array<int> paste(const Clip& c, const juce::Array<int>& lanes, double at, PasteMode mode, double destOut = -1);
+
+    // ---- SRPs ----
+    int addSrp(double t, const juce::String& text = {});
+    Srp* findSrp(int id);
+    void removeSrp(int id);
+    void sortSrps();
     // 4-point edit: replace destination [dIn, dOut) on lane with source [sIn, sOut).
     // If dOut < 0 it's a 3-point edit (insert at dIn). Overwrite keeps the timeline length.
     enum class EditMode { Insert, Overwrite, Replace };
