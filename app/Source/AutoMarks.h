@@ -16,4 +16,15 @@ juce::Array<juce::Range<double>> findSilences(juce::AudioFormatManager& formats,
 // silence before the first audio and after the last. Returns how many marks were added.
 int analogBlackToMarks(Session& s, const juce::Array<juce::Range<double>>& silences);
 
+// Peak level of a region's audio (its source span, before gain, envelope and fades), dBFS.
+// -inf for silence or an unreadable file.
+double regionPeakDb(juce::AudioFormatManager& formats, const Region& r);
+
+// Segment Gain on several regions. Absolute sets the gain, Relative adds to it, Normalize sets
+// it so each region's peak (from `peakDb`) lands on `value` dBFS. Polarity: -1 leave, 0 normal,
+// 1 inverted. Returns how many regions changed.
+enum class SegmentGainMode { Absolute, Relative, Normalize };
+int applySegmentGain(Session& s, const juce::Array<int>& ids, SegmentGainMode mode, double value, int polarity,
+                     std::function<double(const Region&)> peakDb = {});
+
 }  // namespace lathe

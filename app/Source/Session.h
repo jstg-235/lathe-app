@@ -37,6 +37,7 @@ struct Region {
     double start = 0;                    // destination time, seconds
     double gainDb = 0;
     bool mute = false;
+    bool invert = false;                 // polarity
     double fadeIn = 0, fadeOut = 0;      // seconds (overlaps on the same lane extend these automatically)
     FadeShape fadeInShape = FadeShape::EqualPower, fadeOutShape = FadeShape::EqualPower;
     // Edit Fade detail. Offsets move a fade inside the region (the fade-in starts this long after
@@ -276,6 +277,13 @@ public:
     // The offset a track start gets on delivery (frames), from its own setting or the defaults.
     int effectiveStartOffset(const Marker& m, bool isTrack1) const;
     bool onSplice(double t) const;   // a region starts within a CD frame of t
+    // ---- Assembly ----
+    enum class DropMode { Overlay, Insert, Replace };
+    // Drops region `id` (already removed from its old place or not) at `start` on `lane`:
+    // Overlay lays it on top, Insert makes room (later material on that lane moves right),
+    // Replace removes what it covers on that lane.
+    void dropRegion(int id, double start, int lane, DropMode mode);
+
     // Auto marks. Each returns how many marks were added.
     int segmentsToStartMarks(int lane = 0);
     int editedBlackToMarks(double minGap = 0.5);

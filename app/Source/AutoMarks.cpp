@@ -60,4 +60,39 @@ int analogBlackToMarks(Session& s, const juce::Array<juce::Range<double>>& silen
     return added;
 }
 
+double regionPeakDb(juce::AudioFormatManager& formats, const Region& r) {
+    std::unique_ptr<juce::AudioFormatReader> rd(formats.createReaderFor(r.file));
+    if (!rd) return -std::numeric_limits<double>::infinity();
+    const int ch = int(juce::jmin<unsigned int>(rd->numChannels, 8));
+    std::vector<juce::Range<float>> levels(size_t(juce::jmax(1, ch)));
+    rd->readMaxLevels(r.srcIn, r.srcOut - r.srcIn, levels.data(), ch);
+    float peak = 0;
+    for (auto& l : levels) peak = juce::jmax(peak, std::abs(l.getStart()), std::abs(l.getEnd()));
+    return peak > 0 ? 20.0 * std::log10(double(peak)) : -std::numeric_limits<double>::infinity();
+}
+
+int applySegmentGain(Session& s, const juce::Array<int>& ids, SegmentGainMode mode, double value, int polarity,
+                     std::function<double(const Region&)> peakDb) {
+    int n = 0;
+    for (int id : ids) {
+        auto* r = s.findRegion(id);
+        if (!r) continue;
+        const double before = r->gainDb;
+        const bool inv = r->invert;
+        switch (mode) {
+            case SegmentGainMode::Absolute: r->gainDb = value; break;
+            case SegmentGainMode::Relative: r->gainDb += value; break;
+            case SegmentGainMode::Normalize: {
+                const double p = peakDb ? peakDb(*r) : -std::numeric_limits<double>::infinity();
+                if (std::isfinite(p)) r->gainDb = value - p;
+                break;
+            }
+        }
+        r->gainDb = juce::jlimit(-96.0, 48.0, r->gainDb);
+        if (polarity >= 0) r->invert = polarity == 1;
+        if (std::abs(r->gainDb - before) > 1e-9 || r->invert != inv) ++n;
+    }
+    return n;
+}
+
 }  // namespace lathe

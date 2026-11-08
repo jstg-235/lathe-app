@@ -27,7 +27,7 @@ public:
         in_.setSize(2, kChunk);
         for (auto& v : pending_) v.reserve(size_t(kChunk * 8));
         lengthOut_ = juce::int64(std::floor(c.length() * targetRate));
-        gain_ = juce::Decibels::decibelsToGain(c.gainDb);
+        gain_ = juce::Decibels::decibelsToGain(c.gainDb) * (c.invert ? -1.0 : 1.0);
         flushNeeded_ = (rs_[0] ? 64 : 0) + (skip_ + kChunk - 1) / kChunk;
     }
 

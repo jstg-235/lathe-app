@@ -1,7 +1,10 @@
 // A timeline: ruler, PQ marker strip (plus SRPs), and lanes of regions. Used twice: the
 // destination (the master) and the source (material edits are taken from), each with its own
 // zoom, In / Out points and Edit Point.
-// Mouse: click to set the Edit Point, drag empty space to set In / Out, drag a region
+// Mouse: click to set the Edit Point, drag empty space to set In / Out. Drag a region to lay it
+// over what is there; Shift-drag inserts it (later material moves right), Command-drag replaces
+// what it covers, Option-drag keeps it on its lane. Drag a track on the track bar to reorder.
+// Also: drag a region
 // to move it (snaps to edges and the playhead), drag its edges to trim, drag the corner
 // handles to fade, double-click an overlap to open the crossfade editor. With envelope
 // mode on, click the gain line to add a point, drag points, Alt-click to remove.
@@ -71,6 +74,7 @@ public:
     int selectedSrp() const { return selSrp_; }
     void selectSrp(int id) { selSrp_ = id; repaint(); }
     std::function<void(int srpId)> onSrpEdit;    // double-click / Edit... : rename an SRP
+    std::function<void(int regionId)> onSegmentGain;
     int selectedRegion() const { return selRegion_; }
     void selectRegion(int id) { selRegion_ = id; repaint(); }
     int selectedLane() const { return selLane_; }
@@ -108,16 +112,20 @@ public:
     void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
 
 private:
-    static constexpr int kRuler = 22, kMarkerStrip = 26, kProductStrip = 22, kScroll = 12;
+    static constexpr int kRuler = 22, kMarkerStrip = 26, kProductStrip = 22, kTrackBar = 14, kScroll = 12;
+    int trackBarH() const { return role_ == Role::Destination ? kTrackBar : 0; }
+    int trackBarY() const { return kRuler + kMarkerStrip + productH(); }
+    void paintTrackBar(juce::Graphics&);
+    int trackAtX(float x) const;   // track index under x on the track bar, -1 = none
     int productH() const { return role_ == Role::Destination && productView() ? kProductStrip : 0; }
     int srpAt(juce::Point<int> p) const;
     juce::Rectangle<int> badgeBounds(int lane) const;
     void paintSrps(juce::Graphics&);
     void paintPoints(juce::Graphics&);
-    int top() const { return kRuler + kMarkerStrip + productH(); }   // first lane's y
+    int top() const { return trackBarY() + trackBarH(); }   // first lane's y
     void paintProducts(juce::Graphics&);
     int breakAt(juce::Point<int> p) const;   // break index in the shown product, -1 = none
-    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint, SrpMove };
+    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint, SrpMove, TrackBar };
 
     double xToTime(float x) const { return view0_ + double(x) / pps_; }
     float timeToX(double t) const { return float((t - view0_) * pps_); }
@@ -153,6 +161,9 @@ private:
     int dragId_ = 0, dragPoint_ = -1;
     double dragT0_ = 0, dragOrigStart_ = 0, dragOrigEnd_ = 0;
     int dragOrigLane_ = 0;
+    Session::DropMode dropMode_ = Session::DropMode::Overlay;
+    bool laneLock_ = false;
+    int trackFrom_ = -1, trackTo_ = -1;
     bool changed_ = false;
     std::shared_ptr<const dsp::AnalysisResult> an_, raw_;
     bool stale_ = false, showLoudness_ = true;

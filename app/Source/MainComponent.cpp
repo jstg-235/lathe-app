@@ -272,10 +272,12 @@ MainComponent::MainComponent() {
         st.onEdit = [this] { sessionChanged(); };
         st.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setSourcePosition(t); sourceView_.timeline().setPlayhead(t, false); };
         st.onSrpEdit = [this](int id) { editSrpText(true, id); };
+        st.onSegmentGain = [this](int id) { setActiveTimeline(true); showSegmentGain({id}); };
         st.onCrossfade = [this](int, int) {};
     }
     timeline_.onFocus = [this] { setActiveTimeline(false); };
     timeline_.onSrpEdit = [this](int id) { editSrpText(false, id); };
+    timeline_.onSegmentGain = [this](int id) { setActiveTimeline(false); showSegmentGain({id}); };
 
     timeline_.onEdit = [this] { sessionChanged(); };
     timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
@@ -677,6 +679,14 @@ bool MainComponent::perform(const InvocationInfo& info) {
             break;
         case cmd::playbackSettings: showPlaybackSettings(); break;
         case cmd::markInfo: showMarkInfo(); break;
+        case cmd::textView: showTextView(); break;
+        case cmd::segmentGain: {
+            juce::Array<int> ids;
+            if (textViewPanel_ && textViewWindow_ && textViewWindow_->isActiveWindow()) ids = textViewPanel_->selectedIds();
+            if (ids.isEmpty() && activeSession().findRegion(activeTimeline().selectedRegion())) ids.add(activeTimeline().selectedRegion());
+            if (!ids.isEmpty()) showSegmentGain(ids);
+            break;
+        }
         case cmd::segmentsToMarks: if (session_.segmentsToStartMarks(0) > 0) sessionChanged(); break;
         case cmd::editedBlackToMarks: if (session_.editedBlackToMarks() > 0) sessionChanged(); break;
         case cmd::analogBlackToMarks: runAnalogBlack(); break;
@@ -868,6 +878,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             }
             m.addSeparator();
             add({cmd::splitAtPlayhead, cmd::deleteClose, cmd::deleteLeave, cmd::muteRegion, cmd::selectRegionRange, cmd::clearSelection});
+            m.addSeparator();
+            add({cmd::textView, cmd::segmentGain});
             m.addSeparator();
             {
                 juce::PopupMenu ef;
@@ -3251,6 +3263,7 @@ void MainComponent::refreshDeliveryPanels() {
     if (releasePanel_) releasePanel_->refresh();
     if (creditsPanel_) creditsPanel_->refresh();
     if (markInfoPanel_) markInfoPanel_->refresh();
+    if (textViewPanel_) textViewPanel_->refresh();
     if (breakEditor_) {
         auto* p = session_.findProduct(breakEditor_->productId());
         if (!p || breakEditor_->breakIndex() + 1 >= p->units.size()) breakWindow_.reset();
@@ -3370,6 +3383,44 @@ void MainComponent::showMarkInfo() {
     auto* w = new PlainWindow(panel, "Mark Info", false);
     w->onClose = [this] { juce::MessageManager::callAsync([this] { markInfoWindow_.reset(); }); };
     markInfoWindow_.reset(w);
+}
+
+void MainComponent::showTextView() {
+    if (textViewWindow_) { textViewWindow_->toFront(true); return; }
+    auto* panel = new SegmentListPanel(session_);
+    panel->onGain = [this](juce::Array<int> ids) { setActiveTimeline(false); showSegmentGain(ids); };
+    panel->onLocate = [this](double t) { setActiveTimeline(false); locateDest(t); };
+    panel->onSelect = [this](int id) { timeline_.selectRegion(id); };
+    textViewPanel_ = panel;
+    auto* w = new PlainWindow(panel, "Text View", false);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { textViewWindow_.reset(); }); };
+    textViewWindow_.reset(w);
+}
+
+void MainComponent::showSegmentGain(juce::Array<int> ids) {
+    auto& ss = activeSession();
+    if (ids.isEmpty()) return;
+    auto* first = ss.findRegion(ids.getFirst());
+    if (!first) return;
+    const bool src = sourceActive_;
+    auto* w = new juce::AlertWindow("Segment Gain", juce::String(ids.size()) + (ids.size() == 1 ? " segment: " + first->name : juce::String(" segments")),
+                                    juce::MessageBoxIconType::NoIcon);
+    w->addComboBox("mode", {"Set gain to (dB)", "Change gain by (dB)", "Normalize peak to (dBFS)"}, "Gain");
+    w->getComboBoxComponent("mode")->setSelectedItemIndex(ids.size() == 1 ? 0 : 1);
+    w->addTextEditor("value", ids.size() == 1 ? juce::String(first->gainDb, 2) : juce::String("0.0"), "Value");
+    w->addComboBox("pol", {"Leave polarity", "Normal polarity", "Inverted polarity"}, "Polarity");
+    w->getComboBoxComponent("pol")->setSelectedItemIndex(0);
+    w->addButton("Apply", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    w->enterModalState(true, juce::ModalCallbackFunction::create([this, w, ids, src](int r) {
+        std::unique_ptr<juce::AlertWindow> owner(w);
+        if (r != 1) return;
+        auto& s2 = src ? srcSession_ : session_;
+        const auto mode = SegmentGainMode(w->getComboBoxComponent("mode")->getSelectedItemIndex());
+        const double v = w->getTextEditorContents("value").getDoubleValue();
+        const int pol = w->getComboBoxComponent("pol")->getSelectedItemIndex() - 1;
+        if (applySegmentGain(s2, ids, mode, v, pol, [this](const Region& reg) { return regionPeakDb(engine_.formats(), reg); }) > 0) sessionChanged();
+    }), false);
 }
 
 void MainComponent::runAnalogBlack() {

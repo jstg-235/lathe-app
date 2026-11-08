@@ -1023,6 +1023,78 @@ int main() {
         for (auto& m : back.markers) own += (!m.offsetDefault && m.offsetFrames == 20) ? 1 : 0;
         CHECK(own == 1);
     }
+    // ---- Assembly: drop modes, segment gain, polarity ----
+    {
+        auto x1 = makeTone(dir, "as1.wav", 44100, 4.0, 300, 0.5f), x2 = makeTone(dir, "as2.wav", 44100, 2.0, 300, 0.25f);
+        auto build = [&] {
+            Session a;
+            a.lanes = 1;
+            Region r1 = regionFor(a, fm, x1); r1.start = 0; a.regions.add(r1);    // 0..4
+            Region r2 = regionFor(a, fm, x1); r2.start = 6; a.regions.add(r2);    // 6..10
+            Region r3 = regionFor(a, fm, x2); r3.start = 20; a.regions.add(r3);   // the one we drag
+            a.addMarker(Marker::Index, 7.0, r2.id);
+            a.addMarker(Marker::Index, 20.5, r3.id);
+            return a;
+        };
+        {   // Insert at 2 s: r1 is split, everything after moves right by 2 s; r3's own mark rides with it.
+            Session a = build();
+            const int id = a.regions[2].id;
+            a.dropRegion(id, 2.0, 0, Session::DropMode::Insert);
+            CHECK(a.regions.size() == 4);
+            NEAR(a.findRegion(id)->start, 2.0, 1e-9);
+            double r2s = 0;
+            for (auto& r : a.regions) if (r.id == a.regions[1].id) r2s = r.start;
+            NEAR(r2s, 8.0, 1e-6);
+            juce::Array<double> idx;
+            for (auto& m : a.markers) idx.add(m.t);
+            idx.sort();
+            NEAR(idx[0], 2.5, 1e-6);   // r3's mark moved with r3
+            NEAR(idx[1], 9.0, 1e-6);   // r2's mark rippled
+            NEAR(a.end(), 12.0, 1e-6);
+        }
+        {   // Replace at 1 s: covers 1..3 of r1, nothing moves.
+            Session a = build();
+            const int id = a.regions[2].id;
+            a.dropRegion(id, 1.0, 0, Session::DropMode::Replace);
+            NEAR(a.end(), 10.0, 1e-6);
+            ProgramRenderer pr(fm);
+            pr.setSession(a, 44100);
+            juce::AudioBuffer<float> buf(2, 44100);
+            pr.seek(int(44100 * 1.5));
+            pr.render(buf, 0, 22050);
+            NEAR(rms(buf, 0, 22050), 0.25 / std::sqrt(2.0), 0.003);
+        }
+        {   // Segment gain: absolute, relative, normalize, polarity.
+            Session a = build();
+            juce::Array<int> ids{a.regions[0].id, a.regions[2].id};
+            CHECK(applySegmentGain(a, ids, SegmentGainMode::Absolute, -3.0, -1) == 2);
+            CHECK(a.regions[0].gainDb == -3.0 && a.regions[2].gainDb == -3.0);
+            applySegmentGain(a, ids, SegmentGainMode::Relative, 1.5, -1);
+            NEAR(a.regions[2].gainDb, -1.5, 1e-9);
+            applySegmentGain(a, ids, SegmentGainMode::Normalize, -1.0, 1, [&](const Region& r) { return regionPeakDb(fm, r); });
+            NEAR(a.regions[0].gainDb, -1.0 - 20 * std::log10(0.5), 0.01);    // peak 0.5 -> -1 dBFS
+            NEAR(a.regions[2].gainDb, -1.0 - 20 * std::log10(0.25), 0.01);
+            CHECK(a.regions[0].invert && a.regions[2].invert && !a.regions[1].invert);
+            // Inverted polarity renders inverted.
+            Session one;
+            one.lanes = 1;
+            Region q = regionFor(one, fm, x1); q.start = 0; one.regions.add(q);
+            Session inv = one;
+            inv.regions.getReference(0).invert = true;
+            ProgramRenderer pa(fm), pb(fm);
+            pa.setSession(one, 44100);
+            pb.setSession(inv, 44100);
+            juce::AudioBuffer<float> ba(2, 1000), bb(2, 1000);
+            pa.seek(44100); pb.seek(44100);
+            pa.render(ba, 0, 1000); pb.render(bb, 0, 1000);
+            double worst = 0;
+            for (int i = 0; i < 1000; ++i) worst = std::max(worst, double(std::abs(ba.getSample(0, i) + bb.getSample(0, i))));
+            CHECK(worst < 1e-6 && rms(ba, 0, 1000) > 0.1);
+            juce::String err;
+            Session back;
+            CHECK(back.fromVar(juce::JSON::parse(juce::JSON::toString(inv.toVar())), err) && back.regions[0].invert);
+        }
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

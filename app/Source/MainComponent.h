@@ -8,6 +8,7 @@
 #include "DeliveryPanels.h"
 #include "PluginManager.h"
 #include "MarkInfo.h"
+#include "SegmentList.h"
 #include "AutoMarks.h"
 #include "Restore.h"
 #include "Commands.h"
@@ -203,6 +204,10 @@ private:
     FadeLibrary fadeLib_ = defaultFadeLibrary();
     void saveFadeSettings();
     void showMarkInfo();
+    void showTextView();
+    void showSegmentGain(juce::Array<int> ids);
+    std::unique_ptr<juce::DocumentWindow> textViewWindow_;
+    juce::Component::SafePointer<SegmentListPanel> textViewPanel_;
     void runAnalogBlack();
     std::unique_ptr<juce::DocumentWindow> markInfoWindow_;
     juce::Component::SafePointer<MarkInfoPanel> markInfoPanel_;

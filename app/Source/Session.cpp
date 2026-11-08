@@ -703,6 +703,35 @@ cd::Disc buildDisc(const juce::Array<Marker>& ms, double lengthSec, int endFrame
 
 }  // namespace
 
+void Session::dropRegion(int id, double start, int lane, DropMode mode) {
+    const int idx = indexOfRegion(id);
+    if (idx < 0) return;
+    Region r = regions[idx];
+    const double oldStart = r.start;
+    juce::Array<std::pair<int, double>> attached;   // its marks, at their original times
+    for (auto& m : markers)
+        if (m.attachedRegion == id && !markLocked(m)) attached.add({m.id, m.t});
+    regions.remove(idx);   // out of the way while making room
+    start = juce::jmax(0.0, start);
+    lane = juce::jlimit(0, lanes - 1, lane);
+    const juce::Array<int> one{lane};
+    if (mode == DropMode::Insert) {
+        for (int i = regions.size(); --i >= 0;) {
+            const auto o = regions[i];
+            if (o.lane == lane && o.start < start - kEps && o.end() > start + kEps) split(o.id, start);
+        }
+        ripple(start - 1e-4, r.length(), 0, &one);
+    } else if (mode == DropMode::Replace) {
+        clearRange(start, start + r.length(), one, false);
+    }
+    r.start = start;
+    r.lane = lane;
+    regions.add(r);
+    for (auto [mid, t] : attached)   // its marks travel with it (the ripple doesn't count for them)
+        if (auto* m = findMarker(mid)) m->t = juce::jmax(0.0, t + (start - oldStart));
+    sortMarkers();
+}
+
 bool Session::onSplice(double t) const {
     for (auto& r : regions)
         if (!r.mute && std::abs(r.start - t) <= 1.0 / cd::kFramesPerSecond && r.start > 1e-6) return true;
@@ -1090,6 +1119,7 @@ juce::var Session::toVar() const {
         o->setProperty("start", r.start);
         o->setProperty("gainDb", r.gainDb);
         o->setProperty("mute", r.mute);
+        if (r.invert) o->setProperty("invert", true);
         o->setProperty("fadeIn", r.fadeIn);
         o->setProperty("fadeOut", r.fadeOut);
         o->setProperty("fadeInShape", int(r.fadeInShape));
@@ -1278,6 +1308,7 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             r.start = double(o["start"]);
             r.gainDb = double(o["gainDb"]);
             r.mute = bool(o["mute"]);
+            r.invert = bool(o.getProperty("invert", false));
             r.fadeIn = double(o["fadeIn"]);
             r.fadeOut = double(o["fadeOut"]);
             r.fadeInShape = FadeShape(juce::jlimit(0, kNumFadeShapes - 1, int(o["fadeInShape"])));

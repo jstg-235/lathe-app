@@ -51,6 +51,8 @@ enum : juce::CommandID {
     defaultFadeOnEdits,
     // PQ tools
     markInfo = 0x1440, segmentsToMarks, editedBlackToMarks, analogBlackToMarks, autoSpace, lockAllMarks,
+    // Assembly
+    textView = 0x1460, segmentGain,
 };
 }  // namespace cmd
 

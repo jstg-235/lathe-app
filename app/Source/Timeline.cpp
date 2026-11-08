@@ -390,6 +390,7 @@ void Timeline::paintRegion(juce::Graphics& g, int i) {
     juce::String label = r.name;
     if (std::abs(r.gainDb) > 0.05) label << "  " << (r.gainDb > 0 ? "+" : "") << juce::String(r.gainDb, 1) << " dB";
     if (r.mute) label << "  (muted)";
+    if (r.invert) label << "  (polarity inverted)";
     if (r.fxState.isNotEmpty()) {
         // FX badge: this region has its own effects chain.
         auto badge = juce::Rectangle<float>(box.getRight() - 30, box.getY() + 3, 26, 14);
@@ -438,8 +439,16 @@ void Timeline::paint(juce::Graphics& g) {
     paintRuler(g);
     paintMarkers(g);
     paintSrps(g);
-    if (role_ == Role::Destination) paintProducts(g);
+    if (role_ == Role::Destination) { paintProducts(g); paintTrackBar(g); }
     paintPoints(g);
+    if (drag_ == Drag::Move && dropMode_ != Session::DropMode::Overlay && changed_)
+        if (auto* r = s_.findRegion(dragId_)) {
+            auto lb = laneBounds(r->lane);
+            g.setColour(colours::accent);
+            g.setFont(juce::FontOptions(11.0f, juce::Font::bold));
+            g.drawText(dropMode_ == Session::DropMode::Insert ? "INSERT (later material moves right)" : "REPLACE (covers what is under it)",
+                       int(timeToX(r->start)) + 4, lb.getBottom() - 30, 260, 12, juce::Justification::left);
+        }
     // Problem ticks on the ruler (red = serious, amber = warning); click to jump.
     if (an_ && showLoudness_)
         for (auto& p : an_->problems) {
@@ -522,6 +531,39 @@ void Timeline::paintPoints(juce::Graphics& g) {
         g.setColour(active_ ? colours::bg : colours::dim);
         g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
         g.drawText(name, pill.toNearestInt(), juce::Justification::centred);
+    }
+}
+
+int Timeline::trackAtX(float x) const {
+    const double t = xToTime(x);
+    auto ranges = s_.trackRanges();
+    for (int i = 0; i < ranges.size(); ++i)
+        if (t >= ranges[i].getStart() && t < ranges[i].getEnd()) return i;
+    if (!ranges.isEmpty() && t >= ranges.getLast().getEnd()) return ranges.size() - 1;
+    if (!ranges.isEmpty() && t < ranges[0].getStart()) return 0;
+    return -1;
+}
+
+void Timeline::paintTrackBar(juce::Graphics& g) {
+    auto strip = juce::Rectangle<int>(0, trackBarY(), getWidth(), kTrackBar);
+    g.setColour(colours::bg);
+    g.fillRect(strip);
+    auto ranges = s_.trackRanges();
+    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+    for (int i = 0; i < ranges.size(); ++i) {
+        float x0 = timeToX(ranges[i].getStart()), x1 = timeToX(ranges[i].getEnd());
+        if (x1 < 0 || x0 > getWidth()) continue;
+        auto box = juce::Rectangle<float>(x0 + 1, float(strip.getY() + 1), juce::jmax(2.0f, x1 - x0 - 2), float(kTrackBar - 2));
+        const bool dragging = drag_ == Drag::TrackBar && i == trackFrom_;
+        g.setColour((dragging ? colours::accent : (i % 2 ? colours::panel2 : colours::panel2.brighter(0.08f))));
+        g.fillRoundedRectangle(box, 2.0f);
+        g.setColour(dragging ? colours::bg : colours::dim);
+        if (box.getWidth() > 14) g.drawText(juce::String(i + 1), box.toNearestInt(), juce::Justification::centred);
+    }
+    if (drag_ == Drag::TrackBar && trackTo_ >= 0 && trackTo_ < ranges.size() && trackTo_ != trackFrom_) {
+        const float x = timeToX(trackTo_ > trackFrom_ ? ranges[trackTo_].getEnd() : ranges[trackTo_].getStart());
+        g.setColour(colours::accent);
+        g.fillRect(x - 1.5f, float(strip.getY()), 3.0f, float(getHeight() - strip.getY() - kScroll));
     }
 }
 
@@ -630,6 +672,10 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
         repaint();
         return;
     }
+    if (trackBarH() > 0 && e.y >= trackBarY() && e.y < top()) {
+        trackFrom_ = trackTo_ = trackAtX(float(e.x));
+        if (trackFrom_ >= 0) { drag_ = Drag::TrackBar; repaint(); return; }
+    }
     if (e.y < top()) {
         drag_ = Drag::Locate;
         setEditPoint(juce::jmax(0.0, dragT0_));
@@ -665,6 +711,7 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
         menu.addItem(4, "Delete (leave gap)");
         menu.addItem(5, "Clear gain envelope", !r->envelope.isEmpty());
         menu.addItem(6, "Select region range");
+        menu.addItem(10, "Segment gain / polarity...");
         menu.addSeparator();
         menu.addItem(7, r->fxState.isNotEmpty() ? "Region effects... (active)" : "Region effects...");
         menu.addItem(8, "Restore (declick, denoise, hum)...");
@@ -675,6 +722,7 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
             if (c == 7) { if (onRegionFx) onRegionFx(id); return; }
             if (c == 8) { selRegion_ = id; if (onRegionRestore) onRegionRestore(id); return; }
             if (c == 9) { selRegion_ = id; if (onRegionSpectral) onRegionSpectral(id); return; }
+            if (c == 10) { selRegion_ = id; if (onSegmentGain) onSegmentGain(id); return; }
             if (c == 1) s_.split(id, playhead_);
             if (c == 2) rr->mute = !rr->mute;
             if (c == 3) s_.deleteRegion(id, true);
@@ -712,7 +760,11 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
     else if (e.y < lb.getY() + 10 && std::abs(e.x - timeToX(r->end() - r->fadeOut)) < 6) drag_ = Drag::FadeOut;
     else if (std::abs(e.x - xa) < 6) drag_ = Drag::TrimStart;
     else if (std::abs(e.x - xb) < 6) drag_ = Drag::TrimEnd;
-    else drag_ = Drag::Move;
+    else {
+        drag_ = Drag::Move;
+        dropMode_ = e.mods.isShiftDown() ? Session::DropMode::Insert : e.mods.isCommandDown() ? Session::DropMode::Replace : Session::DropMode::Overlay;
+        laneLock_ = e.mods.isAltDown();
+    }
     repaint();
 }
 
@@ -730,6 +782,7 @@ void Timeline::mouseDrag(const juce::MouseEvent& e) {
             out_ = b;
             break;
         }
+        case Drag::TrackBar: trackTo_ = trackAtX(float(e.x)); break;
         case Drag::SrpMove:
             if (auto* q = s_.findSrp(dragId_)) { q->t = snapTime(juce::jmax(0.0, t), 0); edit_ = q->t; changed_ = true; }
             break;
@@ -747,7 +800,11 @@ void Timeline::mouseDrag(const juce::MouseEvent& e) {
             double sStart = snapTime(ns, dragId_), sEnd = snapTime(ns + r->length(), dragId_) - r->length();
             if (std::abs(sStart - ns) > 1e-9) ns = sStart;
             else if (std::abs(sEnd - ns) > 1e-9) ns = sEnd;
-            int lane = e.mods.isShiftDown() ? dragOrigLane_ : laneAt(e.y);
+            // Snap to gap: the start lands one track gap after the end of another region.
+            if (snap_)
+                for (auto& o : s_.regions)
+                    if (o.id != dragId_ && std::abs((o.end() + s_.autoSpaceGap - ns) * pps_) < 8) { ns = o.end() + s_.autoSpaceGap; break; }
+            int lane = laneLock_ ? dragOrigLane_ : laneAt(e.y);
             s_.moveRegion(dragId_, ns, lane);
             selLane_ = lane;
             changed_ = true;
@@ -781,6 +838,12 @@ void Timeline::mouseDrag(const juce::MouseEvent& e) {
 
 void Timeline::mouseUp(const juce::MouseEvent&) {
     if (drag_ == Drag::SrpMove) s_.sortSrps();
+    if (drag_ == Drag::TrackBar) {
+        if (trackFrom_ >= 0 && trackTo_ >= 0 && trackFrom_ != trackTo_ && s_.moveTrack(trackFrom_, trackTo_)) changed_ = true;
+        trackFrom_ = trackTo_ = -1;
+    }
+    if (drag_ == Drag::Move && changed_ && dropMode_ != Session::DropMode::Overlay)
+        if (auto* r = s_.findRegion(dragId_)) s_.dropRegion(dragId_, r->start, r->lane, dropMode_);
     if (changed_ && onEdit) onEdit();
     drag_ = Drag::None;
     changed_ = false;

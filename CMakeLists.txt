@@ -79,6 +79,7 @@ target_sources(Lathe PRIVATE
     app/Source/SourceView.cpp
     app/Source/MarkInfo.cpp
     app/Source/AutoMarks.cpp
+    app/Source/SegmentList.cpp
     app/Source/NullTest.cpp
     app/Source/Commands.cpp
     app/Source/RegionFx.cpp

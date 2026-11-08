@@ -42,6 +42,8 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::regionEffects, "Region Effects...", "Edit", "Open the selected region's own plugin chain", "F"},
         {cmd::restoreRegion, "Restore Region...", "Edit", "Declick, decrackle, denoise, hum and DC removal on the selected region (non-destructive)", "command + shift + D"},
         {cmd::spectralEditor, "Spectral Editor...", "Edit", "See the selected region as a spectrogram and heal or attenuate any sound in it", "command + shift + F"},
+        {cmd::textView, "Text View...", "Edit", "Every segment as a list: times, gain, fades, polarity; select several for Segment Gain", "command + T"},
+        {cmd::segmentGain, "Segment Gain...", "Edit", "Set, change or normalize the gain of the selected segment(s), and their polarity", "command + shift + G"},
         {cmd::bypassRegionFx, "Bypass All Region Effects", "Edit", "A/B every region's effects at once (the master chain stays on)", "shift + F"},
         // Source / destination
         {cmd::sourceIn, "Mark In", "Source / Destination", "Set the In point on the active timeline (at the playhead while playing, otherwise the Edit Point)", "I"},
@@ -215,7 +217,7 @@ const std::vector<std::pair<juce::CommandID, const char*>>& legacyKeys() {
         {cmd::goToIn, "shift + F7"}, {cmd::goToOut, "shift + command + F7"},
         {cmd::nextSrp, "shift + F10"}, {cmd::prevSrp, "shift + command + F10"},
         // View
-        {cmd::toggleEnvelope, "option + G"}, {cmd::scrollRight, "cursor right"}, {cmd::scrollLeft, "cursor left"},
+        {cmd::toggleEnvelope, "option + G"}, {cmd::textView, "option + T"}, {cmd::scrollRight, "cursor right"}, {cmd::scrollLeft, "cursor left"},
         {cmd::zoomIn, "cursor down;command + =;command + +"}, {cmd::zoomOut, "cursor up;command + -"},
         {cmd::zoomSelection, "command + G"}, {cmd::zoomFit, "command + E"},
         // CD prep
