@@ -43,6 +43,9 @@ enum : juce::CommandID {
     playToIn = 0x1320, playFromIn, playToOut, playFromOut, playAroundEdit, repeatPlay, editPointFollowsStop, playbackSettings,
     // SRPs
     addSrp = 0x1420, addSrpText, srpsFromSelection, prevSrp, nextSrp, lockSrp, deleteSrp, deleteAllSrps,
+    // Added with the key presets
+    playFromPlayhead = 0x1340, playRepeatInOut, movePointIn, movePointOut, nextEdge, prevEdge, scrollLeft, scrollRight,
+    zoomSelection, keyPresetLathe = 0x1720, keyPresetLegacy,
 };
 }  // namespace cmd
 
@@ -56,6 +59,17 @@ struct CommandDef {
 
 const std::vector<CommandDef>& allCommands();
 const CommandDef* findCommand(juce::CommandID id);
+
+// Key presets: 0 = Lathe (the defaults above), 1 = Legacy (the classic workstation layout:
+// function-key transport, [ ] for In / Out, F9-F11 marks, arrows to scroll and zoom).
+juce::StringArray keyPresetNames();
+// The keys a command gets under a preset, as JUCE descriptions.
+juce::StringArray presetKeys(int preset, const CommandDef& d);
+// Replaces every assignment in `keys` with the preset's.
+void applyKeyPreset(juce::KeyPressMappingSet& keys, int preset);
+// A key description normalised the way a Mac keyboard sees it (Control and Command differ),
+// for comparing assignments.
+juce::String canonicalKey(const juce::String& description);
 
 // The key command guide as text or HTML. With `keys` null, shows the defaults.
 juce::String keyGuideText(const juce::KeyPressMappingSet* keys);

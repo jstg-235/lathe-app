@@ -112,7 +112,7 @@ private:
     juce::Array<int> editLanes(const Session& s, const Timeline& t, int clipLanes) const;
     // Points
     void nudgePoint(bool in, int dir);
-    void showMovePoint();
+    void showMovePoint(int which = 0);   // 0 Edit Point, 1 In, 2 Out, 3 SRP
     void showPlaybackSettings();
     void addSrp(bool withText);
     void editSrpText(bool source, int id);

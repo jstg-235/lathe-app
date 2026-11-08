@@ -411,6 +411,24 @@ int main() {
                 seen[key] = d.name;
             }
         CHECK(dupes == 0 && unparsed == 0);
+        // The Legacy preset: no clashes either, and the classic keys land where expected.
+        std::map<juce::String, juce::String> seenL;
+        int dupesL = 0;
+        for (auto& d : allCommands())
+            for (auto& k : presetKeys(1, d)) {
+                if (!juce::KeyPress::createFromDescription(k).isValid()) { ++dupesL; std::printf("legacy unparsed: %s\n", k.toRawUTF8()); }
+                auto key = canonicalKey(k);
+                if (seenL.count(key)) { ++dupesL; std::printf("legacy duplicate %s: %s / %s\n", key.toRawUTF8(), seenL[key].toRawUTF8(), d.name); }
+                seenL[key] = d.name;
+            }
+        CHECK(dupesL == 0);
+        CHECK(presetKeys(1, *findCommand(cmd::playToIn)) == juce::StringArray{"F5"});
+        CHECK(presetKeys(1, *findCommand(cmd::sourceIn)) == juce::StringArray{"["});
+        CHECK(presetKeys(1, *findCommand(cmd::overwriteEdit)) == juce::StringArray{"F1"});
+        CHECK(presetKeys(1, *findCommand(cmd::addTrackMarker)) == juce::StringArray{"F9"});
+        CHECK(presetKeys(1, *findCommand(cmd::exportDdp)).isEmpty());   // its key went to Zoom to Fit
+        CHECK(presetKeys(1, *findCommand(cmd::playAroundEdit)).isEmpty());
+        CHECK(presetKeys(1, *findCommand(cmd::analyse)) == juce::StringArray{"command + shift + A"});   // untouched
         if (auto* out = std::getenv("LATHE_KEYGUIDE_OUT")) juce::File(out).replaceWithText(keyGuideHtml(nullptr));
     }
 

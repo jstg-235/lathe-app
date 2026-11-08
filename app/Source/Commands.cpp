@@ -1,5 +1,7 @@
 #include "Commands.h"
 
+#include <set>
+
 namespace lathe {
 
 const std::vector<CommandDef>& allCommands() {
@@ -135,11 +137,103 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::controlSurfaces, "Control Surfaces / MIDI...", "Tools", "Mackie Control, HUI and MIDI-learn for any command", ""},
         {cmd::audioSetup, "Audio Setup...", "Tools", "Choose the audio interface and buffer size", "command + ,"},
         {cmd::followProjectRate, "Follow Project Sample Rate", "Tools", "Switch the interface to the project's rate so playback is never resampled", ""},
+        {cmd::playFromPlayhead, "Play from Playhead", "Transport", "Play from where the playhead is instead of the Edit Point", ""},
+        {cmd::playRepeatInOut, "Play In-Out Repeating", "Transport", "Loop the In-Out of the active timeline until you stop", ""},
+        {cmd::movePointIn, "Move In Point...", "Source / Destination", "Move the In point by an exact amount or to an exact time", ""},
+        {cmd::movePointOut, "Move Out Point...", "Source / Destination", "Move the Out point by an exact amount or to an exact time", ""},
+        {cmd::nextEdge, "Edit Point to Next Region Edge", "Transport", "Move the Edit Point to the next region start or end", ""},
+        {cmd::prevEdge, "Edit Point to Previous Region Edge", "Transport", "Move the Edit Point to the previous region start or end", ""},
+        {cmd::scrollLeft, "Scroll Left", "View", "Scroll the active timeline earlier", ""},
+        {cmd::scrollRight, "Scroll Right", "View", "Scroll the active timeline later", ""},
+        {cmd::zoomSelection, "Zoom to In-Out", "View", "Fit the In-Out (or the selected region) to the window", ""},
         // Help
+        {cmd::keyPresetLathe, "Key Preset: Lathe", "Help", "Use Lathe's default key assignments", ""},
+        {cmd::keyPresetLegacy, "Key Preset: Legacy", "Help", "Use the classic workstation layout (function-key transport, [ ] for In / Out, F9-F11 marks)", ""},
         {cmd::keyGuide, "Key Command Guide", "Help", "Every command and its keys", "F1;command + shift + /"},
         {cmd::editKeyCommands, "Edit Key Commands...", "Help", "Change, add or remove key assignments", "command + option + K"},
     };
     return defs;
+}
+
+juce::String canonicalKey(const juce::String& description) {
+    auto parts = juce::StringArray::fromTokens(description.trim().toLowerCase(), "+", "");
+    parts.trim();
+    parts.removeEmptyStrings();
+    if (parts.isEmpty()) return {};
+    const juce::String keyName = parts[parts.size() - 1];
+    parts.remove(parts.size() - 1);
+    for (auto& m : parts) m = m == "ctrl" ? "control" : m == "alt" ? "option" : m == "cmd" ? "command" : m;
+    parts.sort(false);
+    return parts.joinIntoString("+") + "+" + juce::KeyPress::createFromDescription(keyName).getTextDescription().toLowerCase();
+}
+
+juce::StringArray keyPresetNames() { return {"Lathe", "Legacy"}; }
+
+namespace {
+// The Legacy layout. Commands not listed keep their Lathe keys unless a Legacy key takes them.
+const std::vector<std::pair<juce::CommandID, const char*>>& legacyKeys() {
+    static const std::vector<std::pair<juce::CommandID, const char*>> k{
+        // File
+        {cmd::newSession, "command + N"}, {cmd::openSession, "command + O"}, {cmd::saveSession, "command + S"},
+        {cmd::openDdpSession, "command + option + O"}, {cmd::exportDdp, ""},
+        // Playback
+        {cmd::playStop, "spacebar"}, {cmd::playSelection, "command + spacebar;command + control + F5"},
+        {cmd::playFromPlayhead, "option + spacebar"}, {cmd::playRepeatInOut, "command + option + spacebar"},
+        {cmd::playToIn, "F5"}, {cmd::playFromIn, "F6"}, {cmd::playToOut, "F7"}, {cmd::playFromOut, "F8"},
+        {cmd::playSourceInOut, ""}, {cmd::playAroundEdit, ""},
+        // Edit
+        {cmd::undo, "command + Z"}, {cmd::redo, "command + shift + Z"}, {cmd::clearSelection, "command + D;control + \\"},
+        {cmd::cutRange, "command + X"}, {cmd::copyRange, "command + C"}, {cmd::pasteReplace, "command + V"},
+        {cmd::pasteInsert, "command + option + V"}, {cmd::pasteOverlay, "shift + V"},
+        {cmd::deleteClose, "delete;backspace"}, {cmd::eraseRange, "option + delete;option + backspace"},
+        {cmd::crossfadeEditor, "control + G"},
+        {cmd::overwriteEdit, "F1"}, {cmd::insertEdit, "F2"},
+        {cmd::replaceLeftEdit, "option + F1"}, {cmd::constrainedEdit, "shift + F1"}, {cmd::replaceEdit, "control + F1"}, {cmd::overlayEdit, "option + F2"},
+        {cmd::sourceIn, "["}, {cmd::sourceOut, "]"}, {cmd::selectRegionRange, "control + option + [;command + \\"},
+        {cmd::clearIn, "control + ["}, {cmd::clearOut, "control + ]"},
+        {cmd::movePointIn, "option + ["}, {cmd::movePointOut, "option + ]"},
+        {cmd::editPointToPlayhead, "\\"},
+        {cmd::nextMarker, "shift + F6"}, {cmd::prevMarker, "shift + command + F6"},
+        {cmd::nextEdge, "shift + F5"}, {cmd::prevEdge, "shift + command + F5"},
+        {cmd::goToIn, "shift + F7"}, {cmd::goToOut, "shift + command + F7"},
+        {cmd::nextSrp, "shift + F10"}, {cmd::prevSrp, "shift + command + F10"},
+        // View
+        {cmd::toggleEnvelope, "option + G"}, {cmd::scrollRight, "cursor right"}, {cmd::scrollLeft, "cursor left"},
+        {cmd::zoomIn, "cursor down;command + =;command + +"}, {cmd::zoomOut, "cursor up;command + -"},
+        {cmd::zoomSelection, "command + G"}, {cmd::zoomFit, "command + E"},
+        // CD prep
+        {cmd::addTrackMarker, "F9"}, {cmd::addPauseMarker, "F10"}, {cmd::addIndexMarker, "F11"},
+        // System
+        {cmd::audioSetup, "option + A;command + ,"},
+        {cmd::nudgeSizeA, "control + 1"}, {cmd::nudgeSizeB, "control + 2"}, {cmd::nudgeSizeC, "control + 3"},
+    };
+    return k;
+}
+}  // namespace
+
+juce::StringArray presetKeys(int preset, const CommandDef& d) {
+    auto split = [](const char* keys) {
+        juce::StringArray a = juce::StringArray::fromTokens(keys, ";", "");
+        a.trim();
+        a.removeEmptyStrings();
+        return a;
+    };
+    if (preset != 1) return split(d.keys);
+    std::set<juce::String> taken;
+    for (auto& [id, keys] : legacyKeys()) {
+        if (id == d.id) return split(keys);
+        for (auto& k : split(keys)) taken.insert(canonicalKey(k));
+    }
+    juce::StringArray out;
+    for (auto& k : split(d.keys))
+        if (taken.count(canonicalKey(k)) == 0) out.add(k);
+    return out;
+}
+
+void applyKeyPreset(juce::KeyPressMappingSet& keys, int preset) {
+    for (auto& d : allCommands()) keys.clearAllKeyPresses(d.id);
+    for (auto& d : allCommands())
+        for (auto& k : presetKeys(preset, d)) keys.addKeyPress(d.id, juce::KeyPress::createFromDescription(k));
 }
 
 const CommandDef* findCommand(juce::CommandID id) {

@@ -88,6 +88,8 @@ public:
     std::function<void(double)> onProblemClicked;
 
     void zoomToFit();
+    void zoomToRange(juce::Range<double> r);
+    void scrollBy(double fractionOfWidth);
     void zoomBy(double factor, double aroundSec);
     void sessionUpdated();   // after external changes (undo, load)
 

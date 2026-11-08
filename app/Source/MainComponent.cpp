@@ -500,6 +500,8 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::toggleSnap: info.setTicked(snapBtn_.getToggleState()); break;
         case cmd::followProjectRate: info.setTicked(followRate_); break;
         case cmd::repeatPlay: info.setTicked(repeat_); break;
+        case cmd::keyPresetLathe: info.setTicked(props_.getUserSettings()->getIntValue("keyPreset", 0) == 0); break;
+        case cmd::keyPresetLegacy: info.setTicked(props_.getUserSettings()->getIntValue("keyPreset", 0) == 1); break;
         case cmd::linkPlay: info.setTicked(sourceView_.linked()); break;
         case cmd::editPointFollowsStop: info.setTicked(editFollowsStop_); break;
         case cmd::nudgeSizeA: case cmd::nudgeSizeB: case cmd::nudgeSizeC: {
@@ -588,7 +590,7 @@ bool MainComponent::perform(const InvocationInfo& info) {
             props_.getUserSettings()->setValue("nudgeSize", nudgeSize_);
             commands_.commandStatusChanged();
             break;
-        case cmd::movePoint: showMovePoint(); break;
+        case cmd::movePoint: showMovePoint(0); break;
         case cmd::editPointToPlayhead: {
             const double t = activePlaying() ? activePosition() : (sourceActive_ ? lastStopSource_ : lastStopDest_);
             activeTimeline().setEditPoint(t, true);
@@ -660,6 +662,53 @@ bool MainComponent::perform(const InvocationInfo& info) {
             commands_.commandStatusChanged();
             break;
         case cmd::playbackSettings: showPlaybackSettings(); break;
+        case cmd::playFromPlayhead: {
+            if (engine_.isPlaying() || engine_.isSourcePlaying()) { stopAll(); break; }
+            const double from = sourceActive_ ? lastStopSource_ : lastStopDest_;
+            if (sourceActive_) { engine_.setSourcePosition(from); engine_.playSource(); }
+            else { engine_.setPositionSeconds(from); engine_.play(); }
+            break;
+        }
+        case cmd::playRepeatInOut: {
+            auto r = activeTimeline().selection();
+            if (r.isEmpty()) break;
+            repeat_ = true;
+            commands_.commandStatusChanged();
+            playRange(sourceActive_, r.getStart(), r.getEnd());
+            break;
+        }
+        case cmd::movePointIn: showMovePoint(1); break;
+        case cmd::movePointOut: showMovePoint(2); break;
+        case cmd::nextEdge: case cmd::prevEdge: {
+            const double p = markTime();
+            const bool fwd = info.commandID == cmd::nextEdge;
+            double best = fwd ? 1e12 : -1.0;
+            for (auto& r : activeSession().regions)
+                for (double e : {r.start, r.end()}) {
+                    if (fwd && e > p + 0.001 && e < best) best = e;
+                    if (!fwd && e < p - 0.001 && e > best) best = e;
+                }
+            if (best >= 0 && best < 1e11) locate(best);
+            break;
+        }
+        case cmd::scrollLeft: activeTimeline().scrollBy(-0.25); break;
+        case cmd::scrollRight: activeTimeline().scrollBy(0.25); break;
+        case cmd::zoomSelection: {
+            auto& t = activeTimeline();
+            auto r = t.selection();
+            if (r.isEmpty())
+                if (auto* reg = activeSession().findRegion(t.selectedRegion())) r = {reg->start, reg->end()};
+            if (!r.isEmpty()) t.zoomToRange(r);
+            break;
+        }
+        case cmd::keyPresetLathe: case cmd::keyPresetLegacy: {
+            const int preset = info.commandID == cmd::keyPresetLegacy ? 1 : 0;
+            applyKeyPreset(*commands_.getKeyMappings(), preset);
+            props_.getUserSettings()->setValue("keyPreset", preset);
+            saveKeyMappings();
+            commands_.commandStatusChanged();
+            break;
+        }
         case cmd::addSrp: addSrp(false); break;
         case cmd::addSrpText: addSrp(true); break;
         case cmd::srpsFromSelection: {
@@ -774,7 +823,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
                 addTo(sd, {cmd::sourceIn, cmd::sourceOut, cmd::destIn, cmd::destOut, cmd::goToIn, cmd::goToOut, cmd::clearIn, cmd::clearOut, cmd::moveInToOut});
                 sd.addSeparator();
                 addTo(sd, {cmd::nudgeInLeft, cmd::nudgeInRight, cmd::nudgeOutLeft, cmd::nudgeOutRight, cmd::nudgeSizeA, cmd::nudgeSizeB, cmd::nudgeSizeC,
-                           cmd::movePoint, cmd::editPointToPlayhead});
+                           cmd::movePoint, cmd::movePointIn, cmd::movePointOut, cmd::editPointToPlayhead});
                 sd.addSeparator();
                 addTo(sd, {cmd::insertEdit, cmd::overwriteEdit, cmd::replaceLeftEdit, cmd::constrainedEdit, cmd::replaceEdit, cmd::overlayEdit, cmd::appendEdit});
                 sd.addSeparator();
@@ -801,7 +850,10 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::record});
             m.addSeparator();
-            add({cmd::locateBackFrame, cmd::locateFwdFrame, cmd::locateBackSecond, cmd::locateFwdSecond, cmd::prevMarker, cmd::nextMarker});
+            add({cmd::playFromPlayhead, cmd::playRepeatInOut});
+            m.addSeparator();
+            add({cmd::locateBackFrame, cmd::locateFwdFrame, cmd::locateBackSecond, cmd::locateFwdSecond, cmd::prevMarker, cmd::nextMarker,
+                 cmd::prevEdge, cmd::nextEdge});
             break;
         case 3:
             add({cmd::addTrackMarker, cmd::addIndexMarker, cmd::addPauseMarker, cmd::addEndMarker});
@@ -809,7 +861,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             add({cmd::addSrp, cmd::addSrpText, cmd::srpsFromSelection, cmd::prevSrp, cmd::nextSrp, cmd::lockSrp, cmd::deleteSrp, cmd::deleteAllSrps});
             break;
         case 4:
-            add({cmd::zoomIn, cmd::zoomOut, cmd::zoomFit});
+            add({cmd::zoomIn, cmd::zoomOut, cmd::zoomFit, cmd::zoomSelection, cmd::scrollLeft, cmd::scrollRight});
             m.addSeparator();
             add({cmd::toggleEnvelope, cmd::toggleSnap, cmd::crossfadeEditor, cmd::toggleLoudness});
             break;
@@ -829,7 +881,11 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::pluginManager, cmd::audioSetup, cmd::controlSurfaces, cmd::followProjectRate});
             break;
-        case 7: add({cmd::keyGuide, cmd::editKeyCommands}); break;
+        case 7:
+            add({cmd::keyGuide, cmd::editKeyCommands});
+            m.addSeparator();
+            add({cmd::keyPresetLathe, cmd::keyPresetLegacy});
+            break;
         default: break;
     }
     return m;
@@ -894,9 +950,39 @@ void MainComponent::showKeyGuide() {
 }
 
 void MainComponent::showKeyEditor() {
-    auto* ed = new juce::KeyMappingEditorComponent(*commands_.getKeyMappings(), true);
-    ed->setColours(colours::panel2, colours::text);
-    ed->setSize(620, 640);
+    // The standard editor plus a preset chooser above it.
+    struct KeyEditor : juce::Component {
+        juce::KeyMappingEditorComponent ed;
+        juce::Label lbl;
+        juce::ComboBox preset;
+        KeyEditor(juce::KeyPressMappingSet& k) : ed(k, true) {
+            ed.setColours(colours::panel2, colours::text);
+            lbl.setText("Preset:", juce::dontSendNotification);
+            lbl.setColour(juce::Label::textColourId, colours::text);
+            addAndMakeVisible(lbl);
+            addAndMakeVisible(preset);
+            addAndMakeVisible(ed);
+        }
+        void paint(juce::Graphics& g) override { g.fillAll(colours::bg); }
+        void resized() override {
+            auto r = getLocalBounds().reduced(6);
+            auto top = r.removeFromTop(26);
+            lbl.setBounds(top.removeFromLeft(56));
+            preset.setBounds(top.removeFromLeft(220));
+            r.removeFromTop(6);
+            ed.setBounds(r);
+        }
+    };
+    auto* ed = new KeyEditor(*commands_.getKeyMappings());
+    auto names = keyPresetNames();
+    for (int i = 0; i < names.size(); ++i) ed->preset.addItem(names[i], i + 1);
+    ed->preset.setText("Load a preset...", juce::dontSendNotification);
+    ed->preset.onChange = [this, ed] {
+        const int id = ed->preset.getSelectedId();
+        if (id <= 0) return;
+        commands_.invokeDirectly(id == 2 ? cmd::keyPresetLegacy : cmd::keyPresetLathe, false);
+    };
+    ed->setSize(640, 680);
     juce::DialogWindow::LaunchOptions o;
     o.content.setOwned(ed);
     o.dialogTitle = "Edit Key Commands (click + to add a key, click a key to change or remove it)";
@@ -2440,14 +2526,14 @@ void MainComponent::nudgePoint(bool in, int dir) {
     }
 }
 
-void MainComponent::showMovePoint() {
+void MainComponent::showMovePoint(int which0) {
     auto& t = activeTimeline();
     auto* w = new juce::AlertWindow("Move Point", "Move a point on the " + juce::String(sourceActive_ ? "source" : "destination") +
                                                       " timeline by an amount (e.g. +0.250, -1.5, +3f for CD frames) or to a time (m:ss.fff or m:ss:ff).",
                                     juce::MessageBoxIconType::NoIcon);
     juce::StringArray pts{"Edit Point", "In", "Out", "Selected SRP"};
     w->addComboBox("point", pts, "Point");
-    w->getComboBoxComponent("point")->setSelectedItemIndex(0);
+    w->getComboBoxComponent("point")->setSelectedItemIndex(which0);
     w->addTextEditor("amount", "+0.000", "Move by / to");
     w->addButton("Move", 1, juce::KeyPress(juce::KeyPress::returnKey));
     w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));

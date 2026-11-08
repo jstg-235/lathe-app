@@ -215,6 +215,20 @@ void Timeline::zoomToFit() {
     repaint();
 }
 
+void Timeline::zoomToRange(juce::Range<double> r) {
+    if (r.getLength() <= 0) return;
+    pps_ = juce::jlimit(0.2, 20000.0, double(getWidth()) / (r.getLength() * 1.1));
+    view0_ = juce::jmax(0.0, r.getStart() - r.getLength() * 0.05);
+    updateScrollbar();
+    repaint();
+}
+
+void Timeline::scrollBy(double f) {
+    view0_ = juce::jmax(0.0, view0_ + f * getWidth() / pps_);
+    updateScrollbar();
+    repaint();
+}
+
 void Timeline::zoomBy(double f, double around) {
     double x = (around - view0_) * pps_;
     pps_ = juce::jlimit(0.2, 20000.0, pps_ * f);
