@@ -25,6 +25,15 @@ jobs:
           LATHE_SCAN_LOG: ${{ runner.temp }}/scan.log
         run: ctest --test-dir build -C Release --output-on-failure -E scan
 
+      - name: Crash backtrace (only when a test failed)
+        if: failure()
+        run: |
+          for name in lathe_render_tests lathe_batch_tests; do
+            T=$(find build -name "$name" -type f -perm -u+x | grep Release | head -1)
+            echo "==== $name"
+            lldb --batch -o run -o "bt 40" -o quit -- "$T" 2>&1 | tail -70
+          done
+
       - name: Scan helper test (console helper)
         continue-on-error: true
         env:
