@@ -38,16 +38,14 @@ public:
     void addTo(juce::AudioBuffer<T>& out, int offset, int n) {
         while (int(pending_[0].size()) - pendingPos_ < n && !drained_) pull();
         const int avail = juce::jmin(n, int(pending_[0].size()) - pendingPos_);
-        const double fadeIn = fades_.in * rate_, fadeOut = fades_.out * rate_;
+        const double lenSec = double(lengthOut_ - 1) / rate_;
         const bool env = !clip_.envelope.isEmpty();
         for (int i = 0; i < avail; ++i) {
             juce::int64 k = local_ + i;
             if (k >= lengthOut_) break;
             double g = gain_;
             if (env) g *= juce::Decibels::decibelsToGain(clip_.envelopeDb(double(k) / rate_), -150.0);
-            if (fadeIn > 0 && double(k) < fadeIn) g *= fadeGain(fades_.inShape, double(k) / fadeIn);
-            double toEnd = double(lengthOut_ - 1 - k);
-            if (fadeOut > 0 && toEnd < fadeOut) g *= fadeGain(fades_.outShape, juce::jmax(0.0, toEnd) / fadeOut);
+            g *= fades_.gainAt(double(k) / rate_, lenSec);
             for (int ch = 0; ch < 2; ++ch)
                 out.getWritePointer(ch)[offset + i] += T(pending_[size_t(ch)][size_t(pendingPos_ + i)] * g);
         }

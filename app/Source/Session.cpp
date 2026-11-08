@@ -11,13 +11,21 @@ juce::String fadeShapeName(FadeShape s) {
         case FadeShape::SCurve: return "S-curve";
         case FadeShape::Exponential: return "Exponential";
         case FadeShape::Logarithmic: return "Logarithmic";
+        case FadeShape::Custom: return "Custom";
     }
     return {};
 }
 
-double fadeGain(FadeShape s, double x) {
+double fadeGain(FadeShape s, double x, double dbDown, double alpha) {
     x = juce::jlimit(0.0, 1.0, x);
     switch (s) {
+        case FadeShape::Custom: {
+            // x^p passes through 10^(-dbDown/20) at x = 0.5; alpha blends in a smoothstep first.
+            const double p = juce::jlimit(0.05, 20.0, juce::jmax(0.01, dbDown) / (20.0 * std::log10(2.0)));
+            const double sx = x * x * (3.0 - 2.0 * x);
+            const double a = juce::jlimit(0.0, 1.0, alpha);
+            return std::pow((1.0 - a) * x + a * sx, p);
+        }
         case FadeShape::Linear: return x;
         case FadeShape::EqualPower: return std::sin(juce::MathConstants<double>::halfPi * x);
         case FadeShape::SCurve: return 0.5 - 0.5 * std::cos(juce::MathConstants<double>::pi * x);
@@ -40,6 +48,16 @@ double Region::envelopeDb(double t) const {
         }
     }
     return envelope.getLast().db;
+}
+
+double EffectiveFades::gainAt(double t, double length) const {
+    if (t < inOffset - 1e-12) return 0.0;
+    const double toEnd = length - t;
+    if (toEnd < outOffset - 1e-12) return 0.0;
+    double g = 1.0;
+    if (in > 0 && t < inOffset + in) g *= fadeGain(inShape, (t - inOffset) / in, inDb, inAlpha);
+    if (out > 0 && toEnd < outOffset + out) g *= fadeGain(outShape, (toEnd - outOffset) / out, outDb, outAlpha);
+    return g;
 }
 
 // ---- queries ----------------------------------------------------------------------
@@ -93,18 +111,30 @@ void Session::sortMarkers() {
 
 EffectiveFades Session::fadesFor(int i) const {
     const Region& r = regions.getReference(i);
-    EffectiveFades f{r.fadeIn, r.fadeOut, r.fadeInShape, r.fadeOutShape};
+    EffectiveFades f;
+    f.in = r.fadeIn;
+    f.out = r.fadeOut;
+    f.inShape = r.fadeInShape;
+    f.outShape = r.fadeOutShape;
+    f.inOffset = r.fadeInOffset;
+    f.outOffset = r.fadeOutOffset;
+    f.inDb = r.fadeInDb;
+    f.outDb = r.fadeOutDb;
+    f.inAlpha = r.fadeInAlpha;
+    f.outAlpha = r.fadeOutAlpha;
     for (int j = 0; j < regions.size(); ++j) {
         if (j == i) continue;
         const Region& o = regions.getReference(j);
         if (o.lane != r.lane || o.mute) continue;
-        if (o.start < r.start - kEps && o.end() > r.start + kEps)   // o fades out into r
-            f.in = juce::jmax(f.in, juce::jmin(o.end(), r.end()) - r.start);
-        if (o.start > r.start + kEps && o.start < r.end() - kEps)   // r fades out into o
-            f.out = juce::jmax(f.out, r.end() - o.start);
+        if (!r.fadeInManual && o.start < r.start - kEps && o.end() > r.start + kEps)   // o fades out into r
+            f.in = juce::jmax(f.in, juce::jmin(o.end(), r.end()) - r.start - f.inOffset);
+        if (!r.fadeOutManual && o.start > r.start + kEps && o.start < r.end() - kEps)   // r fades out into o
+            f.out = juce::jmax(f.out, r.end() - o.start - f.outOffset);
     }
-    f.in = juce::jmin(f.in, r.length());
-    f.out = juce::jmin(f.out, r.length());
+    f.inOffset = juce::jlimit(0.0, r.length(), f.inOffset);
+    f.outOffset = juce::jlimit(0.0, r.length(), f.outOffset);
+    f.in = juce::jlimit(0.0, r.length() - f.inOffset, f.in);
+    f.out = juce::jlimit(0.0, r.length() - f.outOffset, f.out);
     return f;
 }
 
@@ -209,6 +239,8 @@ int Session::split(int id, double t) {
     b.srcIn = cut;
     b.start = r->start + double(cut - r->srcIn) / r->fileRate;
     b.fadeIn = 0;
+    b.fadeInOffset = 0;
+    b.fadeInManual = false;
     b.envelope.clear();
     for (auto& p : r->envelope)
         if (p.t >= t - r->start) b.envelope.add({p.t - (b.start - r->start), p.db});
@@ -223,6 +255,8 @@ int Session::split(int id, double t) {
     }
     r->srcOut = cut;
     r->fadeOut = 0;
+    r->fadeOutOffset = 0;
+    r->fadeOutManual = false;
     const int aId = r->id;
     for (auto& m : markers)
         if (m.attachedRegion == aId && m.t >= b.start - kEps) m.attachedRegion = b.id;
@@ -280,6 +314,7 @@ Clip Session::copyRange(double a, double b, const juce::Array<int>& laneList) co
         x.fadeOut = ef.out;
         x.fadeInShape = ef.inShape;
         x.fadeOutShape = ef.outShape;
+        x.fadeInManual = x.fadeOutManual = true;   // the baked lengths are what was heard
         if (x.start < a) {
             const auto d = juce::int64(std::llround((a - x.start) * x.fileRate));
             const double shift = double(d) / x.fileRate;
@@ -294,6 +329,7 @@ Clip Session::copyRange(double a, double b, const juce::Array<int>& laneList) co
             x.srcIn += d;
             x.start += shift;
             x.fadeIn = 0;
+            x.fadeInOffset = 0;
         }
         if (x.end() > b) {
             const double keep = b - x.start;
@@ -307,6 +343,7 @@ Clip Session::copyRange(double a, double b, const juce::Array<int>& laneList) co
             }
             x.srcOut = juce::jlimit<juce::int64>(x.srcIn + 1, x.fileLength, x.srcIn + juce::int64(std::llround(keep * x.fileRate)));
             x.fadeOut = 0;
+            x.fadeOutOffset = 0;
         }
         if (x.srcOut - x.srcIn < 1) continue;
         x.fadeIn = juce::jmin(x.fadeIn, x.length());
@@ -473,23 +510,80 @@ int Session::sourceEdit(const juce::File& f, double rate, juce::int64 len, juce:
     return r.id;
 }
 
-void Session::setCrossfadeLength(int outgoing, int incoming, double len, bool rippleAfter) {
+void Session::shiftWithRipple(int id, double dt, Ripple mode) {
+    auto* b = findRegion(id);
+    if (!b || std::abs(dt) < kEps) return;
+    const double oldStart = b->start, oldEnd = b->end();
+    const int lane = b->lane;
+    b->start += dt;
+    regionMoved(id, dt);
+    if (mode == Ripple::All) {
+        ripple(oldStart + 1e-6, dt, id);
+        return;
+    }
+    if (mode != Ripple::UntilBlack) return;
+    // Walk the material joined to the moved region (touching or overlapping) and move it too;
+    // stop at the first gap, which absorbs the change.
+    juce::Array<int> order;
+    for (int i = 0; i < regions.size(); ++i)
+        if (regions.getReference(i).lane == lane && regions.getReference(i).id != id && regions.getReference(i).start >= oldStart - kEps) order.add(i);
+    std::sort(order.begin(), order.end(), [this](int x, int y) { return regions.getReference(x).start < regions.getReference(y).start; });
+    double chainEnd = oldEnd;
+    for (int i : order) {
+        auto& r = regions.getReference(i);
+        if (r.start > chainEnd + 1e-4) break;   // black: stop here
+        chainEnd = juce::jmax(chainEnd, r.end());
+        r.start = juce::jmax(0.0, r.start + dt);
+        regionMoved(r.id, dt);
+    }
+}
+
+void Session::setCrossfadeLength(int outgoing, int incoming, double len, Ripple mode) {
     auto* a = findRegion(outgoing);
     auto* b = findRegion(incoming);
     if (!a || !b) return;
     len = juce::jlimit(0.0, juce::jmin(a->length(), b->length()) * 0.95, len);
-    double newStart = a->end() - len;
-    double oldStart = b->start;
-    double dt = newStart - oldStart;
-    b->start = newStart;
-    regionMoved(b->id, dt);
-    if (rippleAfter) {
-        ripple(oldStart + 1e-6, dt, b->id);
-        a = findRegion(outgoing);
-        b = findRegion(incoming);
+    const double dt = (a->end() - len) - b->start;
+    shiftWithRipple(incoming, dt, mode);
+    a = findRegion(outgoing);
+    b = findRegion(incoming);
+    if (!a->fadeOutManual) a->fadeOut = juce::jmin(a->fadeOut, len);
+    if (!b->fadeInManual) b->fadeIn = juce::jmin(b->fadeIn, len);
+}
+
+void Session::crossfadeCentred(int outgoing, int incoming, double len) {
+    auto* a = findRegion(outgoing);
+    auto* b = findRegion(incoming);
+    if (!a || !b) return;
+    len = juce::jmax(0.0, len);
+    // The edit's centre: the middle of the overlap, or the butt point.
+    const double c = b->start < a->end() ? 0.5 * (b->start + a->end()) : b->start;
+    trimRegionEnd(outgoing, c + len / 2);
+    trimRegionStart(incoming, c - len / 2);
+    a = findRegion(outgoing);
+    b = findRegion(incoming);
+    a->fadeOutManual = b->fadeInManual = false;
+    a->fadeOutOffset = b->fadeInOffset = 0;
+    const double ov = juce::jmax(0.0, a->end() - b->start);
+    a->fadeOut = juce::jmin(a->fadeOut, ov);
+    b->fadeIn = juce::jmin(b->fadeIn, ov);
+}
+
+juce::Array<std::pair<int, int>> Session::splicesAround(const juce::Array<int>& ids) const {
+    juce::Array<std::pair<int, int>> out;
+    for (int id : ids) {
+        const auto* r = findRegion(id);
+        if (!r) continue;
+        for (auto& o : regions) {
+            if (o.id == r->id || o.lane != r->lane) continue;
+            // o before r: o ends at (or just after) r's start
+            if (o.start < r->start - kEps && o.end() >= r->start - 1e-3 && o.end() <= r->end())
+                out.addIfNotAlreadyThere({o.id, r->id});
+            if (o.start > r->start + kEps && o.start <= r->end() + 1e-3 && o.end() >= r->end())
+                out.addIfNotAlreadyThere({r->id, o.id});
+        }
     }
-    a->fadeOut = juce::jmin(a->fadeOut, len);
-    b->fadeIn = juce::jmin(b->fadeIn, len);
+    return out;
 }
 
 void Session::slip(int id, double dt) {
@@ -775,6 +869,14 @@ juce::var Session::toVar() const {
         o->setProperty("fadeOut", r.fadeOut);
         o->setProperty("fadeInShape", int(r.fadeInShape));
         o->setProperty("fadeOutShape", int(r.fadeOutShape));
+        if (r.fadeInOffset != 0.0) o->setProperty("fadeInOffset", r.fadeInOffset);
+        if (r.fadeOutOffset != 0.0) o->setProperty("fadeOutOffset", r.fadeOutOffset);
+        if (r.fadeInDb != 3.0) o->setProperty("fadeInDb", r.fadeInDb);
+        if (r.fadeOutDb != 3.0) o->setProperty("fadeOutDb", r.fadeOutDb);
+        if (r.fadeInAlpha != 0.0) o->setProperty("fadeInAlpha", r.fadeInAlpha);
+        if (r.fadeOutAlpha != 0.0) o->setProperty("fadeOutAlpha", r.fadeOutAlpha);
+        if (r.fadeInManual) o->setProperty("fadeInManual", true);
+        if (r.fadeOutManual) o->setProperty("fadeOutManual", true);
         juce::Array<juce::var> env;
         for (auto& p : r.envelope) env.add(juce::Array<juce::var>{p.t, p.db});
         o->setProperty("envelope", env);
@@ -944,8 +1046,16 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             r.mute = bool(o["mute"]);
             r.fadeIn = double(o["fadeIn"]);
             r.fadeOut = double(o["fadeOut"]);
-            r.fadeInShape = FadeShape(juce::jlimit(0, 4, int(o["fadeInShape"])));
-            r.fadeOutShape = FadeShape(juce::jlimit(0, 4, int(o["fadeOutShape"])));
+            r.fadeInShape = FadeShape(juce::jlimit(0, kNumFadeShapes - 1, int(o["fadeInShape"])));
+            r.fadeOutShape = FadeShape(juce::jlimit(0, kNumFadeShapes - 1, int(o["fadeOutShape"])));
+            r.fadeInOffset = double(o.getProperty("fadeInOffset", 0.0));
+            r.fadeOutOffset = double(o.getProperty("fadeOutOffset", 0.0));
+            r.fadeInDb = double(o.getProperty("fadeInDb", 3.0));
+            r.fadeOutDb = double(o.getProperty("fadeOutDb", 3.0));
+            r.fadeInAlpha = double(o.getProperty("fadeInAlpha", 0.0));
+            r.fadeOutAlpha = double(o.getProperty("fadeOutAlpha", 0.0));
+            r.fadeInManual = bool(o.getProperty("fadeInManual", false));
+            r.fadeOutManual = bool(o.getProperty("fadeOutManual", false));
             if (auto* env = o["envelope"].getArray())
                 for (auto& p : *env) r.envelope.add({double(p[0]), double(p[1])});
             r.fxState = o["fx"].toString();

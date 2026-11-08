@@ -46,6 +46,9 @@ enum : juce::CommandID {
     // Added with the key presets
     playFromPlayhead = 0x1340, playRepeatInOut, movePointIn, movePointOut, nextEdge, prevEdge, scrollLeft, scrollRight,
     zoomSelection, keyPresetLathe = 0x1720, keyPresetLegacy,
+    // Edit Fade library recall (Option-0 to Option-9)
+    fadeRecall0 = 0x1280, fadeRecall1, fadeRecall2, fadeRecall3, fadeRecall4, fadeRecall5, fadeRecall6, fadeRecall7, fadeRecall8, fadeRecall9,
+    defaultFadeOnEdits,
 };
 }  // namespace cmd
 

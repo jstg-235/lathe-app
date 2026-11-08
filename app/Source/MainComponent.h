@@ -197,6 +197,10 @@ private:
     double preRoll_ = 3.0, postRoll_ = 2.0, nudgeSizes_[3] = {1.0 / 75, 0.1, 1.0};
     double lastStopDest_ = 0, lastStopSource_ = 0;
     juce::String lastSourceState_;
+    FadeEditorPrefs fadePrefs_;
+    FadeLibrary fadeLib_ = defaultFadeLibrary();
+    void saveFadeSettings();
+    void crossfadeNewEdits(const juce::Array<int>& ids, Session& s);   // default crossfade on new splices
     std::unique_ptr<LevelMeters> meters_;
     juce::TableListBox pqList_{"PQ", this};
     ChainModel chainModel_{*this};

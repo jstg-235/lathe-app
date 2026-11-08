@@ -13,10 +13,13 @@
 
 namespace lathe {
 
-enum class FadeShape { Linear = 0, EqualPower, SCurve, Exponential, Logarithmic };
+enum class FadeShape { Linear = 0, EqualPower, SCurve, Exponential, Logarithmic, Custom };
+constexpr int kNumFadeShapes = 6;
 juce::String fadeShapeName(FadeShape s);
 // Gain (0..1) of a fade-in at position x in [0,1]. Fade-outs use 1-x.
-double fadeGain(FadeShape s, double x);
+// Custom: the gain halfway through is `dbDown` below unity (3 dB = equal power, 6 dB = linear
+// amplitude), and `alpha` (0..1) bends the curve towards an S shape around that point.
+double fadeGain(FadeShape s, double x, double dbDown = 3.0, double alpha = 0.0);
 
 struct GainPoint {
     double t = 0;    // seconds from region start
@@ -36,6 +39,12 @@ struct Region {
     bool mute = false;
     double fadeIn = 0, fadeOut = 0;      // seconds (overlaps on the same lane extend these automatically)
     FadeShape fadeInShape = FadeShape::EqualPower, fadeOutShape = FadeShape::EqualPower;
+    // Edit Fade detail. Offsets move a fade inside the region (the fade-in starts this long after
+    // the region start, silent before; the fade-out ends this long before the region end). With
+    // "manual", the fade keeps its own length instead of stretching to cover the overlap.
+    double fadeInOffset = 0, fadeOutOffset = 0;
+    double fadeInDb = 3.0, fadeOutDb = 3.0, fadeInAlpha = 0, fadeOutAlpha = 0;   // Custom shape
+    bool fadeInManual = false, fadeOutManual = false;
     juce::Array<GainPoint> envelope;     // empty = flat
     juce::String fxState;                // region effects chain (base64), empty = none
 
@@ -122,6 +131,10 @@ juce::String pasteModeName(PasteMode m);
 struct EffectiveFades {
     double in = 0, out = 0;
     FadeShape inShape = FadeShape::EqualPower, outShape = FadeShape::EqualPower;
+    double inOffset = 0, outOffset = 0;
+    double inDb = 3.0, outDb = 3.0, inAlpha = 0, outAlpha = 0;
+    // Fade gain at t seconds into a region of `length` seconds.
+    double gainAt(double t, double length) const;
 };
 
 // A commercial or client reference for A/B comparison. Not part of the master.
@@ -207,7 +220,20 @@ public:
                    int lane, double dIn, double dOut, EditMode mode);
     // Moves the later region of an overlap so the crossfade is `len` seconds.
     // With rippleAfter, everything after the incoming region keeps its spacing to it.
-    void setCrossfadeLength(int outgoing, int incoming, double len, bool rippleAfter = false);
+    enum class Ripple { None, All, UntilBlack };
+    void setCrossfadeLength(int outgoing, int incoming, double len, bool rippleAfter = false) {
+        setCrossfadeLength(outgoing, incoming, len, rippleAfter ? Ripple::All : Ripple::None);
+    }
+    // UntilBlack: only the material joined to the incoming region moves; the shift is absorbed
+    // by the first gap (silence) after it.
+    void setCrossfadeLength(int outgoing, int incoming, double len, Ripple mode);
+    // Lock Sound: makes the crossfade `len` long, centred on the edit, by trimming both sides
+    // into their handles. Nothing moves in time. Works on a butt splice too.
+    void crossfadeCentred(int outgoing, int incoming, double len);
+    // Pairs (outgoing, incoming) of regions that butt or overlap at the edges of `ids`.
+    juce::Array<std::pair<int, int>> splicesAround(const juce::Array<int>& ids) const;
+    // Moves the region and, with UntilBlack / All, what follows it (markers attached ride along).
+    void shiftWithRipple(int id, double dt, Ripple mode);
     // Slips a region's audio under its fixed boundaries by dt seconds of source.
     void slip(int id, double dt);
 

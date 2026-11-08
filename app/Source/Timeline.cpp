@@ -265,7 +265,7 @@ std::pair<int, int> Timeline::crossfadeNear(double t) const {
     double bestD = 1e9;
     for (auto& a : s_.regions)
         for (auto& b : s_.regions) {
-            if (a.id == b.id || a.lane != b.lane || !(b.start > a.start && b.start < a.end())) continue;
+            if (a.id == b.id || a.lane != b.lane || !(b.start > a.start && b.start < a.end() + 1e-4) || b.end() <= a.end()) continue;
             double mid = 0.5 * (b.start + juce::jmin(a.end(), b.end()));
             if (std::abs(mid - t) < bestD) { bestD = std::abs(mid - t); best = {a.id, b.id}; }
         }
@@ -352,20 +352,20 @@ void Timeline::paintRegion(juce::Graphics& g, int i) {
     // Fades (including automatic crossfades).
     auto fades = s_.fadesFor(i);
     g.setColour(colours::text.withAlpha(0.6f));
-    auto drawFade = [&](double a, double len, FadeShape shape, bool in) {
-        if (len <= 0) return;
+    auto drawFade = [&](double a, double b) {   // region-relative span [a, b]
+        if (b <= a) return;
         juce::Path p;
-        for (int k = 0; k <= 24; ++k) {
-            double f = double(k) / 24;
-            double gain = fadeGain(shape, in ? f : 1.0 - f);
-            float x = timeToX(a + f * len);
+        for (int k = 0; k <= 32; ++k) {
+            const double t = a + (b - a) * k / 32.0;
+            const double gain = fades.gainAt(t, r.length());
+            float x = timeToX(r.start + t);
             float y = box.getBottom() - float(gain) * box.getHeight();
             if (k == 0) p.startNewSubPath(x, y); else p.lineTo(x, y);
         }
         g.strokePath(p, juce::PathStrokeType(1.2f));
     };
-    drawFade(r.start, fades.in, fades.inShape, true);
-    drawFade(r.end() - fades.out, fades.out, fades.outShape, false);
+    drawFade(0.0, fades.inOffset + fades.in);
+    drawFade(r.length() - fades.outOffset - fades.out, r.length());
     // Fade handles.
     g.setColour(colours::text);
     g.fillRect(juce::Rectangle<float>(timeToX(r.start + r.fadeIn) - 3, box.getY(), 6, 6));

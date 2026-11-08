@@ -815,6 +815,76 @@ int main() {
             CHECK(plain.toVar()["source"].isObject());
         }
     }
+    // ---- Edit Fade: custom shapes, offsets, Lock Sound, ripple until black ----
+    {
+        NEAR(20 * std::log10(fadeGain(FadeShape::Custom, 0.5, 3.0, 0.0)), -3.0, 1e-6);
+        NEAR(20 * std::log10(fadeGain(FadeShape::Custom, 0.5, 6.0, 0.7)), -6.0, 1e-6);   // alpha keeps the midpoint
+        NEAR(fadeGain(FadeShape::Custom, 0.5, 6.0206, 0.0), 0.5, 1e-4);                  // 6.02 dB = linear
+        CHECK(fadeGain(FadeShape::Custom, 0.0, 3.0, 0.5) == 0.0 && fadeGain(FadeShape::Custom, 1.0, 3.0, 0.5) == 1.0);
+        CHECK(fadeGain(FadeShape::Custom, 0.1, 3.0, 1.0) < fadeGain(FadeShape::Custom, 0.1, 3.0, 0.0));   // S: slower start
+
+        auto t1 = makeTone(dir, "ef1.wav", 44100, 10.0, 500, 0.5f);
+        Session e;
+        e.lanes = 1;
+        Region a = regionFor(e, fm, t1);
+        a.srcIn = 0; a.srcOut = 44100 * 4; a.start = 0;               // 0..4 s, handle after it
+        Region b = regionFor(e, fm, t1);
+        b.srcIn = 44100 * 4; b.srcOut = 44100 * 8; b.start = 4.0;      // butt at 4 s, handle before it
+        Region c = regionFor(e, fm, t1);
+        c.srcIn = 0; c.srcOut = 44100 * 2; c.start = 8.0;              // joined to b
+        Region d = regionFor(e, fm, t1);
+        d.srcIn = 0; d.srcOut = 44100 * 2; d.start = 12.0;             // after a gap
+        e.regions.add(a); e.regions.add(b); e.regions.add(c); e.regions.add(d);
+        const int m = e.addMarker(Marker::Index, 9.0, c.id);
+
+        // Lock Sound: a 100 ms crossfade centred on the butt; the audio stays where it was.
+        e.crossfadeCentred(a.id, b.id, 0.1);
+        NEAR(e.findRegion(a.id)->end(), 4.05, 1e-4);
+        NEAR(e.findRegion(b.id)->start, 3.95, 1e-4);
+        NEAR(e.findRegion(b.id)->srcIn, 44100 * 4 - 2205, 1);          // same audio at the same time
+        NEAR(e.findRegion(c.id)->start, 8.0, 1e-9);
+        auto fa = e.fadesFor(e.indexOfRegion(a.id));
+        NEAR(fa.out, 0.1, 1e-4);
+        // The same continuous tone through an equal-power crossfade of correlated audio: no dip
+        // below the tone, a bump of at most +3 dB in the middle.
+        {
+            ProgramRenderer pr(fm);
+            pr.setSession(e, 44100);
+            juce::AudioBuffer<float> buf(2, 4410);
+            pr.seek(juce::int64(3.9 * 44100));
+            pr.render(buf, 0, 4410);
+            NEAR(rms(buf, 0, 1000), 0.5 / std::sqrt(2.0), 0.01);
+            CHECK(rms(buf, 2000, 400) > 0.5 / std::sqrt(2.0) && rms(buf, 2000, 400) < 0.5 * 1.42);
+        }
+        // Ripple until black: lengthening the crossfade moves b and c (joined) but not d (after a gap).
+        e.setCrossfadeLength(a.id, b.id, 0.3, Session::Ripple::UntilBlack);
+        NEAR(e.findRegion(b.id)->start, 3.75, 1e-4);
+        NEAR(e.findRegion(c.id)->start, 7.8, 1e-4);
+        NEAR(e.findMarker(m)->t, 8.8, 1e-4);                          // attached marker rode along
+        NEAR(e.findRegion(d.id)->start, 12.0, 1e-9);
+        // Ripple all moves d too.
+        e.setCrossfadeLength(a.id, b.id, 0.2, Session::Ripple::All);
+        NEAR(e.findRegion(d.id)->start, 12.1, 1e-4);
+
+        // Manual fade length and offset: the fade-out keeps 20 ms and ends 30 ms before the region end.
+        auto* ra = e.findRegion(a.id);
+        ra->fadeOut = 0.02; ra->fadeOutManual = true; ra->fadeOutOffset = 0.03;
+        fa = e.fadesFor(e.indexOfRegion(a.id));
+        NEAR(fa.out, 0.02, 1e-9);
+        CHECK(fa.gainAt(ra->length() - 0.01, ra->length()) == 0.0);      // silent after its fade
+        NEAR(fa.gainAt(ra->length() - 0.06, ra->length()), 1.0, 1e-9);   // full before it
+        // Saved and loaded intact.
+        ra->fadeOutShape = FadeShape::Custom; ra->fadeOutDb = 4.5; ra->fadeOutAlpha = 0.25;
+        juce::String err;
+        Session back;
+        CHECK(back.fromVar(juce::JSON::parse(juce::JSON::toString(e.toVar())), err));
+        auto* rb2 = back.findRegion(a.id);
+        CHECK(rb2 && rb2->fadeOutManual && rb2->fadeOutShape == FadeShape::Custom && rb2->fadeOutDb == 4.5 && rb2->fadeOutAlpha == 0.25 &&
+              std::abs(rb2->fadeOutOffset - 0.03) < 1e-12);
+        // Splices: the butt at c/d isn't one (gap), a/b overlaps.
+        auto sp = e.splicesAround({b.id});
+        CHECK(sp.contains({a.id, b.id}) && sp.contains({b.id, c.id}));
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

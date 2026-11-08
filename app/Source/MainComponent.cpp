@@ -171,6 +171,11 @@ MainComponent::MainComponent() {
         nudgeSizes_[2] = u->getDoubleValue("nudgeC", 1.0);
         nudgeSize_ = juce::jlimit(0, 2, u->getIntValue("nudgeSize", 0));
         editFollowsStop_ = u->getBoolValue("editPointFollowsStop", false);
+        fadePrefs_.fromVar(juce::JSON::parse(u->getValue("fadeEditor")));
+        if (auto* arr = juce::JSON::parse(u->getValue("fadeLibrary")).getArray())
+            for (int k = 0; k < juce::jmin(10, arr->size()); ++k) fadeLib_[size_t(k)] = FadePreset::fromVar(arr->getReference(k));
+        fadeLib_[0].used = true;
+        if (fadeLib_[0].name.isEmpty()) fadeLib_[0].name = "Default crossfade";
     }
 
     for (auto* b : {&newBtn_, &openBtn_, &saveBtn_, &importBtn_, &envBtn_, &snapBtn_, &lanesBtn_, &xfadeBtn_, &trackMk_, &indexMk_,
@@ -206,7 +211,7 @@ MainComponent::MainComponent() {
         });
     };
     xfadeBtn_.onClick = [this] {
-        auto p = timeline_.crossfadeNear(engine_.positionSeconds());
+        auto p = timeline_.crossfadeNear(engine_.isPlaying() ? engine_.positionSeconds() : timeline_.editPoint());
         if (p.first) openCrossfade(p.first, p.second);
     };
     trackMk_.onClick = [this] { addMarkerAtPlayhead(Marker::TrackStart); };
@@ -500,6 +505,14 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::toggleSnap: info.setTicked(snapBtn_.getToggleState()); break;
         case cmd::followProjectRate: info.setTicked(followRate_); break;
         case cmd::repeatPlay: info.setTicked(repeat_); break;
+        case cmd::defaultFadeOnEdits: info.setTicked(fadePrefs_.defaultOnEdits); break;
+        case cmd::fadeRecall0: case cmd::fadeRecall1: case cmd::fadeRecall2: case cmd::fadeRecall3: case cmd::fadeRecall4:
+        case cmd::fadeRecall5: case cmd::fadeRecall6: case cmd::fadeRecall7: case cmd::fadeRecall8: case cmd::fadeRecall9: {
+            const auto& p = fadeLib_[size_t(id - cmd::fadeRecall0)];
+            info.setActive(p.used);
+            if (p.used && p.name.isNotEmpty()) info.shortName << ": " << p.name;
+            break;
+        }
         case cmd::keyPresetLathe: info.setTicked(props_.getUserSettings()->getIntValue("keyPreset", 0) == 0); break;
         case cmd::keyPresetLegacy: info.setTicked(props_.getUserSettings()->getIntValue("keyPreset", 0) == 1); break;
         case cmd::linkPlay: info.setTicked(sourceView_.linked()); break;
@@ -662,6 +675,22 @@ bool MainComponent::perform(const InvocationInfo& info) {
             commands_.commandStatusChanged();
             break;
         case cmd::playbackSettings: showPlaybackSettings(); break;
+        case cmd::fadeRecall0: case cmd::fadeRecall1: case cmd::fadeRecall2: case cmd::fadeRecall3: case cmd::fadeRecall4:
+        case cmd::fadeRecall5: case cmd::fadeRecall6: case cmd::fadeRecall7: case cmd::fadeRecall8: case cmd::fadeRecall9: {
+            const int slot = int(info.commandID - cmd::fadeRecall0);
+            if (!fadeLib_[size_t(slot)].used) break;
+            if (xfadeEditor_ && xfadeWindow_) { xfadeEditor_->recall(slot); break; }
+            auto p = timeline_.crossfadeNear(engine_.isPlaying() ? engine_.positionSeconds() : timeline_.editPoint());
+            if (!p.first) break;
+            applyFadePreset(session_, p.first, p.second, fadeLib_[size_t(slot)], fadePrefs_.lockSound, fadePrefs_.ripple);
+            sessionChanged();
+            break;
+        }
+        case cmd::defaultFadeOnEdits:
+            fadePrefs_.defaultOnEdits = !fadePrefs_.defaultOnEdits;
+            saveFadeSettings();
+            commands_.commandStatusChanged();
+            break;
         case cmd::playFromPlayhead: {
             if (engine_.isPlaying() || engine_.isSourcePlaying()) { stopAll(); break; }
             const double from = sourceActive_ ? lastStopSource_ : lastStopDest_;
@@ -833,6 +862,15 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::splitAtPlayhead, cmd::deleteClose, cmd::deleteLeave, cmd::muteRegion, cmd::selectRegionRange, cmd::clearSelection});
             m.addSeparator();
+            {
+                juce::PopupMenu ef;
+                ef.addCommandItem(&commands_, cmd::crossfadeEditor);
+                ef.addCommandItem(&commands_, cmd::defaultFadeOnEdits);
+                ef.addSeparator();
+                for (int k = 0; k < 10; ++k) ef.addCommandItem(&commands_, cmd::fadeRecall0 + k);
+                m.addSubMenu("Edit Fade", ef);
+                m.addSeparator();
+            }
             add({cmd::regionEffects, cmd::bypassRegionFx});
             m.addSeparator();
             add({cmd::restoreRegion, cmd::spectralEditor});
@@ -2018,7 +2056,10 @@ void MainComponent::sessionChanged(bool undoable) {
     pqList_.updateContent();
     pqList_.repaint();
     refreshIssues();
-    if (xfadeEditor_) xfadeEditor_->repaint();
+    if (xfadeEditor_) {
+        if (session_.findRegion(xfadeEditor_->outgoing()) && session_.findRegion(xfadeEditor_->incoming())) xfadeEditor_->refresh();
+        else juce::MessageManager::callAsync([this] { xfadeWindow_.reset(); });
+    }
     if (auto* w = findParentComponentOfClass<juce::DocumentWindow>())
         w->setName("Lathe - " + (session_.file.existsAsFile() ? session_.file.getFileNameWithoutExtension() : juce::String("Untitled")) + " *");
 }
@@ -2422,6 +2463,7 @@ void MainComponent::sourceEdit(EditKind kind) {
             break;
         }
     }
+    crossfadeNewEdits(ids, session_);
     if (!ids.isEmpty()) timeline_.selectRegion(ids.getFirst());
     timeline_.clearInOut();
     locateDest(endT);   // ready for the next edit
@@ -2469,6 +2511,12 @@ void MainComponent::copyActive(bool cut) {
     commands_.commandStatusChanged();
     if (!cut) return;
     ss.clearRange(r.getStart(), r.getEnd(), ss.targetLanes(), true);
+    {
+        juce::Array<int> joined;   // what now starts at the cut: crossfade the new splice
+        for (auto& reg : ss.regions)
+            if (std::abs(reg.start - r.getStart()) < 1e-3) joined.add(reg.id);
+        crossfadeNewEdits(joined, ss);
+    }
     t.clearInOut();
     t.selectRegion(0);
     locate(r.getStart());
@@ -2495,6 +2543,7 @@ void MainComponent::pasteActive(PasteMode mode) {
     const double at = in >= 0 ? in : t.editPoint();
     const double destOut = mode == PasteMode::ReplaceLeft ? (out >= 0 ? out : (in >= 0 ? in : t.editPoint())) : out;
     auto ids = ss.paste(clip_, editLanes(ss, t, clip_.laneCount), at, mode, destOut);
+    crossfadeNewEdits(ids, ss);
     if (!ids.isEmpty()) t.selectRegion(ids.getFirst());
     double end = at + clip_.length;
     if (mode == PasteMode::ReplaceLeft) end = destOut;
@@ -2647,6 +2696,27 @@ void MainComponent::jumpToSrp(int dir) {
     if (best >= 0) locate(best);
 }
 
+void MainComponent::saveFadeSettings() {
+    auto* u = props_.getUserSettings();
+    u->setValue("fadeEditor", juce::JSON::toString(fadePrefs_.toVar(), true));
+    juce::Array<juce::var> arr;
+    for (auto& p : fadeLib_) arr.add(p.toVar());
+    u->setValue("fadeLibrary", juce::JSON::toString(juce::var(arr), true));
+    props_.saveIfNeeded();
+}
+
+void MainComponent::crossfadeNewEdits(const juce::Array<int>& ids, Session& s) {
+    if (!fadePrefs_.defaultOnEdits || ids.isEmpty()) return;
+    const auto& p = fadeLib_[0];
+    for (auto [a, b] : s.splicesAround(ids)) {
+        auto* ra = s.findRegion(a);
+        auto* rb = s.findRegion(b);
+        // Only butt splices: an edit that already overlaps keeps its crossfade.
+        if (!ra || !rb || ra->end() > rb->start + 1e-4) continue;
+        applyFadePreset(s, a, b, p, true, Session::Ripple::None);
+    }
+}
+
 void MainComponent::addMarkerAtPlayhead(Marker::Type t) {
     int id = session_.addMarker(t, engine_.positionSeconds());
     timeline_.selectMarker(id);
@@ -2690,8 +2760,10 @@ void MainComponent::nudgeSelectedRegion(double dt) {
 
 void MainComponent::openCrossfade(int out, int in) {
     xfadeWindow_.reset();
-    auto* ed = new CrossfadeEditor(session_, thumbs_, out, in);
+    auto* ed = new CrossfadeEditor(session_, thumbs_, engine_.formats(), fadePrefs_, fadeLib_, out, in);
     ed->onChange = [this] { sessionChanged(); };
+    ed->onPrefsChanged = [this] { saveFadeSettings(); };
+    ed->onLibraryChanged = [this] { saveFadeSettings(); };
     ed->onAudition = [this](double a, double b) { auditionRange(a, b); };
     xfadeEditor_ = ed;
     auto* w = new XfadeWindow(ed);
