@@ -29,9 +29,10 @@ public:
     juce::int64 position() const { return pos_; }
     juce::int64 totalSamples() const { return total_; }
     double rate() const { return rate_; }
+    int channels() const { return channels_; }   // 2, or 6 for a 5.1 programme
 
-    // Renders n stereo frames into out (channels 0 and 1) and advances. Past the end
-    // it outputs silence. Returns false if a source file couldn't be read.
+    // Renders n frames into out and advances. A 5.1 programme fills six channels when `out`
+    // has them, otherwise it is folded down to stereo. Past the end it outputs silence. Returns false if a source file couldn't be read.
     // The double version is the master path: the mix, gains, fades and crossfades are all
     // computed in 64-bit float, and samples at unity gain pass through bit-for-bit.
     bool render(juce::AudioBuffer<float>& out, int startSample, int n);
@@ -46,6 +47,9 @@ private:
     juce::Array<EffectiveFades> fades_;
     juce::Array<juce::int64> starts_, ends_;
     juce::Array<GainNode> gain_;   // timeline gain (empty = none)
+    juce::Array<int> laneFormats_;  // per region in regions_
+    int channels_ = 2;
+    juce::AudioBuffer<double> mix_;
     std::vector<std::unique_ptr<ClipStream>> streams_;
     double rate_ = 44100;
     juce::int64 pos_ = 0, total_ = 0;

@@ -18,6 +18,7 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::exportTrackWavs, "Export Track WAVs...", "File", "16-bit / 44.1 kHz WAV per track, cut at the PQ marks", "command + shift + E"},
         {cmd::exportProgram24, "Export Programme WAV (24-bit)...", "File", "The whole programme at the project rate, 24-bit dithered", ""},
         {cmd::exportProgram32, "Export Programme WAV (32-bit float)...", "File", "The whole programme at the project rate, 32-bit float", ""},
+        {cmd::exportSegments, "Export Selected Segments...", "File", "Each selected segment (or the In-Out) as its own WAV at the project rate, through the master chain", "command + option + E"},
         {cmd::batchRender, "Render Album (Batch)...", "File", "DDP plus WAV / FLAC deliverables in one go, with a QC and checksum report", "command + R"},
         // Edit
         // Delivery

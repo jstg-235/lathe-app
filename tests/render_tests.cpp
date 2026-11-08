@@ -1152,6 +1152,61 @@ int main() {
         for (int i = 0; i < 1000; ++i) diff += b1.getSample(0, i) != b2.getSample(0, i);
         CHECK(diff == 0);
     }
+    // ---- Lane formats: mono, stereo, 5.1 ----
+    {
+        // A six-channel file: each channel a different level so the routing is visible.
+        auto f6 = dir.getChildFile("six.wav");
+        {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(f6.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 48000, juce::AudioChannelSet::create5point1(), 24, {}, 0));
+            os.release();
+            juce::AudioBuffer<float> b(6, 48000);
+            const float amp[6] = {0.1f, 0.2f, 0.3f, 0.05f, 0.4f, 0.5f};
+            for (int c = 0; c < 6; ++c)
+                for (int i = 0; i < 48000; ++i) b.setSample(c, i, amp[c] * float(std::sin(2 * juce::MathConstants<double>::pi * 300 * i / 48000.0)));
+            w->writeFromAudioSampleBuffer(b, 0, 48000);
+        }
+        Session m;
+        m.lanes = 1;
+        Region r = regionFor(m, fm, f6); r.start = 0; m.regions.add(r);
+        CHECK(m.programmeChannels() == 2);    // a stereo lane: the 5.1 file plays its front pair
+        m.setLaneFormat(0, 6);
+        CHECK(m.programmeChannels() == 6 && m.laneFormat(0) == 6);
+        ProgramRenderer pr(fm);
+        pr.setSession(m, 48000);
+        CHECK(pr.channels() == 6);
+        juce::AudioBuffer<double> six(6, 4800);
+        pr.seek(4800);
+        pr.render(six, 0, 4800);
+        auto rmsD = [](const juce::AudioBuffer<double>& b, int c) { double s2 = 0; for (int i = 0; i < b.getNumSamples(); ++i) s2 += b.getSample(c, i) * b.getSample(c, i); return std::sqrt(s2 / b.getNumSamples()); };
+        const double amps[6] = {0.1, 0.2, 0.3, 0.05, 0.4, 0.5};
+        for (int c = 0; c < 6; ++c) NEAR(rmsD(six, c), amps[c] / std::sqrt(2.0), 0.002);
+        // A stereo consumer gets the ITU fold-down: L = L + .707 C + .707 Ls.
+        juce::AudioBuffer<float> two(2, 4800);
+        pr.seek(4800);
+        pr.render(two, 0, 4800);
+        NEAR(rms(two, 0, 4800), (0.1 + 0.7071 * 0.3 + 0.7071 * 0.4) / std::sqrt(2.0), 0.003);
+        // A mono lane averages a stereo file and feeds both sides of a stereo programme.
+        auto st = makeTone(dir, "mono-src.wav", 44100, 2.0, 300, 0.4f);
+        Session mono;
+        mono.lanes = 1;
+        Region q = regionFor(mono, fm, st); q.start = 0; mono.regions.add(q);
+        mono.setLaneFormat(0, 1);
+        CHECK(mono.programmeChannels() == 2);
+        ProgramRenderer pm(fm);
+        pm.setSession(mono, 44100);
+        juce::AudioBuffer<float> mb(2, 4410);
+        pm.seek(4410);
+        pm.render(mb, 0, 4410);
+        double d = 0;
+        for (int i = 0; i < 4410; ++i) d = std::max(d, double(std::abs(mb.getSample(0, i) - mb.getSample(1, i))));
+        CHECK(d < 1e-7);
+        NEAR(rms(mb, 0, 4410), 0.4 / std::sqrt(2.0), 0.003);
+        juce::String err;
+        Session back;
+        CHECK(back.fromVar(juce::JSON::parse(juce::JSON::toString(m.toVar())), err) && back.laneFormat(0) == 6 && back.laneFormat(3) == 2);
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

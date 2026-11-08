@@ -204,6 +204,8 @@ private:
     FadeLibrary fadeLib_ = defaultFadeLibrary();
     void saveFadeSettings();
     void showMarkInfo();
+    void showLaneMenu(bool source, int lane);
+    void exportSelectedSegments();
     void showTextView();
     void showSegmentGain(juce::Array<int> ids);
     std::unique_ptr<juce::DocumentWindow> textViewWindow_;

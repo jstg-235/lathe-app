@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
         std::printf("found: %s\nskipped: %s\ntime: %.1f s\n", found.joinIntoString(", ").toRawUTF8(), black.joinIntoString(", ").toRawUTF8(), secs);
         CHECK(found == juce::StringArray({"good-one", "good-three", "good-two"}));
         CHECK(black == juce::StringArray({"abort-me", "crash-me", "hang-me"}));
-        CHECK(secs < 20.0);   // the hang costs the 3 s timeout, not forever
+        CHECK(secs < 12.0);   // the hang costs the 3 s timeout; crashes are noticed at once
         // No helper may be left behind, including the one a plugin hung.
         juce::Thread::sleep(1500);
         juce::ChildProcess ps;

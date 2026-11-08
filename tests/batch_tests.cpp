@@ -545,6 +545,60 @@ int main() {
         }
         if (auto* keep = std::getenv("LATHE_KEEP_PAPERWORK")) out.getChildFile("Paperwork").copyDirectoryTo(juce::File(keep));
     }
+    // ---- Segment-only export, and a 5.1 programme as a six-channel WAV ----
+    {
+        auto a = noiseFile(dir, "seg.wav", 48000, 6.0, 7);
+        Session s;
+        std::unique_ptr<juce::AudioFormatReader> rd(fm.createReaderFor(a));
+        s.append(s.makeRegion(a, rd->sampleRate, rd->lengthInSamples), 2.0);
+        Exporter ex(engine);
+        ExportSettings es;
+        auto f = dir.getChildFile("segment.wav");
+        auto err = ex.exportRangeWav(s, f, 24, es, {3.0, 4.5}, [](double) { return true; });
+        CHECK(err.isEmpty());
+        std::unique_ptr<juce::AudioFormatReader> back(fm.createReaderFor(f));
+        CHECK(back && back->lengthInSamples == 72000 && back->numChannels == 2 && back->bitsPerSample == 24);
+        // The segment is the same audio as that stretch of the full programme.
+        if (back) {
+            auto full = dir.getChildFile("full.wav");
+            CHECK(ex.exportProgramWav(s, full, 32, es, [](double) { return true; }).isEmpty());
+            std::unique_ptr<juce::AudioFormatReader> fr(fm.createReaderFor(full));
+            juce::AudioBuffer<float> x(2, 1000), y(2, 1000);
+            back->read(&x, 0, 1000, 1000, true, true);
+            fr->read(&y, 0, 1000, 48000 * 3 + 1000, true, true);
+            double worst = 0;
+            for (int i = 0; i < 1000; ++i) worst = std::max(worst, double(std::abs(x.getSample(0, i) - y.getSample(0, i))));
+            CHECK(worst < 2.0 / 8388608.0 * 4);   // 24-bit vs float: within dither
+        }
+        // 5.1: a six-channel file on a 5.1 lane exports as six channels.
+        auto f6 = dir.getChildFile("six.wav");
+        {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(f6.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 48000, juce::AudioChannelSet::create5point1(), 24, {}, 0));
+            os.release();
+            juce::AudioBuffer<float> b(6, 48000 * 2);
+            for (int c = 0; c < 6; ++c)
+                for (int i = 0; i < b.getNumSamples(); ++i) b.setSample(c, i, 0.1f * float(c + 1) * float(std::sin(i * 0.05)));
+            w->writeFromAudioSampleBuffer(b, 0, b.getNumSamples());
+        }
+        Session sur;
+        std::unique_ptr<juce::AudioFormatReader> r6(fm.createReaderFor(f6));
+        sur.append(sur.makeRegion(f6, r6->sampleRate, r6->lengthInSamples), 2.0);
+        sur.setLaneFormat(0, 6);
+        auto out6 = dir.getChildFile("surround.wav");
+        CHECK(ex.exportProgramWav(sur, out6, 24, es, [](double) { return true; }).isEmpty());
+        std::unique_ptr<juce::AudioFormatReader> b6(fm.createReaderFor(out6));
+        CHECK(b6 && b6->numChannels == 6 && b6->lengthInSamples == 48000 * 4);
+        if (b6) {
+            juce::AudioBuffer<float> x(6, 4800);
+            b6->read(&x, 0, 4800, 48000 * 2 + 4800, true, true);
+            for (int c = 0; c < 6; ++c) {
+                const float want = 0.1f * float(c + 1) * float(std::sin((4800 + 100) * 0.05));
+                CHECK(std::abs(x.getSample(c, 100) - want) < 1e-4f);
+            }
+        }
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

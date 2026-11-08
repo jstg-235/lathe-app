@@ -445,6 +445,18 @@ juce::Array<int> Session::paste(const Clip& c, const juce::Array<int>& laneList,
     return ids;
 }
 
+void Session::setLaneFormat(int lane, int channels) {
+    if (lane < 0) return;
+    while (laneFormats.size() <= lane) laneFormats.add(2);
+    laneFormats.set(lane, channels == 1 || channels == 6 ? channels : 2);
+}
+
+int Session::programmeChannels() const {
+    for (auto& r : regions)
+        if (!r.mute && laneFormat(r.lane) == 6) return 6;
+    return 2;
+}
+
 double Session::timelineGainDb(double t) const {
     if (!gainActive()) return 0.0;
     if (t <= gainNodes.getFirst().t) return gainNodes.getFirst().db;
@@ -1268,6 +1280,13 @@ juce::var Session::toVar() const {
     juce::Array<juce::var> off;
     for (int l : lanesOff) off.add(l);
     root->setProperty("lanesOff", off);
+    bool anyFormat = false;
+    for (int f : laneFormats) anyFormat = anyFormat || f != 2;
+    if (anyFormat) {
+        juce::Array<juce::var> lf;
+        for (int f : laneFormats) lf.add(f);
+        root->setProperty("laneFormats", lf);
+    }
     if (source != nullptr && (!source->regions.isEmpty() || !source->srps.isEmpty())) root->setProperty("source", source->toVar());
     else if (source == nullptr && sourceDoc.isObject()) root->setProperty("source", sourceDoc);
     return root;
@@ -1290,6 +1309,7 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     gainNodes.clear();
     gainBypass = lockGain = false;
     lanesOff.clear();
+    laneFormats.clear();
     sourceDoc = juce::var();
     nextId = 1;
 
@@ -1487,6 +1507,8 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     lockGain = bool(v.getProperty("lockGain", false));
     if (auto* arr = v["lanesOff"].getArray())
         for (auto& l : *arr) lanesOff.addIfNotAlreadyThere(int(l));
+    if (auto* arr = v["laneFormats"].getArray())
+        for (int i = 0; i < arr->size(); ++i) setLaneFormat(i, int(arr->getReference(i)));
     sourceDoc = v["source"];
     if (source != nullptr) {
         juce::String e;

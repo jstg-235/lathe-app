@@ -15,19 +15,22 @@ namespace lathe {
 // Adapts ProgramRenderer to JUCE's positionable source interface.
 class ProgramSource : public juce::PositionableAudioSource {
 public:
-    ProgramSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx) : r_(fm) {
+    ProgramSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx, int channels = 2) : r_(fm) {
         r_.setRegionFx(fx);
         r_.setSession(s, rate);
+        dbl_.setSize(channels, 8192);
     }
     void prepareToPlay(int, double) override {}
     void releaseResources() override {}
     void getNextAudioBlock(const juce::AudioSourceChannelInfo& info) override {
         // Mix in 64-bit, convert to the device's 32-bit float once at the end.
-        if (dbl_.getNumSamples() < info.numSamples) dbl_.setSize(2, info.numSamples, false, false, true);
+        if (dbl_.getNumSamples() < info.numSamples) dbl_.setSize(dbl_.getNumChannels(), info.numSamples, false, false, true);
         r_.render(dbl_, 0, info.numSamples);
+        const int have = dbl_.getNumChannels();
         for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch) {
             auto* d = info.buffer->getWritePointer(ch, info.startSample);
-            auto* s = dbl_.getReadPointer(juce::jmin(ch, 1));
+            if (have > 2 && ch >= have) { juce::FloatVectorOperations::clear(d, info.numSamples); continue; }
+            auto* s = dbl_.getReadPointer(have > 2 ? ch : juce::jmin(ch, 1));
             for (int i = 0; i < info.numSamples; ++i) d[i] = float(s[i]);
         }
     }
@@ -37,7 +40,7 @@ public:
     bool isLooping() const override { return false; }
 private:
     ProgramRenderer r_;
-    juce::AudioBuffer<double> dbl_{2, 8192};
+    juce::AudioBuffer<double> dbl_;
 };
 
 // Break audition source: the end of one unit, the flip gap, then the top of the next, as
@@ -94,6 +97,11 @@ public:
     double positionSeconds() const { return transport_.getCurrentPosition(); }
     double lengthSeconds() const { return transport_.getLengthInSeconds(); }
     double deviceRate() const { return rate_; }
+    int deviceOutputs() const;
+    // Channels playback uses for the loaded session: 6 for a 5.1 programme on an interface with
+    // six or more outputs, otherwise 2 (5.1 folded down).
+    int playbackChannels() const { return playChannels_; }
+    bool surroundProgramme() const { return surround_; }
 
     // ---- Source timeline (its own session; region effects and the master chain don't apply) ----
     void loadSourceSession(const Session& s);   // keeps position and play state
@@ -216,6 +224,8 @@ private:
     std::unique_ptr<ProgramSource> sourceProgram_;
     std::unique_ptr<juce::BufferingAudioSource> sourceBuffered_;
     juce::AudioBuffer<float> sourceBuf_;
+    std::atomic<int> playChannels_{2};
+    std::atomic<bool> surround_{false};   // 5.1 programme: the (stereo) master chain is bypassed
     std::atomic<bool> hearSource_{false};
     float srcMix_ = 0.0f;   // audio thread only: 0 = destination, 1 = source
     PluginHost host_;

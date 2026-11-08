@@ -75,6 +75,7 @@ public:
     void selectSrp(int id) { selSrp_ = id; repaint(); }
     std::function<void(int srpId)> onSrpEdit;    // double-click / Edit... : rename an SRP
     std::function<void(int regionId)> onSegmentGain;
+    std::function<void(int lane)> onLaneMenu;   // right-click a lane's badge: format etc.
     int selectedRegion() const { return selRegion_; }
     void selectRegion(int id) { selRegion_ = id; repaint(); }
     int selectedLane() const { return selLane_; }

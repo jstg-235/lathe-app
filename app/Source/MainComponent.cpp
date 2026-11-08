@@ -273,11 +273,13 @@ MainComponent::MainComponent() {
         st.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setSourcePosition(t); sourceView_.timeline().setPlayhead(t, false); };
         st.onSrpEdit = [this](int id) { editSrpText(true, id); };
         st.onSegmentGain = [this](int id) { setActiveTimeline(true); showSegmentGain({id}); };
+        st.onLaneMenu = [this](int lane) { showLaneMenu(true, lane); };
         st.onCrossfade = [this](int, int) {};
     }
     timeline_.onFocus = [this] { setActiveTimeline(false); };
     timeline_.onSrpEdit = [this](int id) { editSrpText(false, id); };
     timeline_.onSegmentGain = [this](int id) { setActiveTimeline(false); showSegmentGain({id}); };
+    timeline_.onLaneMenu = [this](int lane) { showLaneMenu(false, lane); };
 
     timeline_.onEdit = [this] { sessionChanged(); };
     timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
@@ -682,6 +684,7 @@ bool MainComponent::perform(const InvocationInfo& info) {
             break;
         case cmd::playbackSettings: showPlaybackSettings(); break;
         case cmd::markInfo: showMarkInfo(); break;
+        case cmd::exportSegments: exportSelectedSegments(); break;
         case cmd::gainOverlay: {
             const bool on = !activeTimeline().gainOverlay();
             activeTimeline().setGainOverlay(on);
@@ -882,7 +885,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::batchRender});
             m.addSeparator();
-            add({cmd::exportDdp, cmd::exportTrackWavs, cmd::exportProgram24});
+            add({cmd::exportDdp, cmd::exportTrackWavs, cmd::exportProgram24, cmd::exportSegments});
             break;
         case 1:
             add({cmd::undo, cmd::redo});
@@ -1191,6 +1194,12 @@ void MainComponent::openRegionFx(int regionId) {
 }
 
 void MainComponent::showBatchDialog() {
+    if (session_.programmeChannels() > 2) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Stereo only",
+                                               "CD, DDP and the per-track deliverables are stereo, and this programme is 5.1 (a lane is set to 5.1). "
+                                               "Use Export Programme WAV for the 5.1 master, or set the lanes to stereo for the CD.");
+        return;
+    }
     if (session_.regions.isEmpty()) return;
     auto* panel = new BatchPanel(session_.effectiveRate(), session_.products.size(),
                                  session_.end() <= productSpec(ProductKind::CD).hardMax);
@@ -2931,6 +2940,9 @@ void MainComponent::refreshIssues() {
     }
     if (!cdt.error.empty()) { ++errors; s << "ERROR  " << juce::String::fromUTF8(cdt.error.c_str()) << "\n"; }
     for (auto& a : adj) s << "Note   " << a << "\n";
+    if (session_.programmeChannels() == 6)
+        s << "Note   5.1 programme: monitoring on " << (engine_.playbackChannels() == 6 ? "six outputs" : "two outputs (folded down; enable six outputs in Audio Setup)")
+          << "; the master chain is stereo and stays out of the 5.1 path. CD and DDP need stereo lanes.\n";
     if (const double early = session_.audioBeforeFirstTrack(); early > 0 && !session_.htoa)
         s << "Warn   Audio plays for " << juce::String(early, 2) << " s before the first track mark (set HTOA in Release Info if intended)\n";
     juce::StringArray missing;
@@ -3049,6 +3061,12 @@ void MainComponent::showExportMenu() {
 }
 
 void MainComponent::exportDdp() {
+    if (session_.programmeChannels() > 2) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Stereo only",
+                                               "CD, DDP and the per-track deliverables are stereo, and this programme is 5.1 (a lane is set to 5.1). "
+                                               "Use Export Programme WAV for the 5.1 master, or set the lanes to stereo for the CD.");
+        return;
+    }
     juce::StringArray adj;
     auto disc = session_.toDisc(&adj);
     if (cd::hasErrors(cd::validate(disc)) || !cd::encodeCdText(disc).error.empty()) {
@@ -3091,6 +3109,12 @@ void MainComponent::exportDdp() {
 }
 
 void MainComponent::exportTrackWavs() {
+    if (session_.programmeChannels() > 2) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Stereo only",
+                                               "CD, DDP and the per-track deliverables are stereo, and this programme is 5.1 (a lane is set to 5.1). "
+                                               "Use Export Programme WAV for the 5.1 master, or set the lanes to stereo for the CD.");
+        return;
+    }
     chooser_ = std::make_unique<juce::FileChooser>("Choose a folder for the track WAVs", juce::File::getSpecialLocation(juce::File::userDesktopDirectory));
     chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories, [this](const juce::FileChooser& fc) {
         auto folder = fc.getResult();
@@ -3399,6 +3423,69 @@ void MainComponent::showTrackCredits() {
     auto* w = new PlainWindow(panel, "Track Credits", false);
     w->onClose = [this] { juce::MessageManager::callAsync([this] { creditsWindow_.reset(); }); };
     creditsWindow_.reset(w);
+}
+
+void MainComponent::showLaneMenu(bool source, int lane) {
+    auto& ss = source ? srcSession_ : session_;
+    juce::PopupMenu m;
+    m.addSectionHeader("Lane " + juce::String(lane + 1));
+    const int f = ss.laneFormat(lane);
+    m.addItem(1, "Mono", true, f == 1);
+    m.addItem(2, "Stereo", true, f == 2);
+    m.addItem(6, "5.1 (L R C LFE Ls Rs)", true, f == 6);
+    m.addSeparator();
+    m.addItem(10, ss.laneTargeted(lane) ? "Leave this lane out of edits (None)" : "Include this lane in edits");
+    m.showMenuAsync({}, [this, source, lane](int r) {
+        auto& s2 = source ? srcSession_ : session_;
+        if (r == 1 || r == 2 || r == 6) s2.setLaneFormat(lane, r);
+        else if (r == 10) { if (s2.laneTargeted(lane)) s2.lanesOff.addIfNotAlreadyThere(lane); else s2.lanesOff.removeAllInstancesOf(lane); }
+        else return;
+        sessionChanged();
+        (source ? sourceView_.timeline() : timeline_).repaint();
+    });
+}
+
+void MainComponent::exportSelectedSegments() {
+    // What to export: the Text View selection, else the selected region, else the In-Out.
+    juce::Array<juce::Range<double>> ranges;
+    juce::StringArray names;
+    juce::Array<int> ids;
+    if (textViewPanel_ && textViewWindow_) ids = textViewPanel_->selectedIds();
+    if (ids.isEmpty() && session_.findRegion(timeline_.selectedRegion())) ids.add(timeline_.selectedRegion());
+    for (int id : ids)
+        if (auto* r = session_.findRegion(id)) { ranges.add({r->start, r->end()}); names.add(r->name); }
+    if (ranges.isEmpty() && !timeline_.selection().isEmpty()) { ranges.add(timeline_.selection()); names.add("In-Out " + msfString(timeline_.selection().getStart()).replace(":", "-")); }
+    if (ranges.isEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Export Selected Segments",
+                                               "Select a segment (or several in the Text View), or mark an In and Out on the destination.");
+        return;
+    }
+    chooser_ = std::make_unique<juce::FileChooser>("Choose a folder for the segment files", session_.file.getParentDirectory());
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                          [this, ranges, names](const juce::FileChooser& fc) {
+        auto folder = fc.getResult();
+        if (folder == juce::File()) return;
+        folder.createDirectory();
+        auto snapshot = std::make_shared<Session>(session_);
+        snapshot->source = nullptr;
+        auto es = exportSettings();
+        auto result = std::make_shared<juce::StringArray>();
+        auto err = std::make_shared<juce::String>();
+        runJob("Exporting segments...",
+               [this, snapshot, es, ranges, names, folder, result, err](Job& j) {
+                   for (int i = 0; i < ranges.size() && err->isEmpty(); ++i) {
+                       auto base = juce::File::createLegalFileName(juce::String(i + 1).paddedLeft('0', 2) + " " + names[i]);
+                       auto f = folder.getNonexistentChildFile(base, ".wav", false);
+                       *err = exporter_.exportRangeWav(*snapshot, f, 24, es, ranges[i], [&](double p) { return j.keep((i + p) / ranges.size()); });
+                       if (err->isEmpty()) result->add(f.getFileName());
+                   }
+               },
+               [this, result, err, folder](bool) {
+                   if (err->isNotEmpty()) juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Export Selected Segments", *err);
+                   else showText("Segments exported", juce::String(result->size()) + " file(s), 24-bit at the project rate, in " + folder.getFullPathName() +
+                                                          ":\n\n" + result->joinIntoString("\n"));
+               });
+    });
 }
 
 void MainComponent::showMarkInfo() {

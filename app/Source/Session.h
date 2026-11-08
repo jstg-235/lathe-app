@@ -189,6 +189,12 @@ public:
     bool gainBypass = false;
     bool lockGain = false;        // global: every gain node stays put and can't be changed
     juce::Array<int> lanesOff;    // lanes set to None: edits, pastes and ripples leave them alone
+    // Lane formats: 1 = mono, 2 = stereo, 6 = 5.1 (L R C LFE Ls Rs). Missing entries are stereo.
+    juce::Array<int> laneFormats;
+    int laneFormat(int lane) const { return juce::isPositiveAndBelow(lane, laneFormats.size()) ? laneFormats[lane] : 2; }
+    void setLaneFormat(int lane, int channels);
+    // The programme's channel count: 6 when a 5.1 lane has audio, otherwise 2.
+    int programmeChannels() const;
     // The source timeline (the material edits are taken from) is a session of its own, saved
     // inside this one. `source` points at the live one; `sourceDoc` is what was last read from file.
     Session* source = nullptr;

@@ -29,10 +29,19 @@ constexpr const char* kPidPrefix = "LATHE_PID:";
 
 // ------------------------------------------------------------------ helper side
 
+#if JUCE_MAC || JUCE_LINUX
+// A plugin that crashes the helper: leave at once. Without this, macOS holds the dying process
+// while it writes a crash report, and the app only notices when the scan times out.
+extern "C" void latheScanCrashed(int) { _exit(3); }
+#endif
+
 class Worker final : public juce::ChildProcessWorker, private juce::AsyncUpdater {
 public:
     explicit Worker(std::function<void(juce::AudioPluginFormatManager&)> addFormats) {
         trace("helper: starting");
+#if JUCE_MAC || JUCE_LINUX
+        for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) std::signal(sig, latheScanCrashed);
+#endif
         if (addFormats) addFormats(formats_);
         else formats_.addDefaultFormats();
 #if JUCE_MAC || JUCE_LINUX

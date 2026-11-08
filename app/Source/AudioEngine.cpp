@@ -67,17 +67,25 @@ void AudioEngine::loadSession(const Session& s) {
     double pos = transport_.getCurrentPosition();
     transport_.stop();
     transport_.setSource(nullptr);
+    surround_ = s.programmeChannels() == 6;
+    const int chans = surround_ && deviceOutputs() >= 6 ? 6 : 2;
+    playChannels_ = chans;
     {
         const juce::ScopedLock sl(sourceLock_);
         buffered_.reset();
-        program_ = std::make_unique<ProgramSource>(formats_, s, rate_, &fx_);
+        program_ = std::make_unique<ProgramSource>(formats_, s, rate_, &fx_, chans);
         // 4 s of read-ahead absorbs slow disks and network volumes.
         buffered_ = std::make_unique<juce::BufferingAudioSource>(program_.get(), readAhead_, false,
-                                                                  int(rate_ * 4), 2, true);
+                                                                  int(rate_ * 4), chans, true);
     }
-    transport_.setSource(buffered_.get(), 0, nullptr, rate_, 2);
+    transport_.setSource(buffered_.get(), 0, nullptr, rate_, chans);
     transport_.setPosition(juce::jmin(pos, transport_.getLengthInSeconds()));
     if (wasPlaying) transport_.start();
+}
+
+int AudioEngine::deviceOutputs() const {
+    if (auto* d = const_cast<juce::AudioDeviceManager&>(devices_).getCurrentAudioDevice()) return d->getActiveOutputChannels().countNumberOfSetBits();
+    return 2;
 }
 
 void AudioEngine::loadSourceSession(const Session& s) {
@@ -442,7 +450,9 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
         return;
     }
     transport_.getNextAudioBlock(info);
-    if (bypassMaster_) {
+    if (surround_) {
+        // 5.1: the master chain is stereo, so it stays out of the path (no half-processed surround).
+    } else if (bypassMaster_) {
         info.buffer->applyGain(info.startSample, info.numSamples, bypassGain_);   // level-matched unprocessed
     } else {
         chain_.process(*info.buffer, info.startSample, info.numSamples);

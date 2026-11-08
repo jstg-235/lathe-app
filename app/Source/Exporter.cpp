@@ -12,7 +12,7 @@ namespace {
 // Pulls finished master audio: programme → chain → (optional) SRC. Owns the chain while alive.
 class MasterStream {
 public:
-    MasterStream(AudioEngine& e, const Session& s, const ExportSettings& es, double outRate)
+    MasterStream(AudioEngine& e, const Session& s, const ExportSettings& es, double outRate, double startSec = 0)
         : engine_(e), renderer_(e.formats()), runPlugins_(es.runPlugins) {
         projRate_ = s.effectiveRate();
         outRate_ = outRate;
@@ -21,6 +21,7 @@ public:
         fxLock_ = std::make_unique<juce::ScopedLock>(engine_.regionFx().lock());   // region chains belong to the export now
         if (es.runPlugins) renderer_.setRegionFx(&engine_.regionFx());
         renderer_.setSession(s, projRate_, true);
+        if (startSec > 0) renderer_.seek(juce::int64(std::llround(startSec * projRate_)));
         if (runPlugins_) {
             engine_.chain().prepare(projRate_, kBlock, true);   // 64-bit for every plugin that supports it
             engine_.chain().setNonRealtime(true);
@@ -281,6 +282,7 @@ juce::String Exporter::exportTrackWavs(const Session& s, const juce::File& folde
 
 juce::String Exporter::exportProgramWav(const Session& s, const juce::File& file, int bits, const ExportSettings& es,
                                         const Keep& keep) {
+    if (s.programmeChannels() == 6) return exportRangeWav(s, file, bits, es, {0.0, s.end()}, keep);
     const double rate = s.effectiveRate();
     MasterStream ms(engine_, s, es, rate);
     const juce::int64 total = juce::int64(std::ceil(s.end() * rate));
@@ -303,6 +305,99 @@ juce::String Exporter::exportProgramWav(const Session& s, const juce::File& file
         if (!ms.pull(l.data(), r.data(), n, err)) return err;
         if (bits < 32) {
             // Dither from 64-bit to the target word length, then write the integers exactly.
+            const double* ch[2] = {l.data(), r.data()};
+            dither.process(ch, n, q.data());
+            if (!writeInts(*w, q.data(), n, bits, ibuf)) return "Disk write failed.";
+        } else {
+            for (int i = 0; i < n; ++i) { fbuf.setSample(0, i, float(l[size_t(i)])); fbuf.setSample(1, i, float(r[size_t(i)])); }
+            if (!w->writeFromAudioSampleBuffer(fbuf, 0, n)) return "Disk write failed.";
+        }
+        pos += n;
+        if (!keep(double(pos) / double(total))) return "Export cancelled.";
+    }
+    return {};
+}
+
+juce::String Exporter::exportRangeWav(const Session& s, const juce::File& file, int bits, const ExportSettings& es, juce::Range<double> range,
+                                      const Keep& keep) {
+    const double rate = s.effectiveRate();
+    range = range.getIntersectionWith({0.0, juce::jmax(s.end(), range.getEnd())});
+    if (range.getLength() <= 0) return "Nothing to export there.";
+    file.deleteFile();
+    std::unique_ptr<juce::OutputStream> os(file.createOutputStream().release());
+    if (!os) return "Couldn't write " + file.getFullPathName();
+    juce::WavAudioFormat wav;
+    const juce::int64 total = juce::int64(std::llround(range.getLength() * rate));
+    juce::String err;
+
+    if (s.programmeChannels() == 6) {
+        // Six channels straight from the programme (region effects apply, the stereo master chain doesn't).
+        std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), rate, juce::AudioChannelSet::create5point1(), bits, {}, 0));
+        if (!w) return "Couldn't create a six-channel " + juce::String(bits) + "-bit WAV writer.";
+        os.release();
+        engine_.suspendForOffline(true);
+        juce::String result;
+        {
+            const juce::ScopedLock fxLock(engine_.regionFx().lock());
+            ProgramRenderer pr(engine_.formats());
+            if (es.runPlugins) pr.setRegionFx(&engine_.regionFx());
+            pr.setSession(s, rate, true);
+            pr.seek(juce::int64(std::llround(range.getStart() * rate)));
+            juce::AudioBuffer<double> buf(6, 4096);
+            juce::AudioBuffer<float> fbuf(6, 4096);
+            dsp::Ditherer dither;
+            if (bits < 32) dither.prepare(6, bits, es.shape, 0x5EED1234u, rate);
+            std::vector<int32_t> q(4096 * 6);
+            std::vector<int> ib[6];
+            for (juce::int64 pos = 0; pos < total && result.isEmpty();) {
+                const int n = int(juce::jmin<juce::int64>(4096, total - pos));
+                if (!pr.render(buf, 0, n)) { result = pr.lastError(); break; }
+                if (bits < 32) {
+                    const double* ch[6];
+                    for (int c = 0; c < 6; ++c) ch[c] = buf.getReadPointer(c);
+                    dither.process(ch, n, q.data());
+                    const int shift = 32 - bits;
+                    const int* cp[7] = {};
+                    for (int c = 0; c < 6; ++c) {
+                        ib[c].resize(size_t(n));
+                        for (int i = 0; i < n; ++i) ib[c][size_t(i)] = int(uint32_t(q[size_t(i * 6 + c)]) << shift);
+                        cp[c] = ib[c].data();
+                    }
+                    if (!w->write(cp, n)) result = "Disk write failed.";
+                } else {
+                    for (int c = 0; c < 6; ++c)
+                        for (int i = 0; i < n; ++i) fbuf.setSample(c, i, float(buf.getSample(c, i)));
+                    if (!w->writeFromAudioSampleBuffer(fbuf, 0, n)) result = "Disk write failed.";
+                }
+                pos += n;
+                if (!keep(double(pos) / double(total))) result = "Export cancelled.";
+            }
+        }
+        engine_.regionFx().prepare(engine_.deviceRate(), 2048, false);
+        engine_.suspendForOffline(false);
+        return result;
+    }
+
+    std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), rate, 2, bits, {}, 0));
+    if (!w) return "Couldn't create a " + juce::String(bits) + "-bit WAV writer.";
+    os.release();
+    const double pre = juce::jmin(1.0, range.getStart());   // warm the chain up on what comes before
+    MasterStream ms(engine_, s, es, rate, range.getStart() - pre);
+    std::vector<double> l(4096), r(4096);
+    for (juce::int64 skip = juce::int64(std::llround(pre * rate)); skip > 0;) {
+        const int n = int(juce::jmin<juce::int64>(4096, skip));
+        if (!ms.pull(l.data(), r.data(), n, err)) return err;
+        skip -= n;
+    }
+    juce::AudioBuffer<float> fbuf(2, 4096);
+    std::vector<int> ibuf[2];
+    dsp::Ditherer dither;
+    if (bits < 32) dither.prepare(2, bits, es.shape, 0x5EED1234u, rate);
+    std::vector<int32_t> q(4096 * 2);
+    for (juce::int64 pos = 0; pos < total;) {
+        const int n = int(juce::jmin<juce::int64>(4096, total - pos));
+        if (!ms.pull(l.data(), r.data(), n, err)) return err;
+        if (bits < 32) {
             const double* ch[2] = {l.data(), r.data()};
             dither.process(ch, n, q.data());
             if (!writeInts(*w, q.data(), n, bits, ibuf)) return "Disk write failed.";

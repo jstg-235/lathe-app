@@ -55,6 +55,8 @@ enum : juce::CommandID {
     textView = 0x1460, segmentGain,
     // Timeline gain
     gainOverlay = 0x1480, gainBypass, lockAllGain, clearGain,
+    // Export
+    exportSegments = 0x1090,
 };
 }  // namespace cmd
 

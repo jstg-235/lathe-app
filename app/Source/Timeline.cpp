@@ -108,7 +108,7 @@ void Timeline::reveal(double t) {
 
 juce::Rectangle<int> Timeline::badgeBounds(int lane) const {
     auto b = laneBounds(lane);
-    return {b.getX() + 3, b.getBottom() - 19, 24, 15};
+    return {b.getX() + 3, b.getBottom() - 19, s_.laneFormat(lane) == 2 ? 24 : 44, 15};
 }
 
 int Timeline::srpAt(juce::Point<int> p) const {
@@ -650,7 +650,9 @@ void Timeline::paintPoints(juce::Graphics& g) {
         g.fillRoundedRectangle(b, 3.0f);
         g.setColour(on ? colours::bg : colours::dim);
         g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-        g.drawText(juce::String(on ? (role_ == Role::Source ? "S" : "D") : "N") + juce::String(l + 1), b.toNearestInt(), juce::Justification::centred);
+        const int fmt = s_.laneFormat(l);
+        g.drawText(juce::String(on ? (role_ == Role::Source ? "S" : "D") : "N") + juce::String(l + 1) + (fmt == 1 ? " MONO" : fmt == 6 ? " 5.1" : ""),
+                   b.toNearestInt(), juce::Justification::centred);
     }
     // Role label.
     {
@@ -743,6 +745,7 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
 
     for (int l = 0; l < s_.lanes; ++l)
         if (badgeBounds(l).contains(p)) {
+            if (e.mods.isPopupMenu()) { if (onLaneMenu) onLaneMenu(l); return; }
             if (s_.laneTargeted(l)) s_.lanesOff.addIfNotAlreadyThere(l); else s_.lanesOff.removeAllInstancesOf(l);
             if (onEdit) onEdit();
             repaint();
