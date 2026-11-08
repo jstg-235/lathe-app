@@ -31,7 +31,7 @@ jobs:
           for name in lathe_render_tests lathe_batch_tests; do
             T=$(find build -name "$name" -type f -perm -u+x | grep Release | head -1)
             echo "==== $name"
-            lldb --batch -o run -o "bt 40" -o quit -- "$T" 2>&1 | tail -70
+            lldb --batch -o run -k "bt 40" -k "frame variable" -k quit -- "$T" 2>&1 | tail -120
           done
 
       - name: Scan helper test (console helper)

@@ -90,6 +90,7 @@ static double rms(const juce::AudioBuffer<float>& b, int a, int n) {
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // keep output if a test crashes
     juce::AudioFormatManager fm;
     fm.registerBasicFormats();
     auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("lathe_render_test");

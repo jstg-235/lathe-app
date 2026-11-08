@@ -39,6 +39,7 @@ struct CommandSpy : juce::ApplicationCommandTarget {
 };
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // keep output if a test crashes
     juce::ScopedJuceInitialiser_GUI gui;
     auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("lathe_batch_test");
     dir.deleteRecursively();
