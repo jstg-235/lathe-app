@@ -61,7 +61,7 @@ public:
         pendingPos_ += avail;
         local_ += n;
         if (pendingPos_ > kChunk * 4) {   // compact occasionally
-            for (auto& v : pending_) v.erase(v.begin(), v.begin() + pendingPos_);
+            for (int ch = 0; ch < nCh_; ++ch) pending_[ch].erase(pending_[ch].begin(), pending_[ch].begin() + pendingPos_);
             pendingPos_ = 0;
         }
     }
