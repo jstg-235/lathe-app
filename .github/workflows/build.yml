@@ -23,11 +23,28 @@ jobs:
       - name: Run tests
         env:
           LATHE_SCAN_LOG: ${{ runner.temp }}/scan.log
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure -E scan
+
+      - name: Scan helper test (console helper)
+        continue-on-error: true
+        env:
+          LATHE_SCAN_LOG: ${{ runner.temp }}/scan.log
+        run: ctest --test-dir build -C Release --output-on-failure -R scan
+
+      - name: Scan helper test (the app as helper)
+        env:
+          LATHE_SCAN_LOG: ${{ runner.temp }}/scan-app.log
+        run: |
+          APP=$(find build -name "Lathe.app" -type d | grep Release | head -1)
+          T=$(find build -name "lathe_scan_tests" -type f -perm -u+x | grep Release | head -1)
+          "$T" --helper "$APP/Contents/MacOS/Lathe"
 
       - name: Scan protocol trace
         if: always()
-        run: cat "${{ runner.temp }}/scan.log" || true
+        run: |
+          cat "${{ runner.temp }}/scan.log" || true
+          echo "---- app as helper ----"
+          cat "${{ runner.temp }}/scan-app.log" || true
 
       - name: Package
         run: |

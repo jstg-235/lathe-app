@@ -7,6 +7,8 @@
 #include "DdpPlayer.h"
 #include "DeliveryPanels.h"
 #include "PluginManager.h"
+#include "MarkInfo.h"
+#include "AutoMarks.h"
 #include "Restore.h"
 #include "Commands.h"
 #include "EditPanels.h"
@@ -200,6 +202,10 @@ private:
     FadeEditorPrefs fadePrefs_;
     FadeLibrary fadeLib_ = defaultFadeLibrary();
     void saveFadeSettings();
+    void showMarkInfo();
+    void runAnalogBlack();
+    std::unique_ptr<juce::DocumentWindow> markInfoWindow_;
+    juce::Component::SafePointer<MarkInfoPanel> markInfoPanel_;
     void crossfadeNewEdits(const juce::Array<int>& ids, Session& s);   // default crossfade on new splices
     std::unique_ptr<LevelMeters> meters_;
     juce::TableListBox pqList_{"PQ", this};

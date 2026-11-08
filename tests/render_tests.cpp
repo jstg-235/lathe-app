@@ -4,6 +4,7 @@
 #include "../core/util/FlacTags.h"
 #include "../app/Source/NullTest.h"
 #include "../app/Source/ProgramRenderer.h"
+#include "../app/Source/AutoMarks.h"
 #include "../app/Source/Products.h"
 
 // A test plugin: hard clip at +/-level with a fixed latency, in float and double.
@@ -884,6 +885,143 @@ int main() {
         // Splices: the butt at c/d isn't one (gap), a/b overlaps.
         auto sp = e.splicesAround({b.id});
         CHECK(sp.contains({a.id, b.id}) && sp.contains({b.id, c.id}));
+    }
+    // ---- PQ: offsets, locks, auto marks, AutoSpace, track reorder, ISRC numbering ----
+    {
+        auto song = [&](const char* n, double sec, float amp) { return makeTone(dir, n, 44100, sec, 440, amp); };
+        auto s1 = song("pq1.wav", 6, 0.4f), s2 = song("pq2.wav", 5, 0.3f), s3 = song("pq3.wav", 4, 0.2f);
+        Session p;
+        p.lanes = 1;
+        for (auto f : {s1, s2, s3}) p.append(regionFor(p, fm, f), 2.0);   // 2-6? : 2..8, 10..15, 17..21
+        auto starts = [&] { juce::Array<double> a; for (auto& m : p.markers) if (m.type == Marker::TrackStart) a.add(m.t); return a; };
+        CHECK(starts().size() == 3);
+        // Offsets: start 5, track 1 "same" (but the 2 s pregap floor holds), splice 2, end 3.
+        p.pqOffsetFrames = 5;
+        p.pqSpliceFrames = 2;   // every track start here is on a region start
+        p.pqEndFrames = 3;
+        auto d = p.toDisc();
+        CHECK(d.tracks[0].startSector() == 150);
+        CHECK(d.tracks[1].startSector() == 10 * 75 - 2);
+        CHECK(d.tracks[1].indexes[0].number == 0 && d.tracks[1].indexes[0].sector == 8 * 75 + 3);
+        // Per-track override, and switching offsets off.
+        for (auto& m : p.markers) if (m.type == Marker::TrackStart && std::abs(m.t - 17.0) < 0.01) { m.offsetDefault = false; m.offsetFrames = 20; }
+        CHECK(p.toDisc().tracks[2].startSector() == 17 * 75 - 20);
+        p.pqOffsetsOn = false;
+        CHECK(p.toDisc().tracks[2].startSector() == 17 * 75 && p.toDisc().tracks[1].indexes[0].sector == 8 * 75);
+        p.pqOffsetsOn = true;
+        // Minimum index width.
+        const int ix = p.addMarker(Marker::Index, 11.0);
+        p.pqMinIndexFrames = 75 * 2;
+        CHECK(p.toDisc().tracks[1].indexes.size() == 2);   // 00 + 01, the index 1 s in is dropped
+        p.pqMinIndexFrames = 0;
+        CHECK(p.toDisc().tracks[1].indexes.size() == 3);
+        p.removeMarker(ix);
+
+        // Locks: a locked mark stays when its audio moves; the global lock holds them all.
+        int t2 = 0;
+        for (auto& m : p.markers) if (m.type == Marker::TrackStart && std::abs(m.t - 10.0) < 0.01) t2 = m.id;
+        p.findMarker(t2)->locked = true;
+        p.ripple(9.0, 1.0);
+        NEAR(p.findMarker(t2)->t, 10.0, 1e-9);
+        p.ripple(9.0, -1.0);
+        p.findMarker(t2)->locked = false;
+        p.lockMarks = true;
+        p.ripple(9.0, 1.0);
+        NEAR(p.findMarker(t2)->t, 10.0, 1e-9);
+        p.lockMarks = false;
+        p.ripple(9.0, -1.0);
+        NEAR(p.findMarker(t2)->t, 9.0, 1e-9);   // regions moved back, the mark moved only once
+        p.moveMarker(t2, 10.0);
+
+        // AutoSpace to 1 s: gaps shrink, marks follow their audio.
+        p.autoSpace(1.0);
+        auto st = starts();
+        CHECK(st.size() == 3);
+        NEAR(st[1], 9.0, 1e-6);
+        NEAR(st[2], 15.0, 1e-6);
+        NEAR(p.end(), 19.0, 1e-6);
+
+        // Reorder: track 3 to the front. The audio and its mark go with it; the pregap stays.
+        CHECK(p.moveTrack(2, 0));
+        auto st2 = starts();
+        CHECK(st2.size() == 3);
+        auto titleAt = [&](int k) { int n = 0; for (auto& m : p.markers) if (m.type == Marker::TrackStart && n++ == k) return juce::String(m.text.title); return juce::String(); };
+        CHECK(titleAt(0) == "pq3" && titleAt(1) == "pq1" && titleAt(2) == "pq2");
+        NEAR(st2[0], 2.0, 1e-6);
+        NEAR(p.end(), 19.0, 1e-3);
+        // The first track now plays pq3's audio (the quietest tone).
+        {
+            ProgramRenderer pr(fm);
+            pr.setSession(p, 44100);
+            juce::AudioBuffer<float> buf(2, 4410);
+            pr.seek(44100 * 3);
+            pr.render(buf, 0, 4410);
+            NEAR(rms(buf, 0, 4410), 0.2 / std::sqrt(2.0), 0.005);
+        }
+        CHECK(p.moveTrack(0, 2));
+        CHECK(titleAt(0) == "pq1" && titleAt(2) == "pq3");
+
+        // ISRC numbering.
+        CHECK(p.autoIsrc("US-ABC-26-00098") == 3);
+        int k = 0;
+        for (auto& m : p.markers)
+            if (m.type == Marker::TrackStart) { CHECK(m.isrc == (k == 0 ? "USABC2600098" : k == 1 ? "USABC2600099" : "USABC2600100")); ++k; }
+        CHECK(p.autoIsrc("nonsense") == 0);
+
+        // Edited black and segments to marks on a session with no marks.
+        Session q;
+        q.lanes = 1;
+        for (auto f : {s1, s2}) q.append(regionFor(q, fm, f), 3.0, false);
+        CHECK(q.markers.isEmpty());
+        CHECK(q.segmentsToStartMarks() == 2);
+        CHECK(q.segmentsToStartMarks() == 0);
+        q.markers.clear();
+        CHECK(q.editedBlackToMarks() == 3);   // lead-in gap: start only; between: pause + start
+        // Audio before the first mark.
+        q.markers.clear();
+        q.addMarker(Marker::TrackStart, 4.0);
+        NEAR(q.audioBeforeFirstTrack(), 1.0, 1e-6);
+
+        // Analog black: one file with a silent stretch in the middle.
+        {
+            auto f = dir.getChildFile("ab.wav");
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(f.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 44100, 2, 24, {}, 0));
+            os.release();
+            juce::AudioBuffer<float> b(2, 44100 * 10);
+            for (int i = 0; i < b.getNumSamples(); ++i) {
+                const double t = i / 44100.0;
+                const float v = (t > 4.0 && t < 6.5) ? 0.0f : 0.4f * float(std::sin(2 * juce::MathConstants<double>::pi * 440 * t));
+                b.setSample(0, i, v);
+                b.setSample(1, i, v);
+            }
+            w->writeFromAudioSampleBuffer(b, 0, b.getNumSamples());
+            w.reset();
+            Session a;
+            a.lanes = 1;
+            a.append(regionFor(a, fm, f), 2.0);
+            auto sil = findSilences(fm, a, -60.0, 1.0);
+            CHECK(sil.size() == 2);   // the 2 s lead-in and the 2.5 s gap
+            if (sil.size() == 2) {
+                NEAR(sil[1].getStart(), 6.0, 0.05);
+                NEAR(sil[1].getEnd(), 8.5, 0.05);
+            }
+            CHECK(analogBlackToMarks(a, sil) == 2);
+            int starts2 = 0, pauses = 0;
+            for (auto& m : a.markers) { starts2 += m.type == Marker::TrackStart; pauses += m.type == Marker::PauseStart; }
+            CHECK(starts2 == 2 && pauses == 1);
+        }
+        // New PQ settings survive a save.
+        juce::String err;
+        Session back;
+        p.pqTrack1Frames = 0;
+        p.lockMarks = true;
+        CHECK(back.fromVar(juce::JSON::parse(juce::JSON::toString(p.toVar())), err));
+        CHECK(back.pqOffsetFrames == 5 && back.pqTrack1Frames == 0 && back.pqSpliceFrames == 2 && back.pqEndFrames == 3 && back.lockMarks);
+        int own = 0;
+        for (auto& m : back.markers) own += (!m.offsetDefault && m.offsetFrames == 20) ? 1 : 0;
+        CHECK(own == 1);
     }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);

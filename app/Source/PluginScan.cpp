@@ -86,6 +86,7 @@ private:
     }
 
     void handleAsyncUpdate() override {
+        trace("helper: message thread picked up the request");
         for (;;) {
             std::pair<juce::String, juce::String> job;
             {

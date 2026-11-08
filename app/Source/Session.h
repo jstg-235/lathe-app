@@ -66,6 +66,10 @@ struct Marker {
     // Label-copy credits (paperwork and tags only, not written to the disc)
     std::string publisher, pro;
     bool explicitContent = false;
+    // PQ offset for this track start (frames earlier), used when offsetDefault is off.
+    int offsetFrames = 0;
+    bool offsetDefault = true;
+    bool locked = false;   // stays at its time: not moved by ripples, region moves or drags
 };
 
 // ---- Products: the same programme cut into physical units (CDs, LP sides, tape sides) ----
@@ -158,7 +162,16 @@ public:
     // Release metadata for paperwork, CD-Text and tags
     juce::String label, catalogue, releaseDate, pLine, cLine, genreText, notes, cdTextDiscId;
     int cdTextGenre = 0;          // CD-Text genre code (0 = none)
-    int pqOffsetFrames = 0;       // track starts are moved earlier by this many CD frames on delivery
+    // PQ offsets (CD frames), applied on delivery only: track starts move earlier by
+    // pqOffsetFrames (pqTrack1Frames for track 1, pqSpliceFrames for a start that sits on an
+    // edit), track ends (pause starts) move later by pqEndFrames; index marks closer than
+    // pqMinIndexFrames to the previous index are left out.
+    int pqOffsetFrames = 0;
+    int pqTrack1Frames = -1, pqSpliceFrames = -1;   // -1 = same as pqOffsetFrames
+    int pqEndFrames = 0, pqMinIndexFrames = 0;
+    bool pqOffsetsOn = true;
+    bool lockMarks = false;       // global: every mark stays put (ripples and region moves leave them)
+    double autoSpaceGap = 2.0;    // seconds between tracks for AutoSpace and imports
     bool htoa = false;            // hidden track one audio: audio before track 1 index 01 is intended
     juce::Array<Product> products;
     juce::Array<Srp> srps;
@@ -258,6 +271,23 @@ public:
     // Looks for each missing file by name in `folders` and relinks the ones it finds.
     // Returns how many files were found.
     int findMissingAudioIn(const juce::Array<juce::File>& folders);
+    // ---- PQ helpers ----
+    bool markLocked(const Marker& m) const { return lockMarks || m.locked; }
+    // The offset a track start gets on delivery (frames), from its own setting or the defaults.
+    int effectiveStartOffset(const Marker& m, bool isTrack1) const;
+    bool onSplice(double t) const;   // a region starts within a CD frame of t
+    // Auto marks. Each returns how many marks were added.
+    int segmentsToStartMarks(int lane = 0);
+    int editedBlackToMarks(double minGap = 0.5);
+    // Moves track `from` (0-based, with its audio, pause and marks) to position `to`.
+    bool moveTrack(int from, int to);
+    // Sets the gap between tracks (groups of joined regions on lane 0) to `gap` seconds.
+    void autoSpace(double gap);
+    // Fills ISRCs from `first` upwards (the designation code counts up). Returns tracks set.
+    int autoIsrc(const juce::String& first);
+    // Audio that plays before track 1 starts (not intended unless HTOA): seconds of it, 0 = none.
+    double audioBeforeFirstTrack() const;
+
     // Each CD track's [start, end) in seconds (index 01 to next track's index 01 / end).
     juce::Array<juce::Range<double>> trackRanges() const;
 
@@ -268,6 +298,7 @@ public:
 
 private:
     void regionMoved(int id, double dt);
+    bool moveTrackUnlocked(int from, int to);
 };
 
 }  // namespace lathe

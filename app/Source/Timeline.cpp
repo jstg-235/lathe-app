@@ -734,8 +734,10 @@ void Timeline::mouseDrag(const juce::MouseEvent& e) {
             if (auto* q = s_.findSrp(dragId_)) { q->t = snapTime(juce::jmax(0.0, t), 0); edit_ = q->t; changed_ = true; }
             break;
         case Drag::Marker:
-            s_.moveMarker(dragId_, snapTime(t, 0));
-            changed_ = true;
+            if (auto* mk = s_.findMarker(dragId_); mk && !s_.markLocked(*mk)) {
+                s_.moveMarker(dragId_, snapTime(t, 0));
+                changed_ = true;
+            }
             break;
         case Drag::Move: {
             auto* r = s_.findRegion(dragId_);

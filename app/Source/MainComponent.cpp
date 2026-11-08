@@ -505,6 +505,7 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::toggleSnap: info.setTicked(snapBtn_.getToggleState()); break;
         case cmd::followProjectRate: info.setTicked(followRate_); break;
         case cmd::repeatPlay: info.setTicked(repeat_); break;
+        case cmd::lockAllMarks: info.setTicked(session_.lockMarks); break;
         case cmd::defaultFadeOnEdits: info.setTicked(fadePrefs_.defaultOnEdits); break;
         case cmd::fadeRecall0: case cmd::fadeRecall1: case cmd::fadeRecall2: case cmd::fadeRecall3: case cmd::fadeRecall4:
         case cmd::fadeRecall5: case cmd::fadeRecall6: case cmd::fadeRecall7: case cmd::fadeRecall8: case cmd::fadeRecall9: {
@@ -675,6 +676,12 @@ bool MainComponent::perform(const InvocationInfo& info) {
             commands_.commandStatusChanged();
             break;
         case cmd::playbackSettings: showPlaybackSettings(); break;
+        case cmd::markInfo: showMarkInfo(); break;
+        case cmd::segmentsToMarks: if (session_.segmentsToStartMarks(0) > 0) sessionChanged(); break;
+        case cmd::editedBlackToMarks: if (session_.editedBlackToMarks() > 0) sessionChanged(); break;
+        case cmd::analogBlackToMarks: runAnalogBlack(); break;
+        case cmd::autoSpace: session_.autoSpace(session_.autoSpaceGap); sessionChanged(); break;
+        case cmd::lockAllMarks: session_.lockMarks = !session_.lockMarks; sessionChanged(); commands_.commandStatusChanged(); break;
         case cmd::fadeRecall0: case cmd::fadeRecall1: case cmd::fadeRecall2: case cmd::fadeRecall3: case cmd::fadeRecall4:
         case cmd::fadeRecall5: case cmd::fadeRecall6: case cmd::fadeRecall7: case cmd::fadeRecall8: case cmd::fadeRecall9: {
             const int slot = int(info.commandID - cmd::fadeRecall0);
@@ -895,6 +902,10 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             break;
         case 3:
             add({cmd::addTrackMarker, cmd::addIndexMarker, cmd::addPauseMarker, cmd::addEndMarker});
+            m.addSeparator();
+            add({cmd::markInfo, cmd::lockAllMarks});
+            m.addSeparator();
+            add({cmd::segmentsToMarks, cmd::editedBlackToMarks, cmd::analogBlackToMarks, cmd::autoSpace});
             m.addSeparator();
             add({cmd::addSrp, cmd::addSrpText, cmd::srpsFromSelection, cmd::prevSrp, cmd::nextSrp, cmd::lockSrp, cmd::deleteSrp, cmd::deleteAllSrps});
             break;
@@ -2226,7 +2237,7 @@ void MainComponent::importFiles(const juce::Array<juce::File>& files) {
         if (!r) { bad.add(f.getFileName()); continue; }
         Region reg = session_.makeRegion(f, r->sampleRate, r->lengthInSamples);
         reg.lane = 0;
-        int id = session_.append(reg, 2.0);
+        int id = session_.append(reg, session_.autoSpaceGap);
         // ISRC embedded by the mix engineer is carried onto the track marker.
         auto isrc = r->metadataValues.getValue("ISRC", r->metadataValues.getValue("isrc", ""));
         if (isrc.isNotEmpty())
@@ -2873,6 +2884,8 @@ void MainComponent::refreshIssues() {
     }
     if (!cdt.error.empty()) { ++errors; s << "ERROR  " << juce::String::fromUTF8(cdt.error.c_str()) << "\n"; }
     for (auto& a : adj) s << "Note   " << a << "\n";
+    if (const double early = session_.audioBeforeFirstTrack(); early > 0 && !session_.htoa)
+        s << "Warn   Audio plays for " << juce::String(early, 2) << " s before the first track mark (set HTOA in Release Info if intended)\n";
     juce::StringArray missing;
     for (auto& r : session_.regions)
         if (!r.file.existsAsFile()) missing.addIfNotAlreadyThere(r.file.getFileName());
@@ -3237,6 +3250,7 @@ void MainComponent::refreshDeliveryPanels() {
     if (productsPanel_) productsPanel_->refresh();
     if (releasePanel_) releasePanel_->refresh();
     if (creditsPanel_) creditsPanel_->refresh();
+    if (markInfoPanel_) markInfoPanel_->refresh();
     if (breakEditor_) {
         auto* p = session_.findProduct(breakEditor_->productId());
         if (!p || breakEditor_->breakIndex() + 1 >= p->units.size()) breakWindow_.reset();
@@ -3337,6 +3351,51 @@ void MainComponent::showTrackCredits() {
     auto* w = new PlainWindow(panel, "Track Credits", false);
     w->onClose = [this] { juce::MessageManager::callAsync([this] { creditsWindow_.reset(); }); };
     creditsWindow_.reset(w);
+}
+
+void MainComponent::showMarkInfo() {
+    if (markInfoWindow_) { markInfoWindow_->toFront(true); return; }
+    auto* panel = new MarkInfoPanel(session_);
+    panel->onChange = [this] {
+        sessionChanged();
+        pqList_.updateContent();
+        pqList_.repaint();
+    };
+    panel->onPlay = [this](double t) { locateDest(t); setActiveTimeline(false); if (!engine_.isPlaying()) togglePlay(); };
+    panel->onSegmentsToMarks = [this] { commands_.invokeDirectly(cmd::segmentsToMarks, false); };
+    panel->onEditedBlack = [this] { commands_.invokeDirectly(cmd::editedBlackToMarks, false); };
+    panel->onAnalogBlack = [this] { runAnalogBlack(); };
+    panel->onAutoSpace = [this] { commands_.invokeDirectly(cmd::autoSpace, false); };
+    markInfoPanel_ = panel;
+    auto* w = new PlainWindow(panel, "Mark Info", false);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { markInfoWindow_.reset(); }); };
+    markInfoWindow_.reset(w);
+}
+
+void MainComponent::runAnalogBlack() {
+    auto* w = new juce::AlertWindow("Analog Black to Marks", "Silence inside the audio becomes a track end and the next track's start.",
+                                    juce::MessageBoxIconType::NoIcon);
+    w->addTextEditor("thresh", "-60", "Quieter than (dBFS peak)");
+    w->addTextEditor("len", "1.0", "For at least (s)");
+    w->addButton("Find", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    w->enterModalState(true, juce::ModalCallbackFunction::create([this, w](int r) {
+        std::unique_ptr<juce::AlertWindow> owner(w);
+        if (r != 1) return;
+        const double th = juce::jlimit(-120.0, -10.0, w->getTextEditorContents("thresh").getDoubleValue());
+        const double len = juce::jlimit(0.1, 30.0, w->getTextEditorContents("len").getDoubleValue());
+        auto snapshot = std::make_shared<Session>(session_);
+        snapshot->source = nullptr;
+        auto found = std::make_shared<juce::Array<juce::Range<double>>>();
+        runJob("Finding silence...",
+               [this, snapshot, th, len, found](Job& j) { *found = findSilences(engine_.formats(), *snapshot, th, len, [&](double p) { return j.keep(p); }); },
+               [this, found](bool) {
+                   const int n = analogBlackToMarks(session_, *found);
+                   if (n > 0) sessionChanged();
+                   juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Analog Black to Marks",
+                                                          juce::String(found->size()) + " silence(s) found, " + juce::String(n) + " mark(s) added.");
+               });
+    }), false);
 }
 
 void MainComponent::showStudioProfile() {

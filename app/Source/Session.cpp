@@ -166,7 +166,7 @@ Region Session::makeRegion(const juce::File& f, double rate, juce::int64 length)
 void Session::regionMoved(int id, double dt) {
     if (std::abs(dt) < kEps) return;
     for (auto& m : markers)
-        if (m.attachedRegion == id) m.t += dt;
+        if (m.attachedRegion == id && !markLocked(m)) m.t += dt;
     sortMarkers();
 }
 
@@ -269,7 +269,7 @@ void Session::ripple(double t, double dt, int except, const juce::Array<int>* on
     for (auto& r : regions)
         if (r.id != except && r.start >= t - kEps && (onLanes == nullptr || onLanes->contains(r.lane))) r.start = juce::jmax(0.0, r.start + dt);
     for (auto& m : markers)
-        if (m.t >= t - kEps && (except == 0 || m.attachedRegion != except)) m.t = juce::jmax(0.0, m.t + dt);
+        if (m.t >= t - kEps && (except == 0 || m.attachedRegion != except) && !markLocked(m)) m.t = juce::jmax(0.0, m.t + dt);
     for (auto& p : srps)
         if (!p.locked && p.t >= t - kEps) p.t = juce::jmax(0.0, p.t + dt);
     sortMarkers();
@@ -378,7 +378,7 @@ void Session::clearRange(double a, double b, const juce::Array<int>& laneList, b
     }
     if (!rippleAfter) return;
     for (int k = markers.size(); --k >= 0;)
-        if (markers.getReference(k).t >= a - kEps && markers.getReference(k).t < b - kEps) markers.remove(k);
+        if (markers.getReference(k).t >= a - kEps && markers.getReference(k).t < b - kEps && !markLocked(markers.getReference(k))) markers.remove(k);
     for (int k = srps.size(); --k >= 0;)
         if (!srps.getReference(k).locked && srps.getReference(k).t >= a - kEps && srps.getReference(k).t < b - kEps) srps.remove(k);
     // Trimmed heads land on b give or take a sample of rounding: catch them too.
@@ -630,11 +630,13 @@ static int64_t toSector(double sec) { return int64_t(std::llround(sec * cd::kFra
 namespace {
 
 // Builds a Red Book disc from sorted markers whose times are already relative to the disc.
-cd::Disc buildDisc(const juce::Array<Marker>& ms, double lengthSec, int offsetFrames, juce::StringArray* adj) {
+// Each marker's offsetFrames holds the offset its track start gets (already resolved).
+cd::Disc buildDisc(const juce::Array<Marker>& ms, double lengthSec, int endFrames, int minIndexFrames, juce::StringArray* adj) {
     cd::Disc d;
     d.leadOutSector = int64_t(std::ceil(lengthSec * cd::kFramesPerSecond - 1e-6));
     double pendingPause = -1;
-    int skippedIndexes = 0;
+    int skippedIndexes = 0, narrowIndexes = 0;
+    std::vector<int> startOffsets;
     for (auto& m : ms) {
         if (m.type == Marker::PauseStart) { pendingPause = m.t; continue; }
         if (m.type == Marker::EndOfDisc) continue;
@@ -642,6 +644,7 @@ cd::Disc buildDisc(const juce::Array<Marker>& ms, double lengthSec, int offsetFr
             if (d.tracks.empty()) { ++skippedIndexes; continue; }
             auto& t = d.tracks.back();
             int64_t sec = toSector(m.t);
+            if (minIndexFrames > 0 && sec - t.indexes.back().sector < minIndexFrames) { ++narrowIndexes; continue; }
             if (sec > t.indexes.back().sector && t.indexes.size() < 100) t.indexes.push_back({t.indexes.back().number + 1, sec});
             else ++skippedIndexes;
             continue;
@@ -651,7 +654,7 @@ cd::Disc buildDisc(const juce::Array<Marker>& ms, double lengthSec, int offsetFr
         int64_t prev = d.tracks.empty() ? -1 : d.tracks.back().indexes.back().sector;
         if (d.tracks.empty()) t.indexes.push_back({0, 0});
         else if (pendingPause >= 0) {
-            int64_t p = toSector(pendingPause);
+            int64_t p = juce::jmin(start - 1, toSector(pendingPause) + endFrames);   // end offset: the track end later
             if (p > prev && p < start) t.indexes.push_back({0, p});
         }
         pendingPause = -1;
@@ -663,18 +666,24 @@ cd::Disc buildDisc(const juce::Array<Marker>& ms, double lengthSec, int offsetFr
         t.scms = m.scms;
         t.text = m.text;
         d.tracks.push_back(t);
+        startOffsets.push_back(m.offsetFrames);
     }
     if (adj && skippedIndexes) adj->add(juce::String(skippedIndexes) + " index marker(s) outside a track were skipped.");
+    if (adj && narrowIndexes) adj->add(juce::String(narrowIndexes) + " index marker(s) closer than the minimum index width were left out.");
+    if (adj && endFrames > 0) adj->add("PQ end offset: track ends moved " + juce::String(endFrames) + " frame(s) later.");
 
     // PQ offset: move each track start (index 01) earlier so slow transports don't clip the
     // first notes. Never past the track's own pause, the previous track's last index, or
     // (track 1) the 2-second minimum pregap.
-    if (offsetFrames > 0) {
+    bool anyOffset = false;
+    for (int o : startOffsets) anyOffset = anyOffset || o > 0;
+    if (anyOffset) {
         int clamped = 0;
         for (size_t ti = 0; ti < d.tracks.size(); ++ti) {
             auto& t = d.tracks[ti];
+            const int offsetFrames = startOffsets[ti];
             for (size_t k = 0; k < t.indexes.size(); ++k) {
-                if (t.indexes[k].number != 1) continue;
+                if (t.indexes[k].number != 1 || offsetFrames <= 0) continue;
                 int64_t floor = ti == 0 ? 2 * cd::kFramesPerSecond : d.tracks[ti - 1].indexes.back().sector + 1;
                 if (k > 0) floor = juce::jmax(floor, t.indexes[k - 1].sector + 1);
                 int64_t want = t.indexes[k].sector - offsetFrames;
@@ -683,7 +692,9 @@ cd::Disc buildDisc(const juce::Array<Marker>& ms, double lengthSec, int offsetFr
             }
         }
         if (adj) {
-            adj->add("PQ offset: track starts moved " + juce::String(offsetFrames) + " frame(s) earlier.");
+            juce::StringArray used;
+            for (int o : startOffsets) if (o > 0) used.addIfNotAlreadyThere(juce::String(o));
+            adj->add("PQ offset: track starts moved " + used.joinIntoString(" / ") + " frame(s) earlier.");
             if (clamped) adj->add(juce::String(clamped) + " track start(s) couldn't take the full offset (pregap or previous marker in the way).");
         }
     }
@@ -692,10 +703,215 @@ cd::Disc buildDisc(const juce::Array<Marker>& ms, double lengthSec, int offsetFr
 
 }  // namespace
 
+bool Session::onSplice(double t) const {
+    for (auto& r : regions)
+        if (!r.mute && std::abs(r.start - t) <= 1.0 / cd::kFramesPerSecond && r.start > 1e-6) return true;
+    return false;
+}
+
+int Session::effectiveStartOffset(const Marker& m, bool isTrack1) const {
+    if (!pqOffsetsOn) return 0;
+    if (!m.offsetDefault) return juce::jlimit(0, 150, m.offsetFrames);
+    if (isTrack1 && pqTrack1Frames >= 0) return pqTrack1Frames;
+    if (!isTrack1 && pqSpliceFrames >= 0 && onSplice(m.t)) return pqSpliceFrames;
+    return pqOffsetFrames;
+}
+
+double Session::audioBeforeFirstTrack() const {
+    double first = -1;
+    for (auto& m : markers)
+        if (m.type == Marker::TrackStart) { first = m.t; break; }
+    if (first < 0) return 0;
+    double earliest = 1e12;
+    for (auto& r : regions)
+        if (!r.mute) earliest = juce::jmin(earliest, r.start);
+    return earliest < first - 1.0 / cd::kFramesPerSecond ? first - earliest : 0.0;
+}
+
+int Session::segmentsToStartMarks(int lane) {
+    juce::Array<const Region*> rs;
+    for (auto& r : regions)
+        if (r.lane == lane && !r.mute) rs.add(&r);
+    std::sort(rs.begin(), rs.end(), [](const Region* a, const Region* b) { return a->start < b->start; });
+    juce::Array<std::pair<double, int>> todo;
+    for (auto* r : rs) {
+        bool has = false;
+        for (auto& m : markers) has = has || (m.type == Marker::TrackStart && std::abs(m.t - r->start) < 1.0 / cd::kFramesPerSecond);
+        if (!has) todo.add({r->start, r->id});
+    }
+    for (auto [t, id] : todo) {
+        const int mid = addMarker(Marker::TrackStart, t, id);
+        if (auto* mk = findMarker(mid); mk && findRegion(id)) {
+            mk->text.title = findRegion(id)->name.toStdString();
+            mk->text.performer = discPerformer.toStdString();
+        }
+    }
+    return todo.size();
+}
+
+int Session::editedBlackToMarks(double minGap) {
+    // Gaps where no region plays on any lane ("edited black").
+    juce::Array<juce::Range<double>> spans;
+    for (auto& r : regions)
+        if (!r.mute) spans.add({r.start, r.end()});
+    std::sort(spans.begin(), spans.end(), [](auto a, auto b) { return a.getStart() < b.getStart(); });
+    juce::Array<juce::Range<double>> gaps;
+    double reach = 0;   // the lead-in counts: it gets a track start at its end
+    for (auto& sp : spans) {
+        if (sp.getStart() - reach >= minGap) gaps.add({reach, sp.getStart()});
+        reach = juce::jmax(reach, sp.getEnd());
+    }
+    int added = 0;
+    const double frame = 1.0 / cd::kFramesPerSecond;
+    for (auto g : gaps) {
+        bool pause = false, start = false;
+        for (auto& m : markers) {
+            pause = pause || (m.type == Marker::PauseStart && m.t >= g.getStart() - frame && m.t <= g.getEnd() + frame);
+            start = start || (m.type == Marker::TrackStart && std::abs(m.t - g.getEnd()) < frame);
+        }
+        if (!start) {
+            const int id = addMarker(Marker::TrackStart, g.getEnd());
+            if (auto* mk = findMarker(id))
+                if (auto* r = findRegion(mk->attachedRegion)) mk->text.title = r->name.toStdString();
+            ++added;
+        }
+        if (!pause && g.getStart() > 1e-6) { addMarker(Marker::PauseStart, g.getStart()); ++added; }
+    }
+    return added;
+}
+
+int Session::autoIsrc(const juce::String& first) {
+    const auto base = juce::String(cd::normaliseIsrc(first.toStdString()));
+    if (base.length() != 12) return 0;
+    const auto prefix = base.substring(0, 7);
+    const int start = base.substring(7).getIntValue();
+    int n = 0;
+    sortMarkers();
+    for (auto& m : markers)
+        if (m.type == Marker::TrackStart) {
+            const int code = start + n;
+            if (code > 99999) break;
+            m.isrc = (prefix + juce::String(code).paddedLeft('0', 5)).toStdString();
+            ++n;
+        }
+    return n;
+}
+
+void Session::autoSpace(double gap) {
+    gap = juce::jmax(0.0, gap);
+    // Groups of joined regions on lane 0, in time order.
+    juce::Array<int> order;
+    for (int i = 0; i < regions.size(); ++i)
+        if (regions.getReference(i).lane == 0) order.add(i);
+    std::sort(order.begin(), order.end(), [this](int a, int b) { return regions.getReference(a).start < regions.getReference(b).start; });
+    if (order.isEmpty()) return;
+    double reach = regions.getReference(order[0]).end();
+    for (int k = 1; k < order.size(); ++k) {
+        const auto& r = regions.getReference(order[k]);
+        if (r.start <= reach + 1e-4) { reach = juce::jmax(reach, r.end()); continue; }
+        const double dt = (reach + gap) - r.start;
+        const double at = r.start;
+        if (std::abs(dt) > 1e-6) {
+            // Pause marks inside the old gap keep their distance from the end of the material before.
+            for (auto& m : markers)
+                if (m.type == Marker::PauseStart && m.t > reach - 1e-6 && m.t < at - 1e-6 && !markLocked(m)) m.t = juce::jmin(m.t, reach + gap);
+            ripple(at - 1e-6, dt);
+        }
+        reach = regions.getReference(order[k]).end();
+    }
+}
+
+bool Session::moveTrack(int from, int to) {
+    // A reorder carries every mark with its track, locked or not.
+    const bool globalLock = lockMarks;
+    juce::Array<int> lockedIds;
+    for (auto& m : markers) if (m.locked) { lockedIds.add(m.id); m.locked = false; }
+    lockMarks = false;
+    const bool ok = moveTrackUnlocked(from, to);
+    lockMarks = globalLock;
+    for (auto& m : markers) if (lockedIds.contains(m.id)) m.locked = true;
+    return ok;
+}
+
+bool Session::moveTrackUnlocked(int from, int to) {
+    sortMarkers();
+    juce::Array<double> st;
+    for (auto& m : markers)
+        if (m.type == Marker::TrackStart) st.add(m.t);
+    const int n = st.size();
+    if (!juce::isPositiveAndBelow(from, n) || !juce::isPositiveAndBelow(to, n) || from == to) return false;
+    // Each track's content runs from its start to the next track's pause (or start); the gaps
+    // between tracks stay where they are, so the spacing of the album doesn't change.
+    const double total = end();
+    juce::Array<double> contentEnd, gap;
+    juce::Array<bool> pauseBefore;   // pauseBefore[k]: track k has a pause mark in front of it
+    pauseBefore.add(false);
+    for (int k = 0; k < n; ++k) {
+        double ce = k + 1 < n ? st[k + 1] : juce::jmax(total, st[k]);
+        bool pause = false;
+        if (k + 1 < n)
+            for (auto& m : markers)
+                if (m.type == Marker::PauseStart && m.t > st[k] && m.t < st[k + 1]) { ce = juce::jmin(ce, m.t); pause = true; }
+        contentEnd.add(ce);
+        if (k + 1 < n) { gap.add(st[k + 1] - ce); pauseBefore.add(pause); }
+    }
+    juce::Array<int> all;
+    for (int l = 0; l < lanes; ++l) all.add(l);
+    std::vector<Clip> clips;
+    std::vector<juce::Array<Marker>> marks;
+    marks.resize(size_t(n));
+    for (int k = 0; k < n; ++k) {
+        clips.push_back(copyRange(st[k], contentEnd[k], all));
+        for (auto& m : markers)
+            if (m.type != Marker::EndOfDisc && m.type != Marker::PauseStart && m.t >= st[k] - kEps && m.t < contentEnd[k] - kEps) {
+                Marker x = m;
+                x.t -= st[k];
+                marks[size_t(k)].add(x);
+            }
+    }
+    juce::Array<int> order;
+    for (int k = 0; k < n; ++k) order.add(k);
+    order.remove(from);
+    order.insert(to, from);
+    // Lay the programme out again from track 1's start.
+    clearRange(st[0], juce::jmax(total, contentEnd[n - 1]) + 1.0, all, false);
+    for (int k = markers.size(); --k >= 0;)
+        if (markers.getReference(k).type != Marker::EndOfDisc && markers.getReference(k).t >= st[0] - kEps) markers.remove(k);
+    double cursor = st[0];
+    for (int j = 0; j < n; ++j) {
+        const int k = order[j];
+        auto ids = paste(clips[size_t(k)], all, cursor, PasteMode::Overlay);
+        for (auto x : marks[size_t(k)]) {
+            x.t += cursor;
+            x.attachedRegion = 0;
+            for (int id : ids)
+                if (auto* r = findRegion(id); r && x.t >= r->start - kEps && x.t < r->end()) { x.attachedRegion = id; break; }
+            markers.add(x);
+        }
+        cursor += contentEnd[k] - st[k];
+        if (j + 1 < n) {
+            if (pauseBefore[j + 1]) {
+                Marker pm;
+                pm.id = nextId++;
+                pm.type = Marker::PauseStart;
+                pm.t = cursor;
+                if (!ids.isEmpty()) pm.attachedRegion = ids.getLast();
+                markers.add(pm);
+            }
+            cursor += gap[j];
+        }
+    }
+    sortMarkers();
+    return true;
+}
+
 cd::Disc Session::toDisc(juce::StringArray* adj) const {
     Session s = *this;
     s.sortMarkers();
-    cd::Disc d = buildDisc(s.markers, end(), pqOffsetFrames, adj);
+    int track = 0;
+    for (auto& m : s.markers)
+        if (m.type == Marker::TrackStart) m.offsetFrames = effectiveStartOffset(m, track++ == 0);
+    cd::Disc d = buildDisc(s.markers, end(), pqOffsetsOn ? pqEndFrames : 0, pqOffsetsOn ? pqMinIndexFrames : 0, adj);
     d.upcEan = upcEan.retainCharacters("0123456789").toStdString();
     d.masterId = (masterId.isNotEmpty() ? masterId : catalogue).toStdString();
     d.text.title = discTitle.toStdString();
@@ -746,7 +962,16 @@ cd::Disc Session::toDiscForUnit(const Unit& u, int unitNumber, int unitCount, do
     lead = std::ceil(lead * cd::kFramesPerSecond - 1e-9) / cd::kFramesPerSecond;
     for (auto& m : inside) m.t = m.t - u.start + lead;
 
-    cd::Disc d = buildDisc(inside, u.length() + lead, pqOffsetFrames, notes);
+    {
+        int track = 0;
+        for (auto& m : inside)
+            if (m.type == Marker::TrackStart) {
+                Marker orig = m;
+                orig.t = m.t - lead + u.start;   // splice test in timeline time
+                m.offsetFrames = effectiveStartOffset(orig, track++ == 0);
+            }
+    }
+    cd::Disc d = buildDisc(inside, u.length() + lead, pqOffsetsOn ? pqEndFrames : 0, pqOffsetsOn ? pqMinIndexFrames : 0, notes);
     d.upcEan = upcEan.retainCharacters("0123456789").toStdString();
     auto id = masterId.isNotEmpty() ? masterId : catalogue;
     if (unitCount > 1 && id.isNotEmpty()) id << "-D" << unitNumber;
@@ -899,6 +1124,8 @@ juce::var Session::toVar() const {
         if (!m.publisher.empty()) o->setProperty("publisher", juce::String::fromUTF8(m.publisher.c_str()));
         if (!m.pro.empty()) o->setProperty("pro", juce::String::fromUTF8(m.pro.c_str()));
         if (m.explicitContent) o->setProperty("explicit", true);
+        if (!m.offsetDefault) { o->setProperty("offsetDefault", false); o->setProperty("offset", m.offsetFrames); }
+        if (m.locked) o->setProperty("locked", true);
         ml.add(o);
     }
     root->setProperty("markers", ml);
@@ -926,6 +1153,13 @@ juce::var Session::toVar() const {
     meta->setProperty("cdTextDiscId", cdTextDiscId);
     meta->setProperty("cdTextGenre", cdTextGenre);
     meta->setProperty("pqOffsetFrames", pqOffsetFrames);
+    meta->setProperty("pqTrack1Frames", pqTrack1Frames);
+    meta->setProperty("pqSpliceFrames", pqSpliceFrames);
+    meta->setProperty("pqEndFrames", pqEndFrames);
+    meta->setProperty("pqMinIndexFrames", pqMinIndexFrames);
+    meta->setProperty("pqOffsetsOn", pqOffsetsOn);
+    meta->setProperty("lockMarks", lockMarks);
+    meta->setProperty("autoSpaceGap", autoSpaceGap);
     meta->setProperty("htoa", htoa);
     root->setProperty("release", meta);
     juce::Array<juce::var> pl;
@@ -1089,6 +1323,13 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
         cdTextDiscId = meta["cdTextDiscId"].toString();
         cdTextGenre = juce::jlimit(0, cd::kGenreCount - 1, int(meta["cdTextGenre"]));
         pqOffsetFrames = juce::jlimit(0, 75, int(meta["pqOffsetFrames"]));
+        pqTrack1Frames = juce::jlimit(-1, 75, int(meta.getProperty("pqTrack1Frames", -1)));
+        pqSpliceFrames = juce::jlimit(-1, 75, int(meta.getProperty("pqSpliceFrames", -1)));
+        pqEndFrames = juce::jlimit(0, 150, int(meta.getProperty("pqEndFrames", 0)));
+        pqMinIndexFrames = juce::jlimit(0, 75 * 60, int(meta.getProperty("pqMinIndexFrames", 0)));
+        pqOffsetsOn = bool(meta.getProperty("pqOffsetsOn", true));
+        lockMarks = bool(meta.getProperty("lockMarks", false));
+        autoSpaceGap = juce::jlimit(0.0, 60.0, double(meta.getProperty("autoSpaceGap", 2.0)));
         htoa = bool(meta["htoa"]);
     }
     products.clear();
@@ -1132,6 +1373,9 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             m.publisher = o["publisher"].toString().toStdString();
             m.pro = o["pro"].toString().toStdString();
             m.explicitContent = bool(o["explicit"]);
+            m.offsetFrames = int(o.getProperty("offset", 0));
+            m.offsetDefault = bool(o.getProperty("offsetDefault", true));
+            m.locked = bool(o.getProperty("locked", false));
             nextId = juce::jmax(nextId, m.id + 1);
             markers.add(m);
         }

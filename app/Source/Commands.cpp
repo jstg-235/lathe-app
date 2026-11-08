@@ -107,6 +107,12 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::addIndexMarker, "Add Index Marker", "Markers", "New sub-index in the current track at the playhead", "shift + M"},
         {cmd::addPauseMarker, "Add Pause Marker", "Markers", "Start of the pause (index 00) before the next track", "P"},
         {cmd::addEndMarker, "Add End-of-Disc Marker", "Markers", "Set the lead-out (end of programme) at the playhead", "E"},
+        {cmd::markInfo, "Mark Info...", "Markers", "Every track: PQ offsets, per-track offset and lock, titles, ISRCs; drag to reorder tracks with their audio", "command + M"},
+        {cmd::segmentsToMarks, "Segments to Start Marks", "Markers", "A track start at the beginning of every region on lane 1 that doesn't have one", ""},
+        {cmd::editedBlackToMarks, "Edited Black to Marks", "Markers", "A track end and the next track's start around every gap between regions", "shift + F12"},
+        {cmd::analogBlackToMarks, "Analog Black to Marks...", "Markers", "Find silence inside the audio and mark tracks around it", ""},
+        {cmd::autoSpace, "AutoSpace Tracks", "Markers", "Make every gap between tracks the same (Mark Info sets the gap); marks move with their audio", ""},
+        {cmd::lockAllMarks, "Lock All Marks", "Markers", "Every mark keeps its time when audio is moved, rippled or edited", ""},
         {cmd::addSrp, "Add SRP", "Markers", "Drop a reference point (not a PQ mark) at the playhead / Edit Point on the active timeline", "S"},
         {cmd::addSrpText, "Add SRP with Text...", "Markers", "Drop a reference point and name it", "shift + S"},
         {cmd::srpsFromSelection, "SRPs from Selection", "Markers", "SRPs at the In and Out (or the selected region's edges)", "option + S"},
@@ -214,6 +220,7 @@ const std::vector<std::pair<juce::CommandID, const char*>>& legacyKeys() {
         {cmd::zoomSelection, "command + G"}, {cmd::zoomFit, "command + E"},
         // CD prep
         {cmd::addTrackMarker, "F9"}, {cmd::addPauseMarker, "F10"}, {cmd::addIndexMarker, "F11"},
+        {cmd::markInfo, "command + M"}, {cmd::editedBlackToMarks, "shift + F12"},
         // System
         {cmd::audioSetup, "option + A;command + ,"},
         {cmd::nudgeSizeA, "control + 1"}, {cmd::nudgeSizeB, "control + 2"}, {cmd::nudgeSizeC, "control + 3"},

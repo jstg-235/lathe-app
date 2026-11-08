@@ -49,6 +49,8 @@ enum : juce::CommandID {
     // Edit Fade library recall (Option-0 to Option-9)
     fadeRecall0 = 0x1280, fadeRecall1, fadeRecall2, fadeRecall3, fadeRecall4, fadeRecall5, fadeRecall6, fadeRecall7, fadeRecall8, fadeRecall9,
     defaultFadeOnEdits,
+    // PQ tools
+    markInfo = 0x1440, segmentsToMarks, editedBlackToMarks, analogBlackToMarks, autoSpace, lockAllMarks,
 };
 }  // namespace cmd
 

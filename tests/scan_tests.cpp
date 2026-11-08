@@ -3,6 +3,9 @@
 // "plugins" are named for what they do; this test binary doubles as the scan helper.
 #include "../app/Source/PluginScan.h"
 
+#if JUCE_MAC
+#include <CoreFoundation/CoreFoundation.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
@@ -14,7 +17,9 @@ namespace {
 
 class FakeFormat : public juce::AudioPluginFormat {
 public:
-    juce::String getName() const override { return "LatheTest"; }
+    explicit FakeFormat(juce::String name = "LatheTest", juce::StringArray items = {"good-one", "crash-me", "good-two", "hang-me", "abort-me", "good-three"})
+        : name_(std::move(name)), items_(std::move(items)) {}
+    juce::String getName() const override { return name_; }
     void findAllTypesForFile(juce::OwnedArray<juce::PluginDescription>& out, const juce::String& id) override {
         if (id.contains("crash")) { volatile int* p = nullptr; *p = 42; }        // segfault, like a broken plugin
         if (id.contains("abort")) std::abort();
@@ -34,12 +39,14 @@ public:
     bool canScanForPlugins() const override { return true; }
     bool isTrivialToScan() const override { return false; }
     juce::StringArray searchPathsForPlugins(const juce::FileSearchPath&, bool, bool) override {
-        return {"good-one", "crash-me", "good-two", "hang-me", "abort-me", "good-three"};
+        return items_;
     }
     juce::FileSearchPath getDefaultLocationsToSearch() override { return {}; }
     bool requiresUnblockedMessageThreadDuringCreation(const juce::PluginDescription&) const override { return false; }
 private:
     void createPluginInstance(const juce::PluginDescription&, double, int, PluginCreationCallback cb) override { cb(nullptr, "fake"); }
+    juce::String name_;
+    juce::StringArray items_;
 };
 
 }  // namespace
@@ -54,17 +61,23 @@ int main(int argc, char** argv) {
     if (lathe::scan::isWorkerCommandLine(cmd)) {
         auto w = lathe::scan::startWorkerIfRequested(cmd, [](juce::AudioPluginFormatManager& f) { f.addFormat(new FakeFormat()); });
         if (!w) return 2;
+#if JUCE_MAC
+        // Pump the main run loop directly (a console process has no running NSApplication).
+        for (;;) CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+#else
         juce::MessageManager::getInstance()->runDispatchLoop();
+#endif
         return 0;
     }
 
-    // Smoke test with another helper binary (e.g. the Lathe app): `lathe_scan_tests --helper <exe>`.
-    // It doesn't know the fake format, so every item should come back empty, none skipped.
+    // Smoke test with another helper binary (the Lathe app): `lathe_scan_tests --helper <exe>`.
+    // Asks it to scan VST3 bundles that don't exist: each request goes through the helper's real
+    // VST3 format on its message thread and must come back empty, quickly, none skipped.
     if (args.size() == 2 && args[0] == "--helper") {
         std::thread t([&] {
             juce::KnownPluginList list;
-            list.setCustomScanner(lathe::scan::makeOutOfProcessScanner(10000, juce::File(args[1])));
-            FakeFormat format;
+            list.setCustomScanner(lathe::scan::makeOutOfProcessScanner(15000, juce::File(args[1])));
+            FakeFormat format("VST3", {"/nonexistent/One.vst3", "/nonexistent/Two.vst3", "/nonexistent/Three.vst3"});
             juce::PluginDirectoryScanner scanner(list, format, {}, true, {});
             juce::String name;
             int n = 0;
