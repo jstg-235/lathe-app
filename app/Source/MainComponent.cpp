@@ -473,13 +473,14 @@ void MainComponent::resized() {
     recordBtn_.setBounds(transport.removeFromLeft(50).reduced(0, 3));
     transport.removeFromLeft(10);
     timeDisplay_.setBounds(transport.removeFromLeft(150));
-    trackDisplay_.setBounds(transport.removeFromLeft(170));
+    // Buttons first; the track readout takes what is left.
     for (auto* b : {&zoomFit_, &zoomIn_, &zoomOut_}) { b->setBounds(transport.removeFromRight(b == &zoomFit_ ? 40 : 28).reduced(0, 3)); transport.removeFromRight(3); }
     transport.removeFromRight(6);
     for (auto* b : {&xfadeBtn_, &lanesBtn_, &snapBtn_, &envBtn_, &splitBtn_, &pauseMk_, &indexMk_, &trackMk_}) {
-        b->setBounds(transport.removeFromRight(b == &xfadeBtn_ ? 86 : 64).reduced(0, 3));
+        b->setBounds(transport.removeFromRight(b == &xfadeBtn_ ? 80 : 60).reduced(0, 3));
         transport.removeFromRight(3);
     }
+    trackDisplay_.setBounds(transport.removeFromLeft(juce::jmin(170, transport.getWidth())));
     abDisplay_.setBounds(transport.removeFromLeft(juce::jmin(260, transport.getWidth() / 2)));
     selDisplay_.setBounds(transport.removeFromLeft(transport.getWidth() / 2));
     rateWarning_.setBounds(transport);

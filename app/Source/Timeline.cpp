@@ -467,7 +467,7 @@ void Timeline::paint(juce::Graphics& g) {
 
     if (s_.regions.isEmpty()) {
         g.setColour(colours::dim);
-        g.drawText(role_ == Role::Source ? "Source: open or drop takes and mixes here, mark In / Out, then Insert, Replace or Overwrite into the destination"
+        g.drawText(role_ == Role::Source ? "Source: open or drop takes and mixes here, mark In / Out, then Insert or Replace into the destination below"
                                          : "Drag audio files here, open them in the Source window, or use Import",
                    getLocalBounds().withTrimmedTop(top()), juce::Justification::centred);
     }
