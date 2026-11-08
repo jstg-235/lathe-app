@@ -431,6 +431,7 @@ int main() {
         CHECK(presetKeys(1, *findCommand(cmd::playAroundEdit)).isEmpty());
         CHECK(presetKeys(1, *findCommand(cmd::analyse)) == juce::StringArray{"command + shift + A"});   // untouched
         if (auto* out = std::getenv("LATHE_KEYGUIDE_OUT")) juce::File(out).replaceWithText(keyGuideHtml(nullptr));
+        if (auto* out = std::getenv("LATHE_KEYGUIDE_LEGACY_OUT")) juce::File(out).replaceWithText(keyGuideHtmlForPreset(1));
     }
 
 

@@ -297,8 +297,14 @@ static juce::String macLabel(const juce::KeyPress& k) {
     return s + key;
 }
 
+static int guidePreset = 0;   // which preset a guide without live keys shows
+
 static juce::StringArray keysFor(const CommandDef& d, const juce::KeyPressMappingSet* keys) {
     juce::StringArray out;
+    if (!keys && guidePreset != 0) {
+        for (auto& s : presetKeys(guidePreset, d)) out.add(macLabel(juce::KeyPress::createFromDescription(s)));
+        return out;
+    }
     if (keys) {
         for (auto& k : keys->getKeyPressesAssignedToCommand(d.id)) out.add(macLabel(k));
     } else {
@@ -327,6 +333,14 @@ juce::String keyGuideText(const juce::KeyPressMappingSet* keys) {
         }
     }
     return s;
+}
+
+juce::String keyGuideHtmlForPreset(int preset) {
+    guidePreset = preset;
+    auto h = keyGuideHtml(nullptr);
+    guidePreset = 0;
+    if (preset == 1) h = h.replace("Default assignments", "The Legacy preset (Help &rsaquo; Key Preset: Legacy)");
+    return h;
 }
 
 juce::String keyGuideHtml(const juce::KeyPressMappingSet* keys) {

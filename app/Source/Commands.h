@@ -85,5 +85,6 @@ juce::String canonicalKey(const juce::String& description);
 // The key command guide as text or HTML. With `keys` null, shows the defaults.
 juce::String keyGuideText(const juce::KeyPressMappingSet* keys);
 juce::String keyGuideHtml(const juce::KeyPressMappingSet* keys);
+juce::String keyGuideHtmlForPreset(int preset);   // 0 Lathe, 1 Legacy
 
 }  // namespace lathe

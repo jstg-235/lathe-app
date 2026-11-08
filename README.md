@@ -42,10 +42,38 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
   PQ offset, hidden track one audio) and Track Credits (writers, arranger, publisher, PRO, explicit).
   CD-Text now includes packs 0x86 (disc ID), 0x87 (genre) and 0x8E (UPC/ISRC).
 
+## Editing, PQ and assembly (v0.9)
+
+- **Two timelines**: a source timeline above the destination, each with its own zoom, In / Out,
+  Edit Point and lane targets (D / S / N). Play either, or link them and switch which you hear
+  with Tab. Edits: Insert, Replace, Replace Left, Replace Constrained, Fit (4-point), Overlay,
+  Append, with 3-point rules from either side. Cut / Copy / Paste with the same modes.
+- **Edit Point** separate from the playhead; Play to / from In and Out with pre- and post-roll
+  (F5-F8), Play Through Edit Point, repeat play, Find / Clear / nudge (A / B / C) / Move points,
+  Move In to Out, SRPs (named reference points, lockable).
+- **Edit Fade**: outgoing, incoming and the rendered result; Lock Sound, ripple / ripple until
+  black; per-fade shape, length, offset, and a Custom shape set by dB down and alpha; Power Lock,
+  Align Fades; per-side edit point and slip nudges with auto-audition; a ten-slot fade library
+  (Option-0 to 9), slot 0 being the default crossfade put on every new edit.
+- **PQ**: start, track 1, on-an-edit and end offsets, minimum index width, per-track offset;
+  Mark Info (reorder tracks with their audio by dragging, lock, ISRC numbering); Segments to
+  Marks, Edited Black and Analog Black to Marks; AutoSpace; warning for audio before track 1.
+- **Assembly**: Shift-drag inserts, Command-drag replaces, snap to gap; track bar to reorder;
+  Text View of every segment; Segment Gain (set, change, normalize, polarity).
+- **Timeline gain**: nodes over the whole programme, 1 dB steps (0.1 dB with Option), groups,
+  locks, bypass. Lock All Marks and Lock All Gain are global settings.
+- **Lanes**: mono, stereo or 5.1. A 5.1 programme plays on six outputs and exports as a
+  six-channel WAV; CD, DDP and vinyl stay stereo. Export Selected Segments writes any segment
+  or In-Out as its own file.
+- **Key presets**: Lathe (default) and Legacy (function-key transport, [ ] for In / Out, F9-F11
+  marks), under Help > Key Preset or in Edit Key Commands.
+
 ## Stability by design
 
 - Audio is streamed from disk on a background thread; the audio callback never touches the disk.
-- The plugin scanner remembers a plugin that crashes it and skips it next time.
+- Plugins are scanned in a separate helper process: a plugin that crashes or hangs only takes
+  the helper down, is skipped, and the scan carries on. Plugins can be switched off in the
+  Plugin Manager.
 - Sessions save atomically (write-then-swap). An automatic backup is written every minute, and
   after a crash Lathe offers to restore it.
 - 200 levels of undo (Cmd-Z / Cmd-Shift-Z).
