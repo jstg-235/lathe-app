@@ -45,6 +45,7 @@ private:
     juce::Array<Region> regions_;
     juce::Array<EffectiveFades> fades_;
     juce::Array<juce::int64> starts_, ends_;
+    juce::Array<GainNode> gain_;   // timeline gain (empty = none)
     std::vector<std::unique_ptr<ClipStream>> streams_;
     double rate_ = 44100;
     juce::int64 pos_ = 0, total_ = 0;

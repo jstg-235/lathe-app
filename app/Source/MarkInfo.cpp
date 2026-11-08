@@ -87,7 +87,12 @@ MarkInfoPanel::MarkInfoPanel(Session& s) : s_(s) {
         addAndMakeVisible(*t);
     }
     offsetsOn_.onClick = [this] { if (!loading_) { s_.pqOffsetsOn = offsetsOn_.getToggleState(); commit(); } };
-    lockAll_.onClick = [this] { if (!loading_) { s_.lockMarks = lockAll_.getToggleState(); commit(); } };
+    lockAll_.onClick = [this] {
+        if (loading_) return;
+        if (onLockAll) { onLockAll(); refresh(); return; }
+        s_.lockMarks = lockAll_.getToggleState();
+        commit();
+    };
     lockAll_.setTooltip("Every mark keeps its time when audio is moved, rippled or edited");
     isrc_.setColour(juce::TextEditor::backgroundColourId, colours::bg);
     isrc_.setColour(juce::TextEditor::textColourId, colours::text);

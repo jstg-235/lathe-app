@@ -125,6 +125,8 @@ void ProgramRenderer::setSession(const Session& s, double targetRate, bool offli
         fades_.add(s.fadesFor(i));
     }
     rate_ = targetRate;
+    gain_.clear();
+    if (s.gainActive()) gain_ = s.gainNodes;
     starts_.clear();
     ends_.clear();
     for (auto& r : regions_) {
@@ -170,6 +172,25 @@ bool ProgramRenderer::renderT(juce::AudioBuffer<T>& out, int start, int n) {
         int offset = int(from - a);
         int len = int(juce::jmin(b, ends_[i]) - from);
         if (out.getNumChannels() >= 2 && len > 0) st->addTo(out, start + offset, len);
+    }
+    if (!gain_.isEmpty()) {
+        // Timeline gain, straight lines in dB between nodes.
+        int k = 0;
+        for (int i = 0; i < n; ++i) {
+            const double t = double(a + i) / rate_;
+            double db;
+            if (t <= gain_.getFirst().t) db = gain_.getFirst().db;
+            else if (t >= gain_.getLast().t) db = gain_.getLast().db;
+            else {
+                while (k + 1 < gain_.size() && gain_.getReference(k + 1).t < t) ++k;
+                const auto& x = gain_.getReference(k);
+                const auto& y = gain_.getReference(juce::jmin(k + 1, gain_.size() - 1));
+                db = y.t > x.t ? x.db + (y.db - x.db) * (t - x.t) / (y.t - x.t) : y.db;
+            }
+            if (db == 0.0) continue;
+            const T g = T(std::pow(10.0, db / 20.0));
+            for (int ch = 0; ch < out.getNumChannels(); ++ch) out.getWritePointer(ch)[start + i] *= g;
+        }
     }
     pos_ = b;
     return ok;

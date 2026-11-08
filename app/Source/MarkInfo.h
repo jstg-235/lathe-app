@@ -19,7 +19,7 @@ public:
     explicit MarkInfoPanel(Session& s);
     std::function<void()> onChange;                 // commit (undo + reload)
     std::function<void(double)> onPlay;             // play from a time
-    std::function<void()> onSegmentsToMarks, onEditedBlack, onAnalogBlack, onAutoSpace;
+    std::function<void()> onSegmentsToMarks, onEditedBlack, onAnalogBlack, onAutoSpace, onLockAll;
     void refresh();
 
     void resized() override;

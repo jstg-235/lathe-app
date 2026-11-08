@@ -53,6 +53,8 @@ enum : juce::CommandID {
     markInfo = 0x1440, segmentsToMarks, editedBlackToMarks, analogBlackToMarks, autoSpace, lockAllMarks,
     // Assembly
     textView = 0x1460, segmentGain,
+    // Timeline gain
+    gainOverlay = 0x1480, gainBypass, lockAllGain, clearGain,
 };
 }  // namespace cmd
 

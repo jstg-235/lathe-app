@@ -1095,6 +1095,63 @@ int main() {
             CHECK(back.fromVar(juce::JSON::parse(juce::JSON::toString(inv.toVar())), err) && back.regions[0].invert);
         }
     }
+    // ---- Timeline gain ----
+    {
+        auto x = makeTone(dir, "tg.wav", 44100, 10.0, 400, 0.5f);
+        Session g;
+        g.lanes = 1;
+        Region r = regionFor(g, fm, x); r.start = 0; g.regions.add(r);
+        g.addGainNode(2.0, 0.0);
+        g.addGainNode(4.0, -6.0);
+        const int locked = g.addGainNode(8.0, -6.0);
+        NEAR(g.timelineGainDb(1.0), 0.0, 1e-12);
+        NEAR(g.timelineGainDb(3.0), -3.0, 1e-12);   // straight line in dB
+        NEAR(g.timelineGainDb(9.0), -6.0, 1e-12);
+        auto level = [&](const Session& ss, double t0) {
+            ProgramRenderer pr(fm);
+            pr.setSession(ss, 44100);
+            juce::AudioBuffer<float> buf(2, 2205);
+            pr.seek(juce::int64(t0 * 44100));
+            pr.render(buf, 0, 2205);
+            return 20 * std::log10(rms(buf, 0, 2205) / (0.5 / std::sqrt(2.0)));
+        };
+        NEAR(level(g, 0.5), 0.0, 0.02);
+        NEAR(level(g, 5.0), -6.0, 0.02);
+        NEAR(level(g, 2.975), -3.0, 0.1);
+        g.gainBypass = true;
+        NEAR(level(g, 5.0), 0.0, 0.02);
+        g.gainBypass = false;
+        // Ripple moves unlocked nodes; locked and globally locked ones stay.
+        g.findGainNode(locked)->locked = true;
+        g.ripple(3.0, 1.0);
+        NEAR(g.gainNodes[1].t, 5.0, 1e-9);
+        NEAR(g.findGainNode(locked)->t, 8.0, 1e-9);
+        g.lockGain = true;
+        g.ripple(3.0, 1.0);
+        NEAR(g.gainNodes[1].t, 5.0, 1e-9);
+        juce::String err;
+        Session back;
+        CHECK(back.fromVar(juce::JSON::parse(juce::JSON::toString(g.toVar())), err));
+        CHECK(back.gainNodes.size() == 3 && back.lockGain && back.gainNodes[2].locked && std::abs(back.gainNodes[1].db + 6.0) < 1e-12);
+        // With no nodes, the render is untouched (bit-for-bit).
+        Session plain;
+        plain.lanes = 1;
+        plain.regions.add(r);
+        ProgramRenderer pa(fm);
+        pa.setSession(plain, 44100);
+        juce::AudioBuffer<double> b1(2, 1000);
+        pa.seek(44100);
+        pa.render(b1, 0, 1000);
+        plain.addGainNode(1.0, 0.0);   // a flat 0 dB node changes nothing either
+        ProgramRenderer pb(fm);
+        pb.setSession(plain, 44100);
+        juce::AudioBuffer<double> b2(2, 1000);
+        pb.seek(44100);
+        pb.render(b2, 0, 1000);
+        int diff = 0;
+        for (int i = 0; i < 1000; ++i) diff += b1.getSample(0, i) != b2.getSample(0, i);
+        CHECK(diff == 0);
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

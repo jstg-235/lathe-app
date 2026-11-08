@@ -272,8 +272,11 @@ void Session::ripple(double t, double dt, int except, const juce::Array<int>* on
         if (m.t >= t - kEps && (except == 0 || m.attachedRegion != except) && !markLocked(m)) m.t = juce::jmax(0.0, m.t + dt);
     for (auto& p : srps)
         if (!p.locked && p.t >= t - kEps) p.t = juce::jmax(0.0, p.t + dt);
+    for (auto& n : gainNodes)
+        if (!gainLocked(n) && n.t >= t - kEps) n.t = juce::jmax(0.0, n.t + dt);
     sortMarkers();
     sortSrps();
+    sortGainNodes();
 }
 
 juce::String pasteModeName(PasteMode m) {
@@ -440,6 +443,43 @@ juce::Array<int> Session::paste(const Clip& c, const juce::Array<int>& laneList,
         ids.add(r.id);
     }
     return ids;
+}
+
+double Session::timelineGainDb(double t) const {
+    if (!gainActive()) return 0.0;
+    if (t <= gainNodes.getFirst().t) return gainNodes.getFirst().db;
+    if (t >= gainNodes.getLast().t) return gainNodes.getLast().db;
+    for (int i = 1; i < gainNodes.size(); ++i) {
+        const auto& a = gainNodes.getReference(i - 1);
+        const auto& b = gainNodes.getReference(i);
+        if (t <= b.t) return b.t > a.t ? a.db + (b.db - a.db) * (t - a.t) / (b.t - a.t) : b.db;
+    }
+    return gainNodes.getLast().db;
+}
+
+int Session::addGainNode(double t, double db) {
+    GainNode n;
+    n.id = nextId++;
+    n.t = juce::jmax(0.0, t);
+    n.db = juce::jlimit(-60.0, 24.0, db);
+    gainNodes.add(n);
+    sortGainNodes();
+    return n.id;
+}
+
+GainNode* Session::findGainNode(int id) {
+    for (auto& n : gainNodes)
+        if (n.id == id) return &n;
+    return nullptr;
+}
+
+void Session::removeGainNode(int id) {
+    for (int i = gainNodes.size(); --i >= 0;)
+        if (gainNodes.getReference(i).id == id) gainNodes.remove(i);
+}
+
+void Session::sortGainNodes() {
+    std::stable_sort(gainNodes.begin(), gainNodes.end(), [](const GainNode& a, const GainNode& b) { return a.t < b.t; });
 }
 
 int Session::addSrp(double t, const juce::String& text) {
@@ -1220,6 +1260,11 @@ juce::var Session::toVar() const {
         sl.add(o);
     }
     root->setProperty("srps", sl);
+    juce::Array<juce::var> gl;
+    for (auto& n : gainNodes) gl.add(juce::Array<juce::var>{n.id, n.t, n.db, n.group, n.locked});
+    root->setProperty("gainNodes", gl);
+    root->setProperty("gainBypass", gainBypass);
+    root->setProperty("lockGain", lockGain);
     juce::Array<juce::var> off;
     for (int l : lanesOff) off.add(l);
     root->setProperty("lanesOff", off);
@@ -1242,6 +1287,8 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     regions.clear();
     markers.clear();
     srps.clear();
+    gainNodes.clear();
+    gainBypass = lockGain = false;
     lanesOff.clear();
     sourceDoc = juce::var();
     nextId = 1;
@@ -1423,6 +1470,21 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             srps.add(p);
         }
     sortSrps();
+    if (auto* arr = v["gainNodes"].getArray())
+        for (auto& o : *arr)
+            if (auto* a = o.getArray(); a && a->size() >= 5) {
+                GainNode n;
+                n.id = int((*a)[0]);
+                n.t = double((*a)[1]);
+                n.db = double((*a)[2]);
+                n.group = int((*a)[3]);
+                n.locked = bool((*a)[4]);
+                nextId = juce::jmax(nextId, n.id + 1);
+                gainNodes.add(n);
+            }
+    sortGainNodes();
+    gainBypass = bool(v.getProperty("gainBypass", false));
+    lockGain = bool(v.getProperty("lockGain", false));
     if (auto* arr = v["lanesOff"].getArray())
         for (auto& l : *arr) lanesOff.addIfNotAlreadyThere(int(l));
     sourceDoc = v["source"];

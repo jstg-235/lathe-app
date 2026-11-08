@@ -196,7 +196,7 @@ MainComponent::MainComponent() {
         chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectMultipleItems,
                               [this](const juce::FileChooser& fc) { importFiles(fc.getResults()); });
     };
-    envBtn_.onClick = [this] { timeline_.setEnvelopeMode(envBtn_.getToggleState()); };
+    envBtn_.onClick = [this] { timeline_.setEnvelopeMode(envBtn_.getToggleState()); commands_.commandStatusChanged(); };
     snapBtn_.onClick = [this] { timeline_.setSnap(snapBtn_.getToggleState()); };
     lanesBtn_.onClick = [this] {
         juce::PopupMenu m;
@@ -508,6 +508,9 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::followProjectRate: info.setTicked(followRate_); break;
         case cmd::repeatPlay: info.setTicked(repeat_); break;
         case cmd::lockAllMarks: info.setTicked(session_.lockMarks); break;
+        case cmd::gainOverlay: info.setTicked(activeTimeline().gainOverlay()); break;
+        case cmd::gainBypass: info.setTicked(activeSession().gainBypass); break;
+        case cmd::lockAllGain: info.setTicked(session_.lockGain); break;
         case cmd::defaultFadeOnEdits: info.setTicked(fadePrefs_.defaultOnEdits); break;
         case cmd::fadeRecall0: case cmd::fadeRecall1: case cmd::fadeRecall2: case cmd::fadeRecall3: case cmd::fadeRecall4:
         case cmd::fadeRecall5: case cmd::fadeRecall6: case cmd::fadeRecall7: case cmd::fadeRecall8: case cmd::fadeRecall9: {
@@ -679,6 +682,27 @@ bool MainComponent::perform(const InvocationInfo& info) {
             break;
         case cmd::playbackSettings: showPlaybackSettings(); break;
         case cmd::markInfo: showMarkInfo(); break;
+        case cmd::gainOverlay: {
+            const bool on = !activeTimeline().gainOverlay();
+            activeTimeline().setGainOverlay(on);
+            if (on) envBtn_.setToggleState(false, juce::dontSendNotification);
+            commands_.commandStatusChanged();
+            break;
+        }
+        case cmd::gainBypass: activeSession().gainBypass = !activeSession().gainBypass; sessionChanged(); commands_.commandStatusChanged(); break;
+        case cmd::lockAllGain:
+            session_.lockGain = srcSession_.lockGain = !session_.lockGain;
+            props_.getUserSettings()->setValue("lockGain", session_.lockGain);   // a global setting: every session
+            sessionChanged();
+            commands_.commandStatusChanged();
+            break;
+        case cmd::clearGain: {
+            auto& ss = activeSession();
+            for (int i = ss.gainNodes.size(); --i >= 0;)
+                if (!ss.gainLocked(ss.gainNodes.getReference(i))) ss.gainNodes.remove(i);
+            sessionChanged();
+            break;
+        }
         case cmd::textView: showTextView(); break;
         case cmd::segmentGain: {
             juce::Array<int> ids;
@@ -691,7 +715,12 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::editedBlackToMarks: if (session_.editedBlackToMarks() > 0) sessionChanged(); break;
         case cmd::analogBlackToMarks: runAnalogBlack(); break;
         case cmd::autoSpace: session_.autoSpace(session_.autoSpaceGap); sessionChanged(); break;
-        case cmd::lockAllMarks: session_.lockMarks = !session_.lockMarks; sessionChanged(); commands_.commandStatusChanged(); break;
+        case cmd::lockAllMarks:
+            session_.lockMarks = !session_.lockMarks;
+            props_.getUserSettings()->setValue("lockMarks", session_.lockMarks);   // a global setting: every session
+            sessionChanged();
+            commands_.commandStatusChanged();
+            break;
         case cmd::fadeRecall0: case cmd::fadeRecall1: case cmd::fadeRecall2: case cmd::fadeRecall3: case cmd::fadeRecall4:
         case cmd::fadeRecall5: case cmd::fadeRecall6: case cmd::fadeRecall7: case cmd::fadeRecall8: case cmd::fadeRecall9: {
             const int slot = int(info.commandID - cmd::fadeRecall0);
@@ -925,6 +954,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             add({cmd::zoomIn, cmd::zoomOut, cmd::zoomFit, cmd::zoomSelection, cmd::scrollLeft, cmd::scrollRight});
             m.addSeparator();
             add({cmd::toggleEnvelope, cmd::toggleSnap, cmd::crossfadeEditor, cmd::toggleLoudness});
+            m.addSeparator();
+            add({cmd::gainOverlay, cmd::gainBypass, cmd::lockAllGain, cmd::clearGain});
             break;
         case 5:
             add({cmd::releaseInfo, cmd::trackCredits});
@@ -2264,12 +2295,16 @@ void MainComponent::importFiles(const juce::Array<juce::File>& files) {
 
 void MainComponent::attachSource() {
     session_.source = &srcSession_;
+    // Global locks follow you into every session.
+    if (props_.getUserSettings()->getBoolValue("lockMarks", false)) session_.lockMarks = true;
+    if (props_.getUserSettings()->getBoolValue("lockGain", false)) session_.lockGain = true;
     juce::String err;
     if (!session_.sourceDoc.isObject() || !srcSession_.fromVar(session_.sourceDoc, err)) {
         srcSession_ = Session();
         srcSession_.lanes = 1;
     }
     srcSession_.source = nullptr;
+    srcSession_.lockGain = session_.lockGain;
     sourceView_.timeline().clearInOut();
     sourceView_.timeline().setEditPoint(0);
     timeline_.clearInOut();
@@ -3379,6 +3414,7 @@ void MainComponent::showMarkInfo() {
     panel->onEditedBlack = [this] { commands_.invokeDirectly(cmd::editedBlackToMarks, false); };
     panel->onAnalogBlack = [this] { runAnalogBlack(); };
     panel->onAutoSpace = [this] { commands_.invokeDirectly(cmd::autoSpace, false); };
+    panel->onLockAll = [this] { commands_.invokeDirectly(cmd::lockAllMarks, false); };
     markInfoPanel_ = panel;
     auto* w = new PlainWindow(panel, "Mark Info", false);
     w->onClose = [this] { juce::MessageManager::callAsync([this] { markInfoWindow_.reset(); }); };

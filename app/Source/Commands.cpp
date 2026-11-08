@@ -141,6 +141,10 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::fadeRecall8, "Recall Fade 8", "Edit Fade", "Apply library slot 8 to the edit nearest the Edit Point, or the one open in Edit Fade", "option + 8"},
         {cmd::fadeRecall9, "Recall Fade 9", "Edit Fade", "Apply library slot 9 to the edit nearest the Edit Point, or the one open in Edit Fade", "option + 9"},
         {cmd::defaultFadeOnEdits, "Crossfade New Edits", "Edit Fade", "Put the default crossfade (library slot 0) on every new edit, centred so nothing moves", ""},
+        {cmd::gainOverlay, "Timeline Gain Overlay", "View", "Draw and edit gain across the whole programme: click to add a node, drag (1 dB, Option 0.1 dB), Option-click to delete", "option + G"},
+        {cmd::gainBypass, "Bypass Timeline Gain", "View", "Hear the programme without the timeline gain (the nodes stay)", "option + shift + G"},
+        {cmd::lockAllGain, "Lock All Gain", "View", "Every timeline gain node stays put and can't be changed", ""},
+        {cmd::clearGain, "Clear Timeline Gain", "View", "Remove every timeline gain node (locked ones stay)", ""},
         {cmd::toggleLoudness, "Loudness Overlay", "View", "Show short-term loudness, track LUFS / true peak and problem flags on the timeline", "L"},
         // Tools
         {cmd::analyse, "Analyse Programme", "Tools", "Loudness map, per-track stats and problem scan (clips, overs, DC, phase, dropouts) of the master and the unprocessed mix", "command + shift + A"},
@@ -217,7 +221,7 @@ const std::vector<std::pair<juce::CommandID, const char*>>& legacyKeys() {
         {cmd::goToIn, "shift + F7"}, {cmd::goToOut, "shift + command + F7"},
         {cmd::nextSrp, "shift + F10"}, {cmd::prevSrp, "shift + command + F10"},
         // View
-        {cmd::toggleEnvelope, "option + G"}, {cmd::textView, "option + T"}, {cmd::scrollRight, "cursor right"}, {cmd::scrollLeft, "cursor left"},
+        {cmd::gainOverlay, "option + G"}, {cmd::textView, "option + T"}, {cmd::scrollRight, "cursor right"}, {cmd::scrollLeft, "cursor left"},
         {cmd::zoomIn, "cursor down;command + =;command + +"}, {cmd::zoomOut, "cursor up;command + -"},
         {cmd::zoomSelection, "command + G"}, {cmd::zoomFit, "command + E"},
         // CD prep

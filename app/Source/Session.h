@@ -117,6 +117,15 @@ struct Srp {
     bool locked = false;
 };
 
+// Timeline gain: nodes on the whole programme (after the lanes are mixed, before the master
+// chain), joined by straight lines in dB. Nodes in one group move together; locked ones stay.
+struct GainNode {
+    int id = 0;
+    double t = 0, db = 0;
+    int group = 0;   // 0 = none
+    bool locked = false;
+};
+
 // A piece of a timeline copied for pasting (also how source material reaches the destination).
 // Region starts are relative to the clip start; lanes are relative to the first copied lane.
 struct Clip {
@@ -176,6 +185,9 @@ public:
     bool htoa = false;            // hidden track one audio: audio before track 1 index 01 is intended
     juce::Array<Product> products;
     juce::Array<Srp> srps;
+    juce::Array<GainNode> gainNodes;
+    bool gainBypass = false;
+    bool lockGain = false;        // global: every gain node stays put and can't be changed
     juce::Array<int> lanesOff;    // lanes set to None: edits, pastes and ripples leave them alone
     // The source timeline (the material edits are taken from) is a session of its own, saved
     // inside this one. `source` points at the live one; `sourceDoc` is what was last read from file.
@@ -221,6 +233,15 @@ public:
     // destination Out point (ReplaceLeft ends there; Constrained fills `at`..destOut). Returns
     // the new region ids.
     juce::Array<int> paste(const Clip& c, const juce::Array<int>& lanes, double at, PasteMode mode, double destOut = -1);
+
+    // ---- Timeline gain ----
+    double timelineGainDb(double t) const;   // 0 with no nodes or when bypassed
+    bool gainActive() const { return !gainNodes.isEmpty() && !gainBypass; }
+    bool gainLocked(const GainNode& n) const { return lockGain || n.locked; }
+    int addGainNode(double t, double db);
+    GainNode* findGainNode(int id);
+    void removeGainNode(int id);
+    void sortGainNodes();
 
     // ---- SRPs ----
     int addSrp(double t, const juce::String& text = {});

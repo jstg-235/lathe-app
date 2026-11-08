@@ -80,7 +80,11 @@ public:
     int selectedLane() const { return selLane_; }
     int selectedMarker() const { return selMarker_; }
     void selectMarker(int id) { selMarker_ = id; repaint(); }
-    void setEnvelopeMode(bool on) { envelopeMode_ = on; repaint(); }
+    void setEnvelopeMode(bool on) { envelopeMode_ = on; if (on) gainMode_ = false; repaint(); }
+    // Timeline gain overlay: click to add a node, drag nodes (1 dB steps, 0.1 dB with Option),
+    // Option-click to delete, Shift-click to select several, Control-click for lock / group.
+    void setGainOverlay(bool on) { gainMode_ = on; if (on) envelopeMode_ = false; selGain_.clear(); repaint(); }
+    bool gainOverlay() const { return gainMode_; }
     bool envelopeMode() const { return envelopeMode_; }
     void setSnap(bool on) { snap_ = on; }
 
@@ -119,13 +123,18 @@ private:
     int trackAtX(float x) const;   // track index under x on the track bar, -1 = none
     int productH() const { return role_ == Role::Destination && productView() ? kProductStrip : 0; }
     int srpAt(juce::Point<int> p) const;
+    int gainNodeAt(juce::Point<int> p) const;
+    float gainY(double db) const;
+    double gainDbAtY(float y) const;
+    void paintGain(juce::Graphics&);
+    bool gainMouseDown(const juce::MouseEvent& e);
     juce::Rectangle<int> badgeBounds(int lane) const;
     void paintSrps(juce::Graphics&);
     void paintPoints(juce::Graphics&);
     int top() const { return trackBarY() + trackBarH(); }   // first lane's y
     void paintProducts(juce::Graphics&);
     int breakAt(juce::Point<int> p) const;   // break index in the shown product, -1 = none
-    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint, SrpMove, TrackBar };
+    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint, SrpMove, TrackBar, GainNode };
 
     double xToTime(float x) const { return view0_ + double(x) / pps_; }
     float timeToX(double t) const { return float((t - view0_) * pps_); }
@@ -163,6 +172,10 @@ private:
     int dragOrigLane_ = 0;
     Session::DropMode dropMode_ = Session::DropMode::Overlay;
     bool laneLock_ = false;
+    bool gainMode_ = false;
+    juce::Array<int> selGain_;                          // selected gain nodes
+    juce::Array<std::pair<int, std::pair<double, double>>> gainDrag_;   // node id -> original (t, db)
+    float dragY0_ = 0;
     int trackFrom_ = -1, trackTo_ = -1;
     bool changed_ = false;
     std::shared_ptr<const dsp::AnalysisResult> an_, raw_;

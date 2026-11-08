@@ -440,6 +440,7 @@ void Timeline::paint(juce::Graphics& g) {
     paintMarkers(g);
     paintSrps(g);
     if (role_ == Role::Destination) { paintProducts(g); paintTrackBar(g); }
+    paintGain(g);
     paintPoints(g);
     if (drag_ == Drag::Move && dropMode_ != Session::DropMode::Overlay && changed_)
         if (auto* r = s_.findRegion(dragId_)) {
@@ -474,6 +475,135 @@ void Timeline::paint(juce::Graphics& g) {
         g.setColour(colours::accent);
         g.fillRect(0, 0, getWidth(), 2);
     }
+}
+
+float Timeline::gainY(double db) const {
+    const float y0 = float(top()) + 4, y1 = float(getHeight() - kScroll) - 4;
+    const double norm = juce::jlimit(0.0, 1.0, (12.0 - db) / 48.0);   // +12 at the top, -36 at the bottom
+    return y0 + float(norm) * (y1 - y0);
+}
+
+double Timeline::gainDbAtY(float y) const {
+    const float y0 = float(top()) + 4, y1 = float(getHeight() - kScroll) - 4;
+    return 12.0 - double((y - y0) / juce::jmax(1.0f, y1 - y0)) * 48.0;
+}
+
+int Timeline::gainNodeAt(juce::Point<int> p) const {
+    for (auto& n : s_.gainNodes)
+        if (std::abs(timeToX(n.t) - float(p.x)) < 6 && std::abs(gainY(n.db) - float(p.y)) < 6) return n.id;
+    return 0;
+}
+
+void Timeline::paintGain(juce::Graphics& g) {
+    if (s_.gainNodes.isEmpty() && !gainMode_) return;
+    const juce::Colour c(0xffd8a0ff);
+    const float alpha = gainMode_ ? 1.0f : 0.45f;
+    // 0 dB reference while editing.
+    if (gainMode_) {
+        g.setColour(c.withAlpha(0.18f));
+        g.drawHorizontalLine(int(gainY(0.0)), 0.0f, float(getWidth()));
+    }
+    juce::Path p;
+    if (s_.gainNodes.isEmpty()) {
+        p.startNewSubPath(0, gainY(0));
+        p.lineTo(float(getWidth()), gainY(0));
+    } else {
+        p.startNewSubPath(0, gainY(s_.gainNodes.getFirst().db));
+        for (auto& n : s_.gainNodes) p.lineTo(timeToX(n.t), gainY(n.db));
+        p.lineTo(float(getWidth()), gainY(s_.gainNodes.getLast().db));
+    }
+    g.setColour(c.withAlpha(alpha * (s_.gainBypass ? 0.4f : 1.0f)));
+    if (s_.gainBypass) {
+        juce::Path d;
+        const float dashes[] = {5.0f, 4.0f};
+        juce::PathStrokeType(1.5f).createDashedStroke(d, p, dashes, 2);
+        g.fillPath(d);
+    } else {
+        g.strokePath(p, juce::PathStrokeType(1.6f));
+    }
+    for (auto& n : s_.gainNodes) {
+        const float x = timeToX(n.t), y = gainY(n.db);
+        if (x < -10 || x > getWidth() + 10) continue;
+        const bool sel = selGain_.contains(n.id);
+        auto box = juce::Rectangle<float>(x - 4, y - 4, 8, 8);
+        g.setColour(sel ? colours::accent : c.withAlpha(alpha));
+        if (s_.gainLocked(n)) g.drawRect(box, 1.5f);
+        else g.fillEllipse(box);
+        if (gainMode_) {
+            g.setFont(10.0f);
+            juce::String lbl = (n.db > 0.005 ? "+" : "") + juce::String(n.db, std::abs(n.db * 10 - std::round(n.db * 10)) < 1e-6 && std::abs(n.db - std::round(n.db)) > 1e-6 ? 1 : 0) + " dB";
+            if (n.group) lbl << "  G" << n.group;
+            g.drawText(lbl, int(x) + 6, int(y) - 14, 80, 12, juce::Justification::left);
+        }
+    }
+    if (gainMode_) {
+        g.setColour(c);
+        g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+        g.drawText(s_.gainBypass ? "TIMELINE GAIN (BYPASSED)" : "TIMELINE GAIN", 8, top() + 2, 200, 12, juce::Justification::left);
+    }
+}
+
+bool Timeline::gainMouseDown(const juce::MouseEvent& e) {
+    if (!gainMode_ || e.y < top()) return false;
+    const auto p = e.getPosition();
+    const int id = gainNodeAt(p);
+    if (id) {
+        auto* n = s_.findGainNode(id);
+        if (e.mods.isPopupMenu()) {
+            if (!selGain_.contains(id)) selGain_ = {id};
+            juce::PopupMenu menu;
+            menu.addItem(1, n->locked ? "Unlock" : "Lock", !s_.lockGain);
+            menu.addItem(2, "Group selected nodes", selGain_.size() > 1 && !s_.lockGain);
+            menu.addItem(3, "Ungroup", n->group != 0 && !s_.lockGain);
+            menu.addItem(4, "Delete", !s_.gainLocked(*n));
+            menu.showMenuAsync({}, [this, id](int r) {
+                auto* q = s_.findGainNode(id);
+                if (!q || r == 0) return;
+                if (r == 1) for (int sid : selGain_) if (auto* x = s_.findGainNode(sid)) x->locked = !q->locked;
+                if (r == 2) {
+                    int g = 1;
+                    for (auto& x : s_.gainNodes) g = juce::jmax(g, x.group + 1);
+                    for (int sid : selGain_) if (auto* x = s_.findGainNode(sid)) x->group = g;
+                }
+                if (r == 3) { const int g = q->group; for (auto& x : s_.gainNodes) if (x.group == g) x.group = 0; }
+                if (r == 4) { s_.removeGainNode(id); selGain_.removeAllInstancesOf(id); }
+                if (onEdit) onEdit();
+                repaint();
+            });
+            return true;
+        }
+        if (e.mods.isAltDown()) {
+            if (!s_.gainLocked(*n)) { s_.removeGainNode(id); selGain_.removeAllInstancesOf(id); changed_ = true; }
+            repaint();
+            return true;
+        }
+        if (e.mods.isShiftDown()) {
+            if (selGain_.contains(id)) selGain_.removeAllInstancesOf(id); else selGain_.add(id);
+            repaint();
+            return true;
+        }
+        if (!selGain_.contains(id)) selGain_ = {id};
+    } else {
+        if (e.mods.isPopupMenu() || s_.lockGain) return true;
+        // A new node on the click, rounded to 1 dB (0.1 dB with Option).
+        const double step = e.mods.isAltDown() ? 0.1 : 1.0;
+        const double db = std::round(gainDbAtY(float(e.y)) / step) * step;
+        const int nid = s_.addGainNode(juce::jmax(0.0, xToTime(float(e.x))), db);
+        selGain_ = {nid};
+        changed_ = true;
+    }
+    // Drag the selection and every node grouped with it.
+    juce::Array<int> moving = selGain_;
+    for (int sid : selGain_)
+        if (auto* x = s_.findGainNode(sid); x && x->group)
+            for (auto& o : s_.gainNodes) if (o.group == x->group) moving.addIfNotAlreadyThere(o.id);
+    gainDrag_.clear();
+    for (int mid : moving)
+        if (auto* x = s_.findGainNode(mid); x && !s_.gainLocked(*x)) gainDrag_.add({mid, {x->t, x->db}});
+    drag_ = Drag::GainNode;
+    dragY0_ = float(e.y);
+    repaint();
+    return true;
 }
 
 void Timeline::paintPoints(juce::Graphics& g) {
@@ -684,6 +814,7 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
         return;
     }
 
+    if (gainMouseDown(e)) return;
     selLane_ = laneAt(e.y);
     int id = regionAt(p);
     if (!id) {
@@ -783,6 +914,19 @@ void Timeline::mouseDrag(const juce::MouseEvent& e) {
             break;
         }
         case Drag::TrackBar: trackTo_ = trackAtX(float(e.x)); break;
+        case Drag::GainNode: {
+            // Vertical: 1 dB steps (0.1 dB with Option). Horizontal: a single ungrouped node only.
+            const double step = e.mods.isAltDown() ? 0.1 : 1.0;
+            const double ddb = std::round((gainDbAtY(float(e.y)) - gainDbAtY(dragY0_)) / step) * step;
+            const double dt = t - dragT0_;
+            for (auto& [mid, orig] : gainDrag_)
+                if (auto* x = s_.findGainNode(mid)) {
+                    x->db = juce::jlimit(-60.0, 24.0, std::round((orig.second + ddb) / step) * step);
+                    if (gainDrag_.size() == 1 && x->group == 0) x->t = juce::jmax(0.0, snapTime(orig.first + dt, 0));
+                }
+            changed_ = true;
+            break;
+        }
         case Drag::SrpMove:
             if (auto* q = s_.findSrp(dragId_)) { q->t = snapTime(juce::jmax(0.0, t), 0); edit_ = q->t; changed_ = true; }
             break;
@@ -838,6 +982,7 @@ void Timeline::mouseDrag(const juce::MouseEvent& e) {
 
 void Timeline::mouseUp(const juce::MouseEvent&) {
     if (drag_ == Drag::SrpMove) s_.sortSrps();
+    if (drag_ == Drag::GainNode) s_.sortGainNodes();
     if (drag_ == Drag::TrackBar) {
         if (trackFrom_ >= 0 && trackTo_ >= 0 && trackFrom_ != trackTo_ && s_.moveTrack(trackFrom_, trackTo_)) changed_ = true;
         trackFrom_ = trackTo_ = -1;
