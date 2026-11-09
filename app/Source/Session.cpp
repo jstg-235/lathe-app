@@ -208,7 +208,7 @@ void Session::trimRegionStart(int id, double newStart) {
     auto delta = juce::int64(std::llround((newStart - r->start) * r->fileRate));
     r->srcIn = juce::jlimit<juce::int64>(0, r->srcOut - 1, r->srcIn + delta);
     double shift = double(delta) / r->fileRate;
-    r->start += shift;
+    r->start = juce::jmax(0.0, r->start + shift);   // sample rounding must not push it before zero
     for (auto& p : r->envelope) p.t -= shift;
 }
 
@@ -317,7 +317,10 @@ Clip Session::copyRange(double a, double b, const juce::Array<int>& laneList) co
         x.fadeOut = ef.out;
         x.fadeInShape = ef.inShape;
         x.fadeOutShape = ef.outShape;
-        x.fadeInManual = x.fadeOutManual = true;   // the baked lengths are what was heard
+        // A fade an overlap was stretching keeps that length in the copy; an ordinary fade stays
+        // free to follow whatever the copy is laid against later.
+        if (ef.in > r.fadeIn + kEps) x.fadeInManual = true;
+        if (ef.out > r.fadeOut + kEps) x.fadeOutManual = true;
         if (x.start < a) {
             const auto d = juce::int64(std::llround((a - x.start) * x.fileRate));
             const double shift = double(d) / x.fileRate;
@@ -330,6 +333,7 @@ Clip Session::copyRange(double a, double b, const juce::Array<int>& laneList) co
                 x.envelope = env;
             }
             x.srcIn += d;
+            if (x.srcIn >= x.srcOut) continue;   // nothing of it is left inside the range
             x.start += shift;
             x.fadeIn = 0;
             x.fadeInOffset = 0;
@@ -344,14 +348,14 @@ Clip Session::copyRange(double a, double b, const juce::Array<int>& laneList) co
                 env.add({keep, db});
                 x.envelope = env;
             }
-            x.srcOut = juce::jlimit<juce::int64>(x.srcIn + 1, x.fileLength, x.srcIn + juce::int64(std::llround(keep * x.fileRate)));
+            x.srcOut = juce::jmin(x.srcOut, x.srcIn + juce::int64(std::llround(keep * x.fileRate)));
             x.fadeOut = 0;
             x.fadeOutOffset = 0;
         }
         if (x.srcOut - x.srcIn < 1) continue;
         x.fadeIn = juce::jmin(x.fadeIn, x.length());
         x.fadeOut = juce::jmin(x.fadeOut, x.length() - x.fadeIn);
-        x.start -= a;
+        x.start = juce::jmax(0.0, x.start - a);
         x.lane = li;
         x.id = 0;
         c.regions.add(x);
@@ -437,7 +441,7 @@ juce::Array<int> Session::paste(const Clip& c, const juce::Array<int>& laneList,
     }
     for (auto r : clip.regions) {
         r.id = nextId++;
-        r.start += at;
+        r.start = juce::jmax(0.0, r.start + at);
         r.lane = dest[juce::jlimit(0, dest.size() - 1, r.lane)];
         regions.add(r);
         ids.add(r.id);
@@ -902,6 +906,43 @@ void Session::autoSpace(double gap) {
     }
 }
 
+int Session::healSplices() {
+    int joined = 0;
+    for (bool again = true; again;) {
+        again = false;
+        for (int i = 0; i < regions.size() && !again; ++i)
+            for (int j = 0; j < regions.size() && !again; ++j) {
+                if (i == j) continue;
+                auto& a = regions.getReference(i);
+                const auto& b = regions.getReference(j);
+                if (a.lane != b.lane || a.file != b.file || a.srcOut != b.srcIn || a.fileRate != b.fileRate) continue;
+                if (std::abs(a.end() - b.start) > 0.5 / a.fileRate) continue;
+                if (a.gainDb != b.gainDb || a.mute != b.mute || a.invert != b.invert || a.fxState != b.fxState) continue;
+                if (!a.envelope.isEmpty() || !b.envelope.isEmpty()) continue;
+                if (a.fadeOut > 0 || a.fadeOutOffset > 0 || b.fadeIn > 0 || b.fadeInOffset > 0) continue;
+                // Nothing else may be crossfading at the joint.
+                bool busy = false;
+                for (auto& o : regions)
+                    if (o.id != a.id && o.id != b.id && o.lane == a.lane && !o.mute && o.start < a.end() + kEps && o.end() > a.end() - kEps) { busy = true; break; }
+                if (busy) continue;
+                const int bid = b.id;
+                a.srcOut = b.srcOut;
+                a.fadeOut = b.fadeOut;
+                a.fadeOutShape = b.fadeOutShape;
+                a.fadeOutOffset = b.fadeOutOffset;
+                a.fadeOutDb = b.fadeOutDb;
+                a.fadeOutAlpha = b.fadeOutAlpha;
+                a.fadeOutManual = b.fadeOutManual;
+                for (auto& m : markers)
+                    if (m.attachedRegion == bid) m.attachedRegion = a.id;
+                regions.remove(j);
+                ++joined;
+                again = true;
+            }
+    }
+    return joined;
+}
+
 bool Session::moveTrack(int from, int to) {
     // A reorder carries every mark with its track, locked or not.
     const bool globalLock = lockMarks;
@@ -909,6 +950,7 @@ bool Session::moveTrack(int from, int to) {
     for (auto& m : markers) if (m.locked) { lockedIds.add(m.id); m.locked = false; }
     lockMarks = false;
     const bool ok = moveTrackUnlocked(from, to);
+    if (ok) healSplices();   // tracks that stayed neighbours become one piece of audio again
     lockMarks = globalLock;
     for (auto& m : markers) if (lockedIds.contains(m.id)) m.locked = true;
     return ok;
@@ -924,17 +966,26 @@ bool Session::moveTrackUnlocked(int from, int to) {
     // Each track's content runs from its start to the next track's pause (or start); the gaps
     // between tracks stay where they are, so the spacing of the album doesn't change.
     const double total = end();
-    juce::Array<double> contentEnd, gap;
-    juce::Array<bool> pauseBefore;   // pauseBefore[k]: track k has a pause mark in front of it
-    pauseBefore.add(false);
+    // extended[k]: audio plays in the pause after track k (applause, room tone, a crossfade into
+    // the next track), so that stretch belongs to the track and travels with it, pause mark
+    // included. Silent gaps instead stay where they are in the running order.
+    juce::Array<double> contentEnd, silentGaps;
+    juce::Array<bool> extended;
+    bool anyPause = false;
     for (int k = 0; k < n; ++k) {
         double ce = k + 1 < n ? st[k + 1] : juce::jmax(total, st[k]);
-        bool pause = false;
-        if (k + 1 < n)
+        bool ext = false;
+        if (k + 1 < n) {
             for (auto& m : markers)
-                if (m.type == Marker::PauseStart && m.t > st[k] && m.t < st[k + 1]) { ce = juce::jmin(ce, m.t); pause = true; }
+                if (m.type == Marker::PauseStart && m.t > st[k] && m.t < st[k + 1]) { ce = juce::jmin(ce, m.t); anyPause = true; }
+            if (ce < st[k + 1] - kEps)
+                for (auto& r : regions)
+                    if (!r.mute && r.end() > ce + 1e-4 && r.start < st[k + 1] - 1e-4) { ext = true; break; }
+            if (ext) ce = st[k + 1];
+            else silentGaps.add(st[k + 1] - ce);
+        }
         contentEnd.add(ce);
-        if (k + 1 < n) { gap.add(st[k + 1] - ce); pauseBefore.add(pause); }
+        extended.add(ext);
     }
     juce::Array<int> all;
     for (int l = 0; l < lanes; ++l) all.add(l);
@@ -944,7 +995,7 @@ bool Session::moveTrackUnlocked(int from, int to) {
     for (int k = 0; k < n; ++k) {
         clips.push_back(copyRange(st[k], contentEnd[k], all));
         for (auto& m : markers)
-            if (m.type != Marker::EndOfDisc && m.type != Marker::PauseStart && m.t >= st[k] - kEps && m.t < contentEnd[k] - kEps) {
+            if (m.type != Marker::EndOfDisc && m.t >= st[k] - kEps && m.t < contentEnd[k] - kEps) {
                 Marker x = m;
                 x.t -= st[k];
                 marks[size_t(k)].add(x);
@@ -959,6 +1010,7 @@ bool Session::moveTrackUnlocked(int from, int to) {
     for (int k = markers.size(); --k >= 0;)
         if (markers.getReference(k).type != Marker::EndOfDisc && markers.getReference(k).t >= st[0] - kEps) markers.remove(k);
     double cursor = st[0];
+    int gapIndex = 0;
     for (int j = 0; j < n; ++j) {
         const int k = order[j];
         auto ids = paste(clips[size_t(k)], all, cursor, PasteMode::Overlay);
@@ -970,8 +1022,12 @@ bool Session::moveTrackUnlocked(int from, int to) {
             markers.add(x);
         }
         cursor += contentEnd[k] - st[k];
-        if (j + 1 < n) {
-            if (pauseBefore[j + 1]) {
+        if (j + 1 < n && !extended[k]) {
+            // The next silent gap in the running order (the last one again if they run out; none
+            // at all when the album has no silent gaps, as on a continuous live recording).
+            const double g = silentGaps.isEmpty() ? 0.0 : silentGaps[juce::jmin(gapIndex, silentGaps.size() - 1)];
+            ++gapIndex;
+            if (g > kEps && anyPause) {
                 Marker pm;
                 pm.id = nextId++;
                 pm.type = Marker::PauseStart;
@@ -979,7 +1035,7 @@ bool Session::moveTrackUnlocked(int from, int to) {
                 if (!ids.isEmpty()) pm.attachedRegion = ids.getLast();
                 markers.add(pm);
             }
-            cursor += gap[j];
+            cursor += g;
         }
     }
     sortMarkers();

@@ -1209,6 +1209,125 @@ int main() {
         Session back;
         CHECK(back.fromVar(juce::JSON::parse(juce::JSON::toString(m.toVar())), err) && back.laneFormat(0) == 6 && back.laneFormat(3) == 2);
     }
+    // ---- Review fixes: pasted regions still crossfade automatically; reordering keeps audio in the pause ----
+    {
+        auto f = makeTone(dir, "rv.wav", 44100, 6.0, 500, 0.4f);
+        Session src;
+        src.lanes = 1;
+        Region r = regionFor(src, fm, f); r.start = 0; src.regions.add(r);
+        Clip c = src.copyRange(1.0, 3.0, {0});
+        CHECK(!c.regions[0].fadeInManual && !c.regions[0].fadeOutManual);
+        Session d;
+        d.lanes = 1;
+        Region base = regionFor(d, fm, f); base.start = 0; d.regions.add(base);
+        auto ids = d.paste(c, {0}, 5.0, PasteMode::Overlay);              // overlaps the last second of base
+        NEAR(d.fadesFor(d.indexOfRegion(ids[0])).in, 1.0, 1e-6);          // the overlap still crossfades
+        // A copy taken from inside a crossfade keeps the length it was heard with.
+        Session x;
+        x.lanes = 1;
+        Region a1 = regionFor(x, fm, f); a1.start = 0; x.regions.add(a1);
+        Region a2 = regionFor(x, fm, f); a2.start = 5.0; x.regions.add(a2);   // 1 s overlap
+        Clip cx = x.copyRange(4.0, 11.0, {0});
+        bool sawFixed = false;
+        for (auto& q : cx.regions) sawFixed = sawFixed || (q.fadeInManual && std::abs(q.fadeIn - 1.0) < 1e-6);
+        CHECK(sawFixed);
+
+        // Live album: applause runs through the pause between tracks. Reordering must not lose it.
+        Session live;
+        live.lanes = 1;
+        Region whole = regionFor(live, fm, f); whole.start = 2.0; live.regions.add(whole);   // one continuous recording, 2..8
+        live.addMarker(Marker::TrackStart, 2.0);
+        live.addMarker(Marker::PauseStart, 4.5);    // applause from 4.5 ...
+        live.addMarker(Marker::TrackStart, 5.0);    // ... to the next song at 5.0
+        CHECK(live.moveTrack(1, 0));
+        NEAR(live.end(), 8.0, 1e-3);
+        double covered = 0;
+        for (auto& q : live.regions) covered += q.length();
+        NEAR(covered, 6.0, 1e-3);                   // every second of audio is still there
+        int pauses = 0;
+        for (auto& m : live.markers) pauses += m.type == Marker::PauseStart;
+        CHECK(pauses == 1);
+        CHECK(live.regions.size() == 2);            // one cut, where the order changed
+        CHECK(live.moveTrack(1, 0));                // back again: the recording is whole once more
+        CHECK(live.regions.size() == 1 && live.regions[0].srcIn == 0 && live.regions[0].srcOut == live.regions[0].fileLength);
+        NEAR(live.regions[0].start, 2.0, 1e-6);
+    }
+    // ---- Stress: hundreds of random edits must leave a session that is valid, saves and loads
+    // back identically, and renders ----
+    {
+        auto f1 = makeTone(dir, "fz1.wav", 44100, 8.0, 300, 0.3f), f2 = makeTone(dir, "fz2.wav", 48000, 5.0, 500, 0.2f);
+        const int firstSeed = std::getenv("LATHE_STRESS_FROM") ? std::atoi(std::getenv("LATHE_STRESS_FROM")) : 1;
+        const int lastSeed = std::getenv("LATHE_STRESS_SEEDS") ? std::atoi(std::getenv("LATHE_STRESS_SEEDS")) : 12;
+        for (int seed = firstSeed; seed <= lastSeed; ++seed) {
+            if (std::getenv("LATHE_STRESS_FROM")) std::printf("seed %d\n", seed);
+            juce::Random rnd(seed);
+            Session z;
+            z.lanes = 2;
+            for (int i = 0; i < 4; ++i) z.append(regionFor(z, fm, i % 2 ? f2 : f1), 2.0);
+            Clip clip;
+            int bad = 0, lastOp = -1;
+            for (int op = 0; op < 250; ++op) {
+                const double len = juce::jmax(1.0, z.end());
+                const double a = rnd.nextDouble() * len, b = a + rnd.nextDouble() * 4.0 + 0.01;
+                const juce::Array<int> lanes = rnd.nextBool() ? juce::Array<int>{0} : juce::Array<int>{0, 1};
+                const int rid = z.regions.isEmpty() ? 0 : z.regions[rnd.nextInt(z.regions.size())].id;
+                const int which = rnd.nextInt(14);
+                lastOp = which;
+                switch (which) {
+                    case 0: clip = z.copyRange(a, b, lanes); break;
+                    case 1: if (!clip.isEmpty()) z.paste(clip, lanes, a, PasteMode(rnd.nextInt(5)), rnd.nextBool() ? b : -1.0); break;
+                    case 2: z.clearRange(a, b, lanes, rnd.nextBool()); break;
+                    case 3: if (rid) z.dropRegion(rid, a, rnd.nextInt(2), Session::DropMode(rnd.nextInt(3))); break;
+                    case 4: { int n = 0; for (auto& m : z.markers) n += m.type == Marker::TrackStart; if (n > 1) z.moveTrack(rnd.nextInt(n), rnd.nextInt(n)); break; }
+                    case 5: z.autoSpace(rnd.nextDouble() * 3.0); break;
+                    case 6: if (rid) z.split(rid, a); break;
+                    case 7: z.addMarker(Marker::Type(rnd.nextInt(3)), a); break;
+                    case 8: {
+                        auto sp = z.splicesAround({rid});
+                        if (!sp.isEmpty()) { if (rnd.nextBool()) z.crossfadeCentred(sp[0].first, sp[0].second, rnd.nextDouble() * 0.5);
+                                             else z.setCrossfadeLength(sp[0].first, sp[0].second, rnd.nextDouble() * 0.5, Session::Ripple(rnd.nextInt(3))); }
+                        break;
+                    }
+                    case 9: z.addGainNode(a, rnd.nextInt(12) - 6); z.addSrp(b); break;
+                    case 10: if (rid) { z.trimRegionStart(rid, a); z.trimRegionEnd(rid, b); } break;
+                    case 11: z.segmentsToStartMarks(); z.editedBlackToMarks(); break;
+                    case 12: z.lockMarks = rnd.nextInt(5) == 0; z.ripple(a, rnd.nextDouble() * 2.0 - 1.0); z.lockMarks = false; break;
+                    case 13: if (rid) z.slip(rid, rnd.nextDouble() - 0.5); break;
+                }
+                for (auto& r : z.regions) {
+                    if (!(r.srcIn >= 0 && r.srcOut > r.srcIn && r.srcOut <= r.fileLength) || !(r.start >= -1e-9) || !std::isfinite(r.start) || r.lane < 0 || r.lane >= z.lanes) {
+                        if (!bad) std::printf("  region %d: src %lld..%lld of %lld start %f lane %d (op kind %d)\n", r.id, (long long) r.srcIn, (long long) r.srcOut, (long long) r.fileLength, r.start, r.lane, lastOp);
+                        ++bad;
+                    }
+                    auto ef = z.fadesFor(z.indexOfRegion(r.id));
+                    if (ef.in < 0 || ef.out < 0 || ef.in > r.length() + 1e-9 || ef.out > r.length() + 1e-9) { if (!bad) std::printf("  fades %f %f len %f (op kind %d)\n", ef.in, ef.out, r.length(), lastOp); ++bad; }
+                }
+                for (int i = 1; i < z.markers.size(); ++i) if (z.markers[i].t < z.markers[i - 1].t - 1e-9) ++bad;
+                for (auto& m : z.markers) if (m.t < -1e-9 || !std::isfinite(m.t)) { if (!bad) std::printf("  marker t %f (op kind %d)\n", m.t, lastOp); ++bad; }
+                juce::Array<int> ids;
+                for (auto& r : z.regions) { if (ids.contains(r.id)) ++bad; ids.add(r.id); }
+                if (bad) { std::printf("stress seed %d: invalid after op %d\n", seed, op); break; }
+                if (std::getenv("LATHE_STRESS_TRACE")) std::printf("  op %d kind %d regions %d markers %d end %.1f\n", op, which, z.regions.size(), z.markers.size(), z.end());
+            }
+            CHECK(bad == 0);
+            juce::String err;
+            Session back;
+            const auto json = juce::JSON::toString(z.toVar());
+            CHECK(back.fromVar(juce::JSON::parse(json), err));
+            CHECK(juce::JSON::toString(back.toVar()) == json);
+            (void) z.toDisc();
+            ProgramRenderer pr(fm);
+            pr.setSession(z, 44100);
+            juce::AudioBuffer<float> buf(2, 4096);
+            bool finite = true;
+            const juce::int64 total = juce::jmin<juce::int64>(pr.totalSamples(), 44100 * 120);
+            for (juce::int64 pos = 0; pos < total; pos += 4096) {
+                pr.render(buf, 0, 4096);
+                for (int i = 0; i < 4096; i += 64) finite = finite && std::isfinite(buf.getSample(0, i)) && std::abs(buf.getSample(0, i)) < 100.0f;
+            }
+            CHECK(finite);
+        }
+    }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

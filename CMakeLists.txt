@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 # Must come before project(): CMake fixes the deployment target when the project starts.
 # 10.15 is the floor because the DDP code uses std::filesystem.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS")
-project(Lathe VERSION 0.9.0 LANGUAGES C CXX)
+project(Lathe VERSION 0.9.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -49,6 +49,9 @@ void applyFadePreset(Session& s, int outgoing, int incoming, const FadePreset& p
     auto* a = s.findRegion(outgoing);
     auto* b = s.findRegion(incoming);
     if (!a || !b) return;
+    // No overlap could be made (neither side has audio beyond its edge to fade with): leave the
+    // two regions exactly as they were, their own fades included.
+    if (p.length > 0 && a->end() - b->start < 1e-5) return;
     a->fadeOutShape = p.outShape;
     b->fadeInShape = p.inShape;
     a->fadeOutDb = p.outDb;

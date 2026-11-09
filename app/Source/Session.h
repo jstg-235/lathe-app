@@ -314,6 +314,10 @@ public:
     // Auto marks. Each returns how many marks were added.
     int segmentsToStartMarks(int lane = 0);
     int editedBlackToMarks(double minGap = 0.5);
+    // Joins regions that were cut but still sit exactly as they did before the cut (same file,
+    // same lane and settings, the audio continuing sample for sample with no fade at the joint),
+    // so an operation that had to cut everything leaves no needless splices. Returns joins made.
+    int healSplices();
     // Moves track `from` (0-based, with its audio, pause and marks) to position `to`.
     bool moveTrack(int from, int to);
     // Sets the gap between tracks (groups of joined regions on lane 0) to `gap` seconds.
