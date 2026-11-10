@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -51,7 +52,13 @@ public:
     double integratedLufs() const;  // gated, whole programme since reset
     double loudnessRange() const;   // LRA in LU (EBU Tech 3342)
     double truePeakDb() const;      // max over all channels, dBTP
+    double truePeakDb(int channel) const;
     int64_t clippedSamples() const { return clipped_; }  // samples at or above full scale
+    double maxMomentaryLufs() const { return maxM_; }   // since reset
+    double maxShortTermLufs() const { return maxS_; }
+    // Counts 100 ms steps since reset: a display can take one short-term reading per step.
+    int64_t hops() const { return hopsDone_; }
+    double durationSeconds() const { return double(hopsDone_) * 0.1; }
 
 private:
     double sr_ = 48000;
@@ -66,6 +73,11 @@ private:
     std::vector<double> gatingBlocks_;   // 400 ms block energies, 75 % overlap
     std::vector<double> shortTermBlocks_;// 3 s block energies at 100 ms hop, for LRA
     int64_t clipped_ = 0;
+    int64_t hopsDone_ = 0;
+    double maxM_ = -INFINITY, maxS_ = -INFINITY;
+    // Integrated and LRA are recomputed only when new blocks arrived.
+    mutable int64_t cacheHopsI_ = -1, cacheHopsL_ = -1;
+    mutable double cacheI_ = -INFINITY, cacheL_ = 0;
     double windowEnergy(int hops) const;
 };
 

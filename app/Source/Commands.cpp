@@ -149,6 +149,8 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::toggleLoudness, "Loudness Overlay", "View", "Show short-term loudness, track LUFS / true peak and problem flags on the timeline", "L"},
         // Tools
         {cmd::analyse, "Analyse Programme", "Tools", "Loudness map, per-track stats and problem scan (clips, overs, DC, phase, dropouts) of the master and the unprocessed mix", "command + shift + A"},
+        {cmd::meterBridge, "Meter Bridge...", "Tools", "Loudness radar, loudness bars and history, statistics and compliance, tonal balance against references, stereo scope", "command + shift + B"},
+        {cmd::resetMeters, "Reset Meters", "Tools", "Start every meter reading again (integrated, range, maxima, spectrum average)", "command + option + R"},
         {cmd::showAnalysis, "Analysis Results...", "Tools", "Show the last analysis: summary and a clickable problem list", "command + shift + L"},
         {cmd::references, "References...", "Tools", "Load reference tracks for level-matched A/B", "command + shift + R"},
         {cmd::listenReference, "A/B: Listen to Reference", "Transport", "Switch between the master and the active reference (level-matched, 10 ms crossfade)", "Q"},

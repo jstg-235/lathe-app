@@ -4,6 +4,8 @@
 #include "../core/ddp/Ddp.h"
 #include "../core/dsp/Analyzer.h"
 #include "../core/dsp/Meters.h"
+#include "../core/dsp/Scope.h"
+#include "../core/dsp/Restoration.h"
 #include "../core/dsp/Restoration.h"
 #include "../core/util/Hash.h"
 #include "../core/doc/Pdf.h"
@@ -583,6 +585,148 @@ static void testPdf() {
     CHECK(ok);
 }
 
+static void testScope() {
+    const double sr = 48000;
+    auto sine = [&](double hz, double amp, int n, double phase = 0) {
+        std::vector<float> out;
+        out.resize(size_t(n));
+        for (int i = 0; i < n; ++i) out[size_t(i)] = float(amp * std::sin(2 * M_PI * hz * i / sr + phase));
+        return out;
+    };
+    // FFT round trip.
+    {
+        std::vector<std::complex<double>> a(64);
+        for (size_t i = 0; i < a.size(); ++i) a[i] = {std::sin(double(i)), std::cos(3.0 * double(i))};
+        auto b = a;
+        dsp::fft(b, false);
+        dsp::fft(b, true);
+        double e = 0;
+        for (size_t i = 0; i < a.size(); ++i) e = std::max(e, std::abs(a[i] - b[i]));
+        CHECK(e < 1e-12);
+    }
+    // A 1 kHz sine at -6 dBFS lands in the 1 kHz band at about -6 dB (sine-calibrated) and
+    // nowhere else much.
+    {
+        dsp::SpectrumAnalyzer an;
+        an.prepare(sr);
+        auto x = sine(1000, 0.5, 48000);
+        an.process(x.data(), x.data(), int(x.size()));
+        const auto& b = an.bands();
+        int k1 = -1;
+        for (int i = 0; i < b.size(); ++i) if (std::abs(b.centre[size_t(i)] - 1000.0) < 1.0) k1 = i;
+        CHECK(k1 >= 0);
+        if (k1 >= 0) {
+            NEAR(an.averageDb(0)[size_t(k1)], -6.02, 0.5);
+            NEAR(an.averageDb(2)[size_t(k1)], -6.02, 0.5);
+            CHECK(an.averageDb(1)[size_t(k1)] < -100);           // no side signal
+            for (int i = 0; i < b.size(); ++i)
+                if (std::abs(i - k1) > 3) CHECK(an.averageDb(0)[size_t(i)] < -50);
+            NEAR(an.monoLossDb()[size_t(k1)], 0.0, 0.05);         // identical channels: nothing lost
+            NEAR(an.bandCorrelation()[size_t(k1)], 1.0, 1e-3);
+        }
+        // Out of phase: the mono sum cancels and the band correlation is -1.
+        auto y = x;
+        for (auto& v : y) v = -v;
+        an.reset();
+        an.process(x.data(), y.data(), int(x.size()));
+        if (k1 >= 0) {
+            CHECK(an.monoLossDb()[size_t(k1)] < -30);
+            NEAR(an.bandCorrelation()[size_t(k1)], -1.0, 1e-3);
+        }
+    }
+    // Stereo meter: identical, inverted, unrelated, and balance.
+    {
+        dsp::StereoMeter sm;
+        sm.prepare(sr);
+        auto x = sine(440, 0.5, 48000);
+        sm.process(x.data(), x.data(), int(x.size()));
+        NEAR(sm.correlation(), 1.0, 1e-6);
+        NEAR(sm.width(), 0.0, 1e-6);
+        NEAR(sm.balanceDb(), 0.0, 1e-6);
+        auto y = x;
+        for (auto& v : y) v = -v;
+        sm.reset();
+        sm.process(x.data(), y.data(), int(x.size()));
+        NEAR(sm.correlation(), -1.0, 1e-6);
+        CHECK(sm.minCorrelation() < -0.99);
+        std::vector<float> n1(48000), n2(48000);
+        uint32_t r = 1;
+        auto rnd = [&] { r = r * 1664525u + 1013904223u; return float(int32_t(r)) / 2147483648.0f; };
+        for (size_t i = 0; i < n1.size(); ++i) { n1[i] = 0.3f * rnd(); n2[i] = 0.3f * rnd(); }
+        sm.reset();
+        sm.process(n1.data(), n2.data(), int(n1.size()));
+        CHECK(std::abs(sm.correlation()) < 0.15);
+        NEAR(sm.width(), 1.0, 0.2);                               // as much side as mid
+        auto half = x;
+        for (auto& v : half) v *= 0.5f;
+        sm.reset();
+        sm.process(x.data(), half.data(), int(x.size()));
+        NEAR(sm.balanceDb(), 6.02, 0.05);
+        std::vector<float> gl, gr;
+        sm.recentPairs(gl, gr, 512);
+        CHECK(gl.size() == 512 && std::abs(gl.back() - x.back()) < 1e-7f && std::abs(gr.back() - half.back()) < 1e-7f);
+    }
+    // Balance: a profile doesn't depend on level; a target zone from references; range notes.
+    {
+        dsp::SpectrumAnalyzer an;
+        an.prepare(sr);
+        auto mix = [&](double lowAmp, double highAmp) {
+            auto a = sine(100, lowAmp, 96000), b = sine(5000, highAmp, 96000), m = sine(1000, 0.3, 96000);
+            for (size_t i = 0; i < a.size(); ++i) a[i] += b[i] + m[i];
+            an.reset();
+            an.process(a.data(), a.data(), int(a.size()));
+            return an.averagePower(0);
+        };
+        auto ref1 = dsp::BalanceProfile::fromPower(an.bands(), mix(0.5, 0.25));
+        auto ref1Quiet = [&] {   // same balance, 20 dB down
+            auto a = sine(100, 0.05, 96000), b = sine(5000, 0.025, 96000), m = sine(1000, 0.03, 96000);
+            for (size_t i = 0; i < a.size(); ++i) a[i] += b[i] + m[i];
+            an.reset();
+            an.process(a.data(), a.data(), int(a.size()));
+            return dsp::BalanceProfile::fromPower(an.bands(), an.averagePower(0));
+        }();
+        double worst = 0;
+        for (size_t i = 0; i < ref1.shareDb.size(); ++i)
+            if (ref1.shareDb[i] > -60) worst = std::max(worst, std::abs(ref1.shareDb[i] - ref1Quiet.shareDb[i]));
+        CHECK(worst < 0.2);
+        auto ref2 = dsp::BalanceProfile::fromPower(an.bands(), mix(0.5, 0.3));
+        auto target = dsp::BalanceTarget::fromProfiles({ref1, ref2});
+        CHECK(target.valid() && target.references == 2);
+        // A mix with 6 dB more low end than the references.
+        auto prog = mix(1.0, 0.25);
+        auto ranges = dsp::balanceRanges(an.bands(), prog, target, {ref1, ref2});
+        const dsp::BalanceRange* low = nullptr;
+        for (auto& r : ranges) if (std::string(r.name) == "Low") low = &r;
+        CHECK(low != nullptr);
+        if (low) {
+            NEAR(low->diffDb(), 6.02, 0.3);          // 6 dB more low end than the references
+            CHECK(low->outsideDb() > 4.0);
+        }
+        auto notes = dsp::balanceNotes(ranges);
+        CHECK(!notes.empty() && notes.front().find("above") != std::string::npos);
+        // The same mix as the reference: nothing to report.
+        CHECK(dsp::balanceNotes(dsp::balanceRanges(an.bands(), mix(0.5, 0.27), target, {ref1, ref2})).empty());
+    }
+    // Loudness meter extras: max M/S, history count, per-channel true peak, reset.
+    {
+        dsp::LoudnessMeter m;
+        m.prepare(sr, 2);
+        auto loud = sine(1000, 0.5, 48000 * 4), quiet = sine(1000, 0.05, 48000 * 4);
+        const float* pl[2] = {loud.data(), quiet.data()};
+        m.process(pl, int(loud.size()));
+        CHECK(m.hops() == 40);
+        NEAR(m.durationSeconds(), 4.0, 1e-9);
+        CHECK(std::isfinite(m.maxMomentaryLufs()) && m.maxMomentaryLufs() >= m.momentaryLufs() - 1e-9);
+        CHECK(std::isfinite(m.maxShortTermLufs()));
+        NEAR(m.truePeakDb(0) - m.truePeakDb(1), 20.0, 0.1);
+        const double i1 = m.integratedLufs();
+        CHECK(m.integratedLufs() == i1);   // cached reading is stable
+        m.reset();
+        CHECK(m.hops() == 0 && !std::isfinite(m.maxMomentaryLufs()) && !std::isfinite(m.integratedLufs()));
+    }
+    CHECK(dsp::loudnessStandards().size() >= 6 && dsp::loudnessStandards()[0].targetLufs == -23.0);
+}
+
 int main() {
     testRestoration();
     testAnalyzer();
@@ -597,6 +741,7 @@ int main() {
     testDither();
     testCdTextExtras();
     testPdf();
+    testScope();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

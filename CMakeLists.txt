@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 # Must come before project(): CMake fixes the deployment target when the project starts.
 # 10.15 is the floor because the DDP code uses std::filesystem.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS")
-project(Lathe VERSION 0.9.1 LANGUAGES C CXX)
+project(Lathe VERSION 0.10.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,6 +17,7 @@ add_library(lathe_core STATIC
     core/ddp/Ddp.cpp
     core/dsp/Meters.cpp
     core/dsp/Analyzer.cpp
+    core/dsp/Scope.cpp
     core/dsp/Restoration.cpp
     core/util/Hash.cpp
     core/util/FlacTags.cpp
@@ -78,6 +79,7 @@ target_sources(Lathe PRIVATE
     app/Source/EditPanels.cpp
     app/Source/SourceView.cpp
     app/Source/MarkInfo.cpp
+    app/Source/Metering.cpp
     app/Source/AutoMarks.cpp
     app/Source/SegmentList.cpp
     app/Source/NullTest.cpp

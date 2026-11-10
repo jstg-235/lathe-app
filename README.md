@@ -68,6 +68,26 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
 - **Key presets**: Lathe (default) and Legacy (function-key transport, [ ] for In / Out, F9-F11
   marks), under Help > Key Preset or in Edit Key Commands.
 
+## Metering (v0.10)
+
+- **Meter Bridge** (Tools > Meter Bridge, Cmd-Shift-B), a window of its own for a second screen:
+  - **Radar**: short-term loudness swept around a dial against the target (1 to 60 minutes per
+    turn), momentary loudness on the outer ring, programme loudness against the target, LRA,
+    max true peak and elapsed time.
+  - **Loudness**: L / R peak bars with true-peak holds, M / S / I bars on an LU scale around
+    the target, five minutes of momentary and short-term history, statistics (integrated, LRA,
+    max M / S, true and sample peak per channel, PLR, PSR, overs) and compliance against a
+    standard: EBU R128, ATSC A/85, ARIB, OP-59, streaming -14, Apple -16, Amazon, podcast, or
+    the session's own target.
+  - **Balance**: the programme's average spectrum against the mids, a target zone built from
+    the session's reference tracks, six ranges (sub to air) with how far each sits from the
+    zone, plain notes for the ones outside it, a mono check line and an optional 3 dB / octave
+    tilt.
+  - **Stereo**: goniometer, correlation with its lowest reading, width (side against mid),
+    left / right balance, a minute of correlation history and correlation per band.
+- The main window keeps a compact meter: peak bars, integrated loudness coloured against the
+  target, momentary, short-term, LRA, true peak, PLR / PSR and correlation.
+
 ## Stability by design
 
 - Audio is streamed from disk on a background thread; the audio callback never touches the disk.

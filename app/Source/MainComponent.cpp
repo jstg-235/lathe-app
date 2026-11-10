@@ -10,72 +10,6 @@ enum PqCol { pTrack = 1, pType, pTime, pLength, pTitle, pPerformer, pIsrc, pDcp,
 
 // ---------------------------------------------------------------- meters
 
-class LevelMeters : public juce::Component {
-public:
-    void prepare(double rate) {
-        if (rate != rate_) { rate_ = rate; meter_.prepare(rate, 2); }
-    }
-    void reset() { meter_.reset(); peak_[0] = peak_[1] = 0; hold_[0] = hold_[1] = 0; repaint(); }
-    void feed(MeterTap& tap) {
-        if (rate_ <= 0) return;
-        int n = tap.pull(scratch_);
-        if (n > 0) {
-            const float* ch[2] = {scratch_.getReadPointer(0), scratch_.getReadPointer(1)};
-            meter_.process(ch, n);
-            for (int c = 0; c < 2; ++c) {
-                float m = scratch_.getMagnitude(c, 0, n);
-                peak_[c] = juce::jmax(m, peak_[c] * 0.86f);
-                hold_[c] = juce::jmax(hold_[c], m);
-            }
-        } else {
-            for (auto& p : peak_) p *= 0.86f;
-        }
-        repaint();
-    }
-    void paint(juce::Graphics& g) override {
-        g.fillAll(colours::panel);
-        auto r = getLocalBounds().reduced(6);
-        auto bars = r.removeFromLeft(44);
-        auto norm = [](float lin) { float db = juce::Decibels::gainToDecibels(lin, -60.0f); return (db + 60.0f) / 60.0f; };
-        for (int c = 0; c < 2; ++c) {
-            auto b = bars.removeFromLeft(18).toFloat();
-            bars.removeFromLeft(4);
-            g.setColour(colours::line);
-            g.fillRect(b);
-            g.setColour(hold_[c] >= 0.99997f ? colours::error : colours::ok);
-            g.fillRect(b.withTop(b.getBottom() - b.getHeight() * norm(peak_[c])));
-            g.setColour(colours::text);
-            g.drawHorizontalLine(int(b.getBottom() - b.getHeight() * norm(hold_[c])), b.getX(), b.getRight());
-        }
-        r.removeFromLeft(8);
-        g.setFont(juce::FontOptions(13.0f));
-        auto line = [&](const juce::String& k, double v, const char* unit) {
-            auto row = r.removeFromTop(19);
-            g.setColour(colours::dim);
-            g.drawText(k, row.removeFromLeft(78), juce::Justification::left);
-            g.setColour(colours::text);
-            g.drawText(std::isfinite(v) ? juce::String(v, 1) + " " + unit : juce::String("--"), row, juce::Justification::right);
-        };
-        line("Momentary", meter_.momentaryLufs(), "LUFS");
-        line("Short-term", meter_.shortTermLufs(), "LUFS");
-        line("Integrated", meter_.integratedLufs(), "LUFS");
-        line("Range", meter_.loudnessRange(), "LU");
-        line("True peak", meter_.truePeakDb(), "dBTP");
-        auto row = r.removeFromTop(19);
-        g.setColour(colours::dim);
-        g.drawText("Overs", row.removeFromLeft(78), juce::Justification::left);
-        g.setColour(meter_.clippedSamples() ? colours::error : colours::text);
-        g.drawText(juce::String(meter_.clippedSamples()), row, juce::Justification::right);
-    }
-    void mouseDown(const juce::MouseEvent&) override { reset(); }
-
-private:
-    dsp::LoudnessMeter meter_;
-    double rate_ = 0;
-    float peak_[2]{}, hold_[2]{};
-    juce::AudioBuffer<float> scratch_{2, 1 << 17};
-};
-
 // ---------------------------------------------------------------- editable cell
 
 class Cell : public juce::Label {
@@ -155,8 +89,11 @@ MainComponent::MainComponent() {
     studio_.fromVar(juce::JSON::parse(props_.getUserSettings()->getValue("studioProfile")));
 
     getLookAndFeel().setColour(juce::ResizableWindow::backgroundColourId, colours::bg);
-    meters_ = std::make_unique<LevelMeters>();
+    meters_ = std::make_unique<MeterStrip>(meterHub_);
+    meters_->onOpenBridge = [this] { showMeterBridge(); };
+    meters_->onReset = [this] { meterHub_.reset(); };
     addAndMakeVisible(*meters_);
+    meterHub_.standard = props_.getUserSettings()->getIntValue("meterStandard", -1);
     srcSession_.lanes = 1;
     session_.source = &srcSession_;
     addAndMakeVisible(sourceView_);
@@ -219,7 +156,7 @@ MainComponent::MainComponent() {
     pauseMk_.onClick = [this] { addMarkerAtPlayhead(Marker::PauseStart); };
     splitBtn_.onClick = [this] { splitAtPlayhead(); };
     playBtn_.onClick = [this] { setActiveTimeline(false); togglePlay(); };
-    homeBtn_.onClick = [this] { locateDest(0); meters_->reset(); };
+    homeBtn_.onClick = [this] { locateDest(0); meterHub_.reset(); };
     pluginsBtn_.onClick = [this] { showPluginMenu(); };
     exportBtn_.onClick = [this] { showExportMenu(); };
     analyseBtn_.onClick = [this] { runAnalysis(); };
@@ -450,7 +387,7 @@ void MainComponent::resized() {
     r.removeFromTop(6);
     auto right = r.removeFromRight(300);
     r.removeFromRight(8);
-    meters_->setBounds(right.removeFromTop(150));
+    meters_->setBounds(right.removeFromTop(176));
     right.removeFromTop(8);
     auto chainButtons = right.removeFromBottom(26);
     for (auto* b : {&chainAdd_, &chainRemove_, &chainBypass_, &chainUp_, &chainDown_}) {
@@ -685,6 +622,8 @@ bool MainComponent::perform(const InvocationInfo& info) {
             break;
         case cmd::playbackSettings: showPlaybackSettings(); break;
         case cmd::markInfo: showMarkInfo(); break;
+        case cmd::meterBridge: showMeterBridge(); break;
+        case cmd::resetMeters: meterHub_.reset(); break;
         case cmd::exportSegments: exportSelectedSegments(); break;
         case cmd::gainOverlay: {
             const bool on = !activeTimeline().gainOverlay();
@@ -971,6 +910,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             add({cmd::studioProfile});
             break;
         case 6:
+            add({cmd::meterBridge, cmd::resetMeters});
+            m.addSeparator();
             add({cmd::analyse, cmd::showAnalysis, cmd::references});
             m.addSeparator();
             add({cmd::ddpPlayer, cmd::verifyDdp, cmd::nullTest});
@@ -3297,8 +3238,11 @@ void MainComponent::timerCallback() {
                                                    ? "  (level-matched)" : "  (not level-matched)");
         abDisplay_.setText(ab, juce::dontSendNotification);
     }
-    meters_->prepare(engine_.deviceRate());
-    meters_->feed(engine_.meterTap());
+    meterHub_.sessionTarget = session_.loudnessTarget;
+    meterHub_.prepare(engine_.deviceRate());
+    meterHub_.feed(engine_.meterTap());
+    meters_->repaint();
+    if (meterBridge_ && meterWindow_ && meterWindow_->isVisible()) meterBridge_->refresh();
 
     double pr = session_.effectiveRate(), dr = engine_.deviceRate();
     juce::String rw;
@@ -3487,6 +3431,62 @@ void MainComponent::exportSelectedSegments() {
                                                           ":\n\n" + result->joinIntoString("\n"));
                });
     });
+}
+
+void MainComponent::showMeterBridge() {
+    if (meterWindow_) { meterWindow_->setVisible(true); meterWindow_->toFront(true); return; }
+    auto* bridge = new MeterBridge(meterHub_);
+    bridge->onReset = [this] { meterHub_.reset(); };
+    bridge->onStandardChanged = [this] { props_.getUserSettings()->setValue("meterStandard", meterHub_.standard); meters_->repaint(); };
+    bridge->onRefreshReferences = [this] { loadReferenceProfiles(true); };
+    meterBridge_ = bridge;
+    auto* w = new PlainWindow(bridge, "Meter Bridge", false);   // not on top: it can live on a second screen
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { meterWindow_.reset(); }); };
+    meterWindow_.reset(w);
+    loadReferenceProfiles(false);
+}
+
+void MainComponent::loadReferenceProfiles(bool explain) {
+    // The tonal balance target: the session's reference tracks (up to 8), measured once each.
+    juce::Array<juce::File> files;
+    for (auto& r : session_.references)
+        if (r.file.existsAsFile() && files.size() < 8) files.add(r.file);
+    if (files.isEmpty()) {
+        meterHub_.setReferenceProfiles({}, {});
+        if (explain)
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Tonal balance references",
+                                                   "Add reference tracks in Tools > References (commercial releases or your own approved masters "
+                                                   "in the same style). The Balance view then shows a zone from them, and how far each range of "
+                                                   "this programme sits from it.");
+        return;
+    }
+    juce::Array<juce::File> todo;
+    for (auto& f : files)
+        if (refProfiles_.find(f.getFullPathName() + "|" + juce::String(f.getLastModificationTime().toMilliseconds())) == refProfiles_.end()) todo.add(f);
+    auto apply = [this, files] {
+        std::vector<dsp::BalanceProfile> ps;
+        juce::StringArray names;
+        for (auto& f : files) {
+            auto it = refProfiles_.find(f.getFullPathName() + "|" + juce::String(f.getLastModificationTime().toMilliseconds()));
+            if (it != refProfiles_.end() && it->second.valid()) { ps.push_back(it->second); names.add(f.getFileNameWithoutExtension()); }
+        }
+        meterHub_.setReferenceProfiles(std::move(ps), names);
+        if (meterBridge_) meterBridge_->refresh();
+    };
+    if (todo.isEmpty()) { apply(); return; }
+    auto results = std::make_shared<std::vector<std::pair<juce::String, dsp::BalanceProfile>>>();
+    runJob("Measuring reference tracks...",
+           [this, todo, results](Job& j) {
+               for (int i = 0; i < todo.size(); ++i) {
+                   auto p = MeterHub::profileOfFile(engine_.formats(), todo[i], [&](double x) { return j.keep((i + x) / todo.size()); });
+                   results->push_back({todo[i].getFullPathName() + "|" + juce::String(todo[i].getLastModificationTime().toMilliseconds()), p});
+                   if (j.threadShouldExit()) return;
+               }
+           },
+           [this, results, apply](bool) {
+               for (auto& [k, p] : *results) refProfiles_[k] = p;
+               apply();
+           });
 }
 
 void MainComponent::showMarkInfo() {

@@ -123,6 +123,9 @@ void LoudnessMeter::reset() {
     gatingBlocks_.clear();
     shortTermBlocks_.clear();
     clipped_ = 0;
+    hopsDone_ = 0;
+    maxM_ = maxS_ = -INFINITY;
+    cacheHopsI_ = cacheHopsL_ = -1;
 }
 
 double LoudnessMeter::windowEnergy(int hops) const {
@@ -152,8 +155,15 @@ void LoudnessMeter::process(const float* const* x, int n) {
             hopCount_ = std::min(hopCount_ + 1, 30);
             inBlock_ = 0;
             blockSum_ = 0;
-            if (hopCount_ >= 4) gatingBlocks_.push_back(windowEnergy(4));
-            if (hopCount_ >= 30) shortTermBlocks_.push_back(windowEnergy(30));
+            ++hopsDone_;
+            if (hopCount_ >= 4) {
+                gatingBlocks_.push_back(windowEnergy(4));
+                maxM_ = std::max(maxM_, energyToLufs(gatingBlocks_.back()));
+            }
+            if (hopCount_ >= 30) {
+                shortTermBlocks_.push_back(windowEnergy(30));
+                maxS_ = std::max(maxS_, energyToLufs(shortTermBlocks_.back()));
+            }
         }
     }
 }
@@ -162,19 +172,24 @@ double LoudnessMeter::momentaryLufs() const { return hopCount_ >= 4 ? energyToLu
 double LoudnessMeter::shortTermLufs() const { return hopCount_ >= 30 ? energyToLufs(windowEnergy(30)) : -INFINITY; }
 
 double LoudnessMeter::integratedLufs() const {
+    if (cacheHopsI_ == hopsDone_) return cacheI_;
+    cacheHopsI_ = hopsDone_;
     double s = 0; int n = 0;
     for (double e : gatingBlocks_) if (energyToLufs(e) > kAbsGate) { s += e; ++n; }
-    if (n == 0) return -INFINITY;
+    if (n == 0) return cacheI_ = -INFINITY;
     double rel = energyToLufs(s / n) - 10.0;
     s = 0; n = 0;
     for (double e : gatingBlocks_) {
         double l = energyToLufs(e);
         if (l > kAbsGate && l > rel) { s += e; ++n; }
     }
-    return n ? energyToLufs(s / n) : -INFINITY;
+    return cacheI_ = (n ? energyToLufs(s / n) : -INFINITY);
 }
 
 double LoudnessMeter::loudnessRange() const {
+    if (cacheHopsL_ == hopsDone_) return cacheL_;
+    cacheHopsL_ = hopsDone_;
+    cacheL_ = 0;
     std::vector<double> gated;
     double s = 0; int n = 0;
     for (double e : shortTermBlocks_) if (energyToLufs(e) > kAbsGate) { s += e; ++n; }
@@ -187,7 +202,13 @@ double LoudnessMeter::loudnessRange() const {
     if (gated.size() < 2) return 0;
     std::sort(gated.begin(), gated.end());
     auto pct = [&](double p) { return gated[size_t(std::lround(p * double(gated.size() - 1)))]; };
-    return pct(0.95) - pct(0.10);
+    return cacheL_ = pct(0.95) - pct(0.10);
+}
+
+double LoudnessMeter::truePeakDb(int channel) const {
+    if (channel < 0 || channel >= int(tp_.size())) return -INFINITY;
+    const float m = tp_[size_t(channel)].maxLinear();
+    return m > 0 ? 20.0 * std::log10(double(m)) : -INFINITY;
 }
 
 double LoudnessMeter::truePeakDb() const {

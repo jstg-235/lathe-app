@@ -57,6 +57,8 @@ enum : juce::CommandID {
     gainOverlay = 0x1480, gainBypass, lockAllGain, clearGain,
     // Export
     exportSegments = 0x1090,
+    // Metering
+    meterBridge = 0x14a0, resetMeters,
 };
 }  // namespace cmd
 

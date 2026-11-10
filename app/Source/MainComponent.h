@@ -8,6 +8,7 @@
 #include "DeliveryPanels.h"
 #include "PluginManager.h"
 #include "MarkInfo.h"
+#include "Metering.h"
 #include "SegmentList.h"
 #include "AutoMarks.h"
 #include "Restore.h"
@@ -23,7 +24,6 @@
 
 namespace lathe {
 
-class LevelMeters;
 struct RelinkState;
 
 class MainComponent : public juce::Component,
@@ -214,7 +214,13 @@ private:
     std::unique_ptr<juce::DocumentWindow> markInfoWindow_;
     juce::Component::SafePointer<MarkInfoPanel> markInfoPanel_;
     void crossfadeNewEdits(const juce::Array<int>& ids, Session& s);   // default crossfade on new splices
-    std::unique_ptr<LevelMeters> meters_;
+    MeterHub meterHub_;
+    std::unique_ptr<MeterStrip> meters_;
+    std::unique_ptr<juce::DocumentWindow> meterWindow_;
+    juce::Component::SafePointer<MeterBridge> meterBridge_;
+    std::map<juce::String, dsp::BalanceProfile> refProfiles_;
+    void showMeterBridge();
+    void loadReferenceProfiles(bool explain);
     juce::TableListBox pqList_{"PQ", this};
     ChainModel chainModel_{*this};
     juce::ListBox chainList_{"Plugins", &chainModel_};
