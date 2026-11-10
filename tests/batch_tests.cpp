@@ -1,5 +1,6 @@
 // End-to-end batch render: DDP + WAV/FLAC 16/44.1 + hi-res, then checks that the 16-bit
 // track files are bit-identical to the DDP image and the tags are present.
+#include "../app/Source/Capture.h"
 #include "../app/Source/ControlSurface.h"
 #include "../app/Source/DdpFormat.h"
 #include "../app/Source/Exporter.h"
@@ -316,6 +317,8 @@ int main() {
     }
 
     // ---- Recording: input in the callback buffer lands in the file, sample for sample.
+    // (No interface from here on: a real one would pull blocks while the tests feed their own.)
+    engine.devices().closeAudioDevice();
     {
         engine.prepareToPlay(512, 44100);
         auto rf = dir.getChildFile("rec.wav");
@@ -500,6 +503,514 @@ int main() {
         engine.setLevelMatch(false);
         engine.chain().setState({}, problems);
         engine.regionFx().clear();
+        engine.loadSession(Session());
+        engine.releaseResources();
+    }
+
+    // ---- Audio Setup settings, capture planning and landing (no audio) ----
+    {
+        IoSettings io;
+        io.monitorOut = 2;
+        io.monitorSix = true;
+        io.defaultInput = 4;
+        io.nextToSession = false;
+        io.folder = dir.getChildFile("takes").getFullPathName();
+        io.bits = 32;
+        io.inputMonitoring = true;
+        io.captureOut = 6;
+        io.captureIn = 8;
+        io.captureMute = true;
+        io.capturePostRoll = 5.0;
+        const auto key = IoSettings::delayKey("Interface A", "Interface A", 6, 8, 96000.0, 256);
+        io.delays[key] = 613;
+        IoSettings back;
+        back.fromVar(juce::JSON::parse(juce::JSON::toString(io.toVar())));
+        CHECK(back.monitorOut == 2 && back.monitorSix && back.defaultInput == 4 && !back.nextToSession && back.folder == io.folder);
+        CHECK(back.bits == 32 && back.inputMonitoring && back.captureOut == 6 && back.captureIn == 8 && back.captureMute && back.capturePostRoll == 5.0);
+        CHECK(back.delay(key) == 613);
+        // A measurement belongs to its sockets, sample rate and buffer: anything else is "not measured".
+        CHECK(back.delay(IoSettings::delayKey("Interface A", "Interface A", 6, 8, 96000.0, 512)) == -1);
+        CHECK(back.delay(IoSettings::delayKey("Interface A", "Interface A", 6, 10, 96000.0, 256)) == -1);
+        CHECK(back.delay(IoSettings::delayKey("Interface A", "Interface B", 6, 8, 96000.0, 256)) == -1);
+        // Recordings go next to the session by default, or in the chosen folder.
+        auto sessionFile = dir.getChildFile("Album.lathe");
+        sessionFile.replaceWithText("{}");
+        IoSettings def;
+        CHECK(def.nextToSession && def.bits == 24 && !def.inputMonitoring);
+        CHECK(recordingsFolder(def, sessionFile) == dir.getChildFile("Album Recordings"));
+        CHECK(recordingsFolder(io, sessionFile) == dir.getChildFile("takes"));
+        CHECK(recordingName(sessionFile, "Capture", juce::Time(2026, 10, 10, 16, 11, 5)) == "Album Capture 2026-11-10 161105");
+        CHECK(recordingName(juce::File(), "Print", juce::Time(2026, 0, 2, 3, 4, 5)).startsWith("Untitled Print 2026-01-02"));
+        CHECK(recordingBytes(10.0, 48000.0, 2, 24) == 48000 * 10 * 2 * 3 + 4096);
+
+        // Planning: the In-Out or the whole programme; the lane type; the lowest lane heard.
+        Session s;
+        auto add = [&](int lane, double start, double len) {
+            Region r = s.makeRegion(dir.getChildFile("x.wav"), 48000, juce::int64(len * 48000));
+            r.lane = lane;
+            r.start = start;
+            s.regions.add(r);
+            s.lanes = juce::jmax(s.lanes, lane + 1);
+            return r.id;
+        };
+        const int a = add(0, 2.0, 10.0), b = add(1, 4.0, 4.0), c = add(2, 20.0, 5.0);
+        auto whole = planCapture(s, {});
+        CHECK(whole.whole && whole.range.getStart() == 0.0 && whole.range.getEnd() == 25.0 && whole.channels == 2 && whole.underLane == 2 && whole.sources.size() == 3);
+        auto part = planCapture(s, {5.0, 7.0});
+        CHECK(!part.whole && part.valid() && part.underLane == 1 && part.sources.size() == 2 && part.sources.contains(a) && part.sources.contains(b));
+        CHECK(!planCapture(s, {13.0, 19.0}).valid());   // silence between the In and Out
+        s.setLaneFormat(0, 1);
+        CHECK(planCapture(s, {2.5, 3.5}).channels == 1);   // only the mono lane is heard there
+        CHECK(planCapture(s, {5.0, 7.0}).channels == 2);   // mono and stereo together
+        s.setLaneFormat(2, 6);
+        CHECK(planCapture(s, {5.0, 7.0}).channels == 6);   // a 5.1 programme is captured as 5.1
+        s.setLaneFormat(2, 2);
+        s.findRegion(b)->mute = true;
+        CHECK(planCapture(s, {5.0, 7.0}).underLane == 0);   // a muted region isn't part of it
+        s.findRegion(b)->mute = false;
+
+        // Landing: a new lane directly under the material, in sync, the round trip taken off.
+        s.lanesOff.add(2);
+        CaptureTake take;
+        take.file = dir.getChildFile("take.wav");
+        take.rate = 48000;
+        take.startSample = 3 * 48000 - 3;            // the file began 2 s (less the read-ahead) before the In point
+        take.roundTrip = 700;
+        take.length = (2 + 2 + 1) * 48000 + 700;     // pre-roll, the range, a tail
+        part = planCapture(s, {5.0, 7.0});
+        const int id = placeCapture(s, part, take, true, "Take");
+        CHECK(id != 0);
+        if (auto* r = s.findRegion(id)) {
+            CHECK(r->lane == 2 && s.lanes == 4);
+            CHECK(std::abs(r->start - 5.0) < 1e-12 && r->srcIn == 2 * 48000 + 3 + 700 && r->srcOut - r->srcIn == 2 * 48000);
+            CHECK(r->name == "Take" && !r->mute);
+            CHECK(s.laneFormat(2) == 2 && s.laneFormat(0) == 1);
+        }
+        CHECK(s.findRegion(c)->lane == 3 && s.lanesOff.contains(3) && !s.lanesOff.contains(2));   // what was below moved down
+        // Mute the original: only the captured stretch goes quiet.
+        int mutedPieces = 0;
+        double mutedLength = 0;
+        for (auto& r : s.regions)
+            if (r.mute) { ++mutedPieces; mutedLength += r.length(); CHECK(r.start >= 5.0 - 1e-9 && r.end() <= 7.0 + 1e-9); }
+        CHECK(mutedPieces == 2 && std::abs(mutedLength - 4.0) < 1e-6);
+        double heardLane0 = 0;
+        for (auto& r : s.regions)
+            if (r.lane == 0 && !r.mute) heardLane0 += r.length();
+        CHECK(std::abs(heardLane0 - 8.0) < 1e-6);
+        // Stopped early: what was recorded is kept; nothing usable gives no region.
+        Session e;
+        Region er = e.makeRegion(dir.getChildFile("x.wav"), 48000, 480000);
+        er.start = 2.0;
+        e.regions.add(er);
+        auto ep = planCapture(e, {5.0, 7.0});
+        take.length = 2 * 48000 + 3 + 700 + 24000;   // half a second into the range
+        Session e1 = e;
+        const int eid = placeCapture(e1, ep, take, false, "Early");
+        CHECK(eid != 0 && e1.findRegion(eid)->srcOut - e1.findRegion(eid)->srcIn == 24000 && e1.findRegion(eid)->lane == 1);
+        take.length = 48000;                          // stopped during the pre-roll
+        Session e2 = e;
+        CHECK(placeCapture(e2, ep, take, false, "None") == 0 && e2.regions.size() == 1 && e2.lanes == e.lanes);
+        // The capture on its own, for switching against what was sent.
+        auto alone = captureAlone(e1, eid);
+        CHECK(alone.regions.size() == 1 && alone.regions[0].lane == 0 && alone.regions[0].start == e1.findRegion(eid)->start);
+    }
+
+    // ---- Inputs, routing and Capture through a simulated loop (the engine's own blocks) ----
+    {
+        const int N = 512;
+        engine.prepareToPlay(N, 44100);
+        engine.chain().prepare(44100, N);
+        juce::StringArray problems;
+        engine.chain().setState({}, problems);
+        auto src = noiseFile(dir, "cap.wav", 44100, 8.0, 77);
+        std::unique_ptr<juce::AudioFormatReader> sr(fm.createReaderFor(src));
+        juce::AudioBuffer<float> noise(2, int(sr->lengthInSamples));
+        sr->read(&noise, 0, noise.getNumSamples(), 0, true, true);
+        Session s;
+        const int rid = s.append(s.makeRegion(src, sr->sampleRate, sr->lengthInSamples), 0.0);
+        const juce::int64 regionStart = juce::int64(std::llround(s.findRegion(rid)->start * 44100));   // 2 s
+        engine.loadSession(s);
+
+        // Input meters: armed inputs reach the input feed (and only that), overs are counted.
+        {
+            engine.setInputSelection(0, 2);
+            juce::AudioBuffer<float> io(2, N);
+            auto fill = [&](float l, float r) { for (int i = 0; i < N; ++i) { io.setSample(0, i, l); io.setSample(1, i, r); } };
+            juce::AudioBuffer<float> got(2, 4 * N);
+            engine.inputTap().clear();
+            engine.meterTap().clear();
+            fill(0.25f, -0.5f);
+            engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+            CHECK(!engine.inputsLive() && engine.inputTap().pull(got) == 0);   // not armed: nothing is measured
+            CHECK(io.getMagnitude(0, N) == 0.0f);                               // and no input leaks to the outputs
+            engine.setArmed(true);
+            engine.resetInputOvers();
+            fill(0.25f, -0.5f);
+            engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+            CHECK(engine.inputsLive() && engine.inputTap().pull(got) == N);
+            CHECK(got.getSample(0, 100) == 0.25f && got.getSample(1, 100) == -0.5f);
+            CHECK(io.getMagnitude(0, N) == 0.0f);                               // input monitoring is off by default
+            CHECK(engine.meterTap().pull(got) == 0);                            // the output meters don't see the inputs
+            CHECK(engine.inputOvers() == 0 && std::abs(engine.inputMax() - 0.5f) < 1e-6f);
+            fill(0.25f, -0.5f);
+            io.setSample(1, 7, 1.0f);
+            io.setSample(0, 9, -1.2f);
+            engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+            CHECK(engine.inputOvers() == 2 && engine.inputMax() >= 1.2f);
+            engine.resetInputOvers();
+            CHECK(engine.inputOvers() == 0);
+            // Input monitoring: the armed pair is played on the monitor pair.
+            engine.setInputMonitoring(true);
+            fill(0.25f, -0.5f);
+            engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+            CHECK(io.getSample(0, 5) == 0.25f && io.getSample(1, 5) == -0.5f);
+            // A mono input is shown on both bars.
+            engine.setInputSelection(1, 1);
+            engine.inputTap().clear();
+            fill(0.25f, -0.5f);
+            engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+            CHECK(engine.inputTap().pull(got) == N && got.getSample(0, 3) == -0.5f && got.getSample(1, 3) == -0.5f);
+            engine.setInputMonitoring(false);
+            engine.setArmed(false);
+            engine.setInputSelection(0, 2);
+        }
+
+        // Output pair: playback goes to the chosen pair, nothing else is touched by it.
+        {
+            engine.setMonitorOutput(2);
+            engine.setPositionSeconds(3.0);
+            engine.play();
+            juce::AudioBuffer<float> io(4, N);
+            bool onPair = true, quietElsewhere = true;
+            for (int b = 0; b < 30; ++b) {
+                CHECK(engine.waitForReadAhead(5000));
+                for (int ch = 0; ch < 4; ++ch) for (int i = 0; i < N; ++i) io.setSample(ch, i, 0.9f);   // "inputs" in the device's buffer
+                engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+                quietElsewhere &= io.getMagnitude(0, 0, N) == 0.0f && io.getMagnitude(1, 0, N) == 0.0f;
+                if (b > 4) onPair &= io.getRMSLevel(2, 0, N) > 0.01f && io.getRMSLevel(3, 0, N) > 0.01f && io.getMagnitude(2, 0, N) < 0.9f;
+            }
+            CHECK(onPair && quietElsewhere);
+            engine.stop();
+            engine.setMonitorOutput(-1);
+        }
+
+        // One capture through a loop of `trip` samples with `gearGain`. Returns the placed session.
+        struct Run { Session after; CapturePlan plan; CaptureTake take; int id = 0; bool complete = false; juce::AudioBuffer<float> file; int fileChannels = 0; };
+        auto capture = [&](const Session& from, juce::Range<double> selection, int trip, float gearGain, int stopAfterBlocks, const juce::String& name,
+                           int bufferChannels = 2, bool mute = false) {
+            Run run;
+            run.plan = planCapture(from, selection);
+            AudioEngine::CaptureRequest rq;
+            rq.file = dir.getChildFile(name + ".wav");
+            rq.channels = run.plan.channels;
+            rq.bits = 32;
+            rq.from = run.plan.range.getStart();
+            rq.to = run.plan.range.getEnd();
+            rq.preRoll = 2.0;
+            rq.postRoll = 0.5;
+            juce::String err;
+            CHECK(engine.startCapture(rq, from, err));
+            CHECK(engine.captureActive() && engine.captureRecording() && engine.inputsLive());
+            std::vector<std::vector<float>> sent{size_t(bufferChannels), std::vector<float>()};
+            juce::AudioBuffer<float> io(bufferChannels, N);
+            const int maxBlocks = int((run.plan.range.getLength() + 4.0) * 44100 / N) + 50;
+            int blocks = 0;
+            for (; blocks < maxBlocks && !engine.captureComplete(); ++blocks) {
+                if (stopAfterBlocks >= 0 && blocks >= stopAfterBlocks) break;
+                CHECK(engine.waitForReadAhead(5000));
+                // The gear: what was sent `trip` samples ago comes back on the same channel numbers.
+                for (int ch = 0; ch < bufferChannels; ++ch)
+                    for (int i = 0; i < N; ++i) {
+                        const int k = blocks * N + i - trip;
+                        io.setSample(ch, i, k >= 0 ? sent[size_t(ch)][size_t(k)] * gearGain : 0.0f);
+                    }
+                engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+                for (int ch = 0; ch < bufferChannels; ++ch)
+                    for (int i = 0; i < N; ++i) sent[size_t(ch)].push_back(io.getSample(ch, i));
+            }
+            run.complete = engine.captureComplete();
+            run.take.file = rq.file;
+            run.take.startSample = engine.recordStartSample();
+            run.take.roundTrip = trip + engine.masterLatency();
+            engine.stopCapture();
+            CHECK(!engine.captureActive() && !engine.isRecording());
+            if (std::unique_ptr<juce::AudioFormatReader> r{fm.createReaderFor(rq.file)}) {
+                run.take.rate = r->sampleRate;
+                run.take.length = r->lengthInSamples;
+                run.fileChannels = int(r->numChannels);
+                run.file.setSize(int(r->numChannels), int(r->lengthInSamples));
+                r->read(&run.file, 0, int(r->lengthInSamples), 0, true, true);
+            }
+            run.after = from;
+            run.id = placeCapture(run.after, run.plan, run.take, mute, name);
+            engine.loadSession(from);
+            return run;
+        };
+        // How far the captured region is from the programme: the worst sample difference with the
+        // region read `slip` samples off its place (0 = where it was put).
+        auto worst = [&](const Run& run, float scale, int slip) {
+            const auto* r = run.after.findRegion(run.id);
+            if (!r) return 1.0e9;
+            const juce::int64 t0 = juce::int64(std::llround(r->start * 44100));
+            double w = 0;
+            for (juce::int64 k = 2; k < r->srcOut - r->srcIn - 2; ++k) {
+                const juce::int64 n = t0 + k - regionStart;   // sample of the source file the programme plays at t0 + k
+                const float want = n >= 0 && n < noise.getNumSamples() ? noise.getSample(0, int(n)) * scale : 0.0f;
+                w = juce::jmax(w, double(std::abs(run.file.getSample(0, int(r->srcIn + k + slip)) - want)));
+            }
+            return w;
+        };
+
+        const int trip = N + 317;   // a round trip is never shorter than a buffer
+        // The In-Out, with pre-roll: lands on a new lane under the original, on the sample.
+        {
+            auto run = capture(s, {3.0, 5.0}, trip, 1.0f, -1, "cap-range");
+            CHECK(run.complete && run.id != 0 && run.fileChannels == 2);
+            const auto* r = run.after.findRegion(run.id);
+            CHECK(r && r->lane == 1 && run.after.lanes == 3 && std::abs(r->start - 3.0) < 1e-12 && r->srcOut - r->srcIn == 2 * 44100);
+            const double exact = worst(run, 1.0f, 0);
+            std::printf("capture In-Out: worst sample error %.3g in place, %.3g one sample early, %.3g one late\n", exact, worst(run, 1.0f, -1), worst(run, 1.0f, 1));
+            CHECK(exact == 0.0);                                             // bit for bit, +/- 0 samples
+            CHECK(worst(run, 1.0f, -1) > 0.05 && worst(run, 1.0f, 1) > 0.05);
+            // After the Out point the programme is silent, so the tail holds only the gear's own tail.
+            bool tailSilent = true;
+            for (juce::int64 i = r->srcOut; i < run.take.length; ++i) tailSilent &= run.file.getSample(0, int(i)) == 0.0f;
+            CHECK(tailSilent && run.take.length - r->srcOut >= juce::int64(0.5 * 44100) - trip - N);
+            CHECK(!run.after.findRegion(rid)->mute);                         // the original is left as it was
+        }
+        // Nothing selected: the whole programme, from the very first sample.
+        {
+            auto run = capture(s, {}, trip, 1.0f, -1, "cap-whole", 2, true);
+            CHECK(run.complete && run.plan.whole && run.id != 0);
+            const auto* r = run.after.findRegion(run.id);
+            CHECK(r && r->start == 0.0 && r->srcOut - r->srcIn == juce::int64(std::llround(s.end() * 44100)));
+            const double exact = worst(run, 1.0f, 0);
+            std::printf("capture whole programme: worst sample error %.3g\n", exact);
+            CHECK(exact == 0.0);
+            CHECK(run.after.findRegion(rid)->mute);                          // "mute the original" asked for
+        }
+        // Through master plugins that add delay: the capture still lands in sync.
+        {
+            engine.chain().addInstance(std::make_unique<GainDelayPlugin>(0.5f, 300));
+            auto run = capture(s, {4.0, 5.5}, trip, 1.0f, -1, "cap-chain");
+            CHECK(run.complete && run.id != 0 && run.take.roundTrip == trip + 300);
+            const double exact = worst(run, 0.5f, 0);
+            std::printf("capture through a 300-sample master chain: worst sample error %.3g\n", exact);
+            CHECK(exact < 1e-7);
+            // Switching between what was sent and the capture: in step (they null), and level
+            // matching turns down whichever is louder.
+            engine.loadSessionWithAlternate(s, captureAlone(run.after, run.id));
+            CHECK(engine.hasAlternate());
+            auto listen = [&](bool hearCapture, bool match, int blocks, double from = 4.2) {
+                engine.stop();
+                engine.setPositionSeconds(from);
+                engine.setHearUnprocessed(hearCapture);
+                engine.setLevelMatch(match);
+                engine.play();
+                juce::AudioBuffer<float> all(2, blocks * N);
+                for (int b = 0; b < blocks; ++b) {
+                    CHECK(engine.waitForReadAhead(5000));
+                    juce::AudioBuffer<float> out(2, N);
+                    engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&out, 0, N));
+                    for (int ch = 0; ch < 2; ++ch) all.copyFrom(ch, b * N, out, ch, 0, N);
+                }
+                engine.stop();
+                return all;
+            };
+            listen(false, false, 60);
+            auto A = listen(false, false, 40), B = listen(true, false, 40);
+            double errSum = 0, refSum = 0;
+            for (int i = 20 * N; i < 40 * N; ++i) { const double d = A.getSample(0, i) - B.getSample(0, i); errSum += d * d; refSum += double(A.getSample(0, i)) * A.getSample(0, i); }
+            const double nullDb = 10.0 * std::log10(juce::jmax(1e-30, errSum / juce::jmax(1e-30, refSum)));
+            std::printf("  sent against capture nulls to %.1f dB\n", nullDb);
+            CHECK(refSum > 0 && nullDb < -100.0);
+            engine.setHearUnprocessed(false);
+            engine.setLevelMatch(false);
+            engine.loadSession(s);
+            CHECK(!engine.hasAlternate());
+            // Gear that adds 6 dB: the capture is louder, so level matching turns the capture down.
+            auto hot = capture(s, {3.0, 7.5}, trip, 2.0f, -1, "cap-hot");
+            CHECK(hot.id != 0 && worst(hot, 1.0f, 0) < 1e-7);
+            engine.loadSessionWithAlternate(s, captureAlone(hot.after, hot.id));
+            engine.resetMatch();
+            auto sentLevel = listen(false, true, 330, 3.2);                  // (about 3.8 s: long enough to measure)
+            std::printf("  +6 dB gear: sent against capture measures %.2f dB\n", engine.matchDifferenceDb());
+            CHECK(engine.matchMeasured() && std::abs(engine.matchDifferenceDb() + 6.0206) < 0.05);
+            CHECK(std::abs(engine.matchCutDb()) < 1e-9);                     // what was sent isn't touched
+            auto captureLevel = listen(true, true, 330, 3.2);
+            const double ra = sentLevel.getRMSLevel(0, 300 * N, 25 * N), rb = captureLevel.getRMSLevel(0, 300 * N, 25 * N);
+            std::printf("  level matched, capture against sent %.2f dB\n", 20.0 * std::log10(rb / ra));
+            CHECK(std::abs(20.0 * std::log10(rb / ra)) < 0.1);
+            engine.setHearUnprocessed(false);
+            engine.setLevelMatch(false);
+            engine.chain().setState({}, problems);
+            engine.loadSession(s);
+        }
+        // Stopped early: what was recorded is kept and placed.
+        {
+            const int blocksToStop = int((2.0 + 0.75) * 44100 / N);   // pre-roll and three quarters of a second
+            auto run = capture(s, {3.0, 5.0}, trip, 1.0f, blocksToStop, "cap-early");
+            CHECK(!run.complete && run.id != 0);
+            const auto* r = run.after.findRegion(run.id);
+            const juce::int64 kept = r ? r->srcOut - r->srcIn : 0;
+            std::printf("capture stopped early: kept %.2f s\n", double(kept) / 44100.0);
+            CHECK(kept > juce::int64(0.6 * 44100) && kept < juce::int64(0.8 * 44100) && worst(run, 1.0f, 0) == 0.0);
+        }
+        // The send on another output pair: the programme leaves on it, the monitor pair stays quiet
+        // (or carries the return, with input monitoring on), and the capture is the same.
+        {
+            engine.setInputMonitoring(true);
+            auto plan = planCapture(s, {3.0, 3.5});
+            AudioEngine::CaptureRequest rq;
+            rq.file = dir.getChildFile("cap-route.wav");
+            rq.firstOutput = 2;
+            rq.firstInput = 2;
+            rq.channels = 2;
+            rq.bits = 32;
+            rq.from = 3.0;
+            rq.to = 3.5;
+            rq.preRoll = 0.5;
+            rq.postRoll = 0.1;
+            juce::String err;
+            CHECK(engine.startCapture(rq, s, err));
+            juce::AudioBuffer<float> io(4, N);
+            std::vector<float> sent;
+            bool monitorIsReturn = true, heardSomething = false;
+            for (int b = 0; b < 400 && !engine.captureComplete(); ++b) {
+                CHECK(engine.waitForReadAhead(5000));
+                io.clear();
+                for (int i = 0; i < N; ++i) {
+                    const int k = b * N + i - trip;
+                    const float v = k >= 0 ? sent[size_t(k)] : 0.0f;
+                    io.setSample(2, i, v);
+                    io.setSample(3, i, v);
+                }
+                juce::AudioBuffer<float> in(2, N);
+                in.copyFrom(0, 0, io, 2, 0, N);
+                engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+                for (int i = 0; i < N; ++i) {
+                    sent.push_back(io.getSample(2, i));
+                    monitorIsReturn &= io.getSample(0, i) == in.getSample(0, i);   // outputs 1-2: the return, not the send
+                    heardSomething |= io.getSample(2, i) != 0.0f;
+                }
+            }
+            CHECK(engine.captureComplete() && monitorIsReturn && heardSomething);
+            CaptureTake take;
+            take.file = rq.file;
+            take.startSample = engine.recordStartSample();
+            take.roundTrip = trip;
+            engine.stopCapture();
+            engine.setInputMonitoring(false);
+            Run run;
+            run.plan = plan;
+            if (std::unique_ptr<juce::AudioFormatReader> r{fm.createReaderFor(rq.file)}) {
+                take.rate = r->sampleRate;
+                take.length = r->lengthInSamples;
+                run.file.setSize(2, int(r->lengthInSamples));
+                r->read(&run.file, 0, int(r->lengthInSamples), 0, true, true);
+            }
+            run.after = s;
+            run.id = placeCapture(run.after, plan, take, false, "route");
+            CHECK(run.id != 0 && worst(run, 1.0f, 0) == 0.0);
+            engine.loadSession(s);
+        }
+        // The channels follow the lane type: a mono lane is captured as a mono file onto a mono lane.
+        {
+            Session mono = s;
+            mono.setLaneFormat(0, 1);
+            auto run = capture(mono, {3.0, 4.0}, trip, 1.0f, -1, "cap-mono");
+            CHECK(run.complete && run.plan.channels == 1 && run.fileChannels == 1 && run.id != 0);
+            CHECK(run.after.laneFormat(1) == 1 && run.after.laneFormat(0) == 1);
+            const auto* r = run.after.findRegion(run.id);
+            CHECK(r && r->srcOut - r->srcIn == 44100 && run.file.getRMSLevel(0, int(r->srcIn), 44100) > 0.01f);
+        }
+        // ... and a 5.1 programme as six channels, each on its own socket.
+        {
+            auto f6 = dir.getChildFile("cap6.wav");
+            {
+                juce::WavAudioFormat wav;
+                std::unique_ptr<juce::OutputStream> os(f6.createOutputStream().release());
+                std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 44100, juce::AudioChannelSet::create5point1(), 24, {}, 0));
+                os.release();
+                juce::AudioBuffer<float> b(6, 44100 * 3);
+                for (int c = 0; c < 6; ++c)
+                    for (int i = 0; i < b.getNumSamples(); ++i) b.setSample(c, i, 0.1f * float(c + 1) * float(std::sin(i * 0.05)));
+                w->writeFromAudioSampleBuffer(b, 0, b.getNumSamples());
+            }
+            Session sur;
+            std::unique_ptr<juce::AudioFormatReader> r6(fm.createReaderFor(f6));
+            sur.append(sur.makeRegion(f6, r6->sampleRate, r6->lengthInSamples), 2.0);
+            sur.setLaneFormat(0, 6);
+            auto run = capture(sur, {3.0, 4.0}, trip, 1.0f, -1, "cap-51", 6);
+            CHECK(run.complete && run.plan.channels == 6 && run.fileChannels == 6 && run.id != 0 && run.after.laneFormat(1) == 6);
+            if (auto* r = run.after.findRegion(run.id); r && run.fileChannels == 6) {
+                bool each = true;
+                for (int c = 0; c < 6; ++c) {
+                    const int k = 1000;   // timeline 3 s + 1000 samples = 1 s + 1000 into the file
+                    const float want = 0.1f * float(c + 1) * float(std::sin((44100 + k) * 0.05));
+                    each &= std::abs(run.file.getSample(c, int(r->srcIn) + k) - want) < 1e-4f;
+                }
+                CHECK(each);
+            }
+        }
+        // Level check: routed and measured, nothing recorded, and it doesn't stop by itself.
+        {
+            AudioEngine::CaptureRequest rq;
+            rq.levelCheck = true;
+            rq.from = 3.0;
+            rq.to = 3.2;
+            rq.preRoll = 0.0;
+            juce::String err;
+            CHECK(engine.startCapture(rq, s, err));
+            CHECK(engine.captureActive() && !engine.captureRecording() && !engine.isRecording() && engine.inputsLive());
+            juce::AudioBuffer<float> io(2, N);
+            bool played = false;
+            for (int b = 0; b < 60; ++b) {
+                CHECK(engine.waitForReadAhead(5000));
+                io.clear();
+                engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+                if (b > 40) played |= io.getRMSLevel(0, 0, N) > 0.01f;   // past the Out point: still playing (the window loops it)
+            }
+            CHECK(played && !engine.captureComplete());
+            engine.stopCapture();
+            engine.loadSession(s);
+        }
+        // The old Record window's print is placed from the same exact start.
+        {
+            auto pf = dir.getChildFile("print.wav");
+            juce::String err;
+            engine.setPositionSeconds(2.5);
+            CHECK(engine.startRecording(pf, 0, 32, true, err));
+            juce::AudioBuffer<float> io(2, N);
+            std::vector<float> sent;
+            for (int b = 0; b < 80; ++b) {
+                CHECK(engine.waitForReadAhead(5000));
+                for (int i = 0; i < N; ++i) {
+                    const int k = b * N + i - trip;
+                    io.setSample(0, i, k >= 0 ? sent[size_t(k)] : 0.0f);
+                    io.setSample(1, i, 0.0f);
+                }
+                engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+                for (int i = 0; i < N; ++i) sent.push_back(io.getSample(0, i));
+            }
+            const juce::int64 start = engine.recordStartSample();
+            CHECK(std::abs(engine.recordStartPosition() * 44100.0 - double(start)) < 1e-6);
+            engine.stopRecording();
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(pf));
+            CHECK(r != nullptr);
+            if (r) {
+                juce::AudioBuffer<float> got(2, int(r->lengthInSamples));
+                r->read(&got, 0, got.getNumSamples(), 0, true, true);
+                // File sample i holds programme sample start + i - trip.
+                bool same = true;
+                for (int i = trip + 100; i < trip + 20000; ++i) {
+                    const juce::int64 n = start + i - trip - regionStart;
+                    same &= n >= 0 && got.getSample(0, i) == noise.getSample(0, int(n));
+                }
+                CHECK(same);
+            }
+        }
+        engine.stop();
         engine.loadSession(Session());
         engine.releaseResources();
     }

@@ -84,19 +84,34 @@ private:
 
 class MeterStrip : public juce::Component {
 public:
-    explicit MeterStrip(MeterHub& h) : hub_(h) {}
-    std::function<void()> onOpenBridge, onReset;
+    explicit MeterStrip(MeterHub& out, MeterHub* in = nullptr) : hub_(out), in_(in) {}
+    std::function<void()> onOpenBridge, onReset, onResetInput;
+    // While the inputs are armed the strip splits in two: OUT (what is played) and IN (what
+    // comes back). The owner sets these each tick.
+    bool showInput = false;
+    int inputOvers = 0;          // samples at full scale on the armed inputs; stays until clicked
+    float inputMaxDb = -200.0f;  // highest sample on any armed input (dBFS)
+    juce::String inputName;      // e.g. "3-4"
     void paint(juce::Graphics&) override;
     void mouseDown(const juce::MouseEvent&) override;
 private:
+    void paintSplit(juce::Graphics&);
     MeterHub& hub_;
-    juce::Rectangle<int> bridgeBtn_;
+    MeterHub* in_;
+    juce::Rectangle<int> bridgeBtn_, inHalf_;
 };
 
 class MeterBridge : public juce::Component, private juce::Timer {
 public:
-    explicit MeterBridge(MeterHub& h);
+    explicit MeterBridge(MeterHub& out, MeterHub* in = nullptr);
     std::function<void()> onReset, onStandardChanged, onRefreshReferences;
+    // What the views show: what is played, what comes back on the armed inputs, or both (the
+    // Loudness view then shows the two side by side and the gain through the outboard).
+    enum class Source { Output = 0, Input, Both };
+    void setSource(Source s);
+    Source source() const { return source_; }
+    std::function<void()> onSourceChanged;
+    bool inputsLive = false;    // set by the owner: the inputs are armed
     void refresh() { repaint(); }
     void resized() override;
     void paint(juce::Graphics&) override;
@@ -115,8 +130,13 @@ private:
     void paintBalance(juce::Graphics&, juce::Rectangle<int>);
     void paintStereo(juce::Graphics&, juce::Rectangle<int>);
     void paintBigNumbers(juce::Graphics&, juce::Rectangle<int>);
+    void paintLoudnessBoth(juce::Graphics&, juce::Rectangle<int>);
+    MeterHub& hub() const { return source_ == Source::Input && in_ ? *in_ : out_; }
 
-    MeterHub& hub_;
+    MeterHub& out_;
+    MeterHub* in_;
+    Source source_ = Source::Output;
+    juce::ComboBox sourceBox_;
     View view_ = View::Radar;
     juce::TextButton tabs_[4] = {juce::TextButton{"Radar"}, juce::TextButton{"Loudness"}, juce::TextButton{"Balance"}, juce::TextButton{"Stereo"}};
     juce::ComboBox standard_, speed_;

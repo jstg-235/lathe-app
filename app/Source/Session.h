@@ -195,6 +195,8 @@ public:
     juce::Array<int> laneFormats;
     int laneFormat(int lane) const { return juce::isPositiveAndBelow(lane, laneFormats.size()) ? laneFormats[lane] : 2; }
     void setLaneFormat(int lane, int channels);
+    // Makes room for a new, empty stereo lane at `at`: that lane and the ones below move down.
+    void insertLane(int at);
     // The programme's channel count: 6 when a 5.1 lane has audio, otherwise 2.
     int programmeChannels() const;
     // The source timeline (the material edits are taken from) is a session of its own, saved

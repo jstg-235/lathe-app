@@ -88,6 +88,7 @@ public:
     PluginHost& pluginHost() { return host_; }
     RegionFxBank& regionFx() { return fx_; }
     MeterTap& meterTap() { return tap_; }
+    MeterTap& inputTap() { return inTap_; }   // what arrives on the armed inputs
 
     // Rebuilds the playback source from the session. Keeps position and play state.
     void loadSession(const Session& s);
@@ -120,23 +121,94 @@ public:
     void setSourcePosition(double sec) { sourceTransport_.setPosition(sec); }
     double sourceLength() const { return sourceTransport_.getLengthInSeconds(); }
 
+    // ---- Outputs and inputs ----
+    // Channel numbers here are the interface's own (0 = its first channel), whichever channels
+    // happen to be switched on.
+    // Where playback goes: the first channel of the monitor pair, or -1 for the first outputs that
+    // are switched on. With `six`, a 5.1 programme plays on six outputs from there.
+    void setMonitorOutput(int firstChannel, bool six = false);
+    int monitorOutput() const { return monitorOut_; }
+    juce::StringArray outputPairNames() const;
+    int numOutputChannels() const;    // channels the interface has (not only the ones switched on)
+    int numInputChannelsOnDevice() const;
+    // Switches on the channels asked for (leaving the others as they are). Empty string = fine.
+    juce::String ensureChannels(int firstInput, int inputCount, int firstOutput, int outputCount);
+    // Inputs and outputs are on different interfaces (their clocks can drift apart).
+    bool splitDevices() const;
+    juce::String outputDeviceName() const;
+    juce::String inputDeviceName() const;
+    int bufferSize() const { return block_; }
+
+    // Arming: the chosen inputs are measured (input meters) without recording. Recording and
+    // capturing measure them too.
+    void setArmed(bool on) { armed_ = on; }
+    bool isArmed() const { return armed_; }
+    bool inputsLive() const { return armed_ || recording_ || captureOn_; }
+    // Which inputs are armed: first channel and how many (1, 2 or 6).
+    void setInputSelection(int firstChannel, int channels);
+    int inputSelection() const { return inFirst_; }
+    bool inputSelectionOn() const { return inIdx_ >= 0; }   // those inputs are switched on at the interface
+    int inputSelectionChannels() const { return inChannels_; }
+    // Samples at or above full scale on the armed inputs since the last reset, and the highest
+    // sample seen (linear).
+    int inputOvers() const { return inOvers_; }
+    float inputMax() const { return inMax_; }
+    void resetInputOvers() { inOvers_ = 0; inMax_ = 0.0f; }
+    // Input monitoring: the armed inputs are also played on the monitor pair. Never while the
+    // programme is being sent to the gear on those same outputs (that would feed back).
+    void setInputMonitoring(bool on) { inputMonitoring_ = on; }
+    bool inputMonitoring() const { return inputMonitoring_; }
+
     // ---- Recording ----
-    // Records input channels [firstInput, firstInput+1] to `file` (24-bit or 32-bit float WAV).
-    // With withPlayback, the session plays at the same time (printing through outboard).
-    bool startRecording(const juce::File& file, int firstInput, int bits, bool withPlayback, juce::String& error);
+    // Records `channels` inputs from firstInput to `file` (24-bit or 32-bit float WAV).
+    // With withPlayback, the session plays at the same time (printing through outboard); the file
+    // then starts with the first block the session plays.
+    bool startRecording(const juce::File& file, int firstInput, int bits, bool withPlayback, juce::String& error, int channels = 2);
     void stopRecording();
     bool isRecording() const { return recording_; }
     double recordStartPosition() const { return recStart_; }   // timeline seconds at the first recorded sample
+    // The same, exact: the timeline sample (at the device rate) that was being played when the
+    // file's first sample was taken. Subtract nothing: the round trip is the caller's to add.
+    juce::int64 recordStartSample() const { return recStartSample_; }
     juce::int64 recordedSamples() const { return recSamples_; }
     double recordRate() const { return rate_; }
     // Round-trip latency the interface reports (output + input), in samples.
     int reportedRoundTrip() const;
     int numInputChannels() const;
     juce::StringArray inputPairNames() const;
-    // Loopback latency test: plays a click on the outputs and listens on firstInput.
-    // Returns -1 while running; result in samples when done (0 = nothing heard).
-    void startLatencyTest(int firstInput);
+    // Loopback latency test: plays a click on an output pair (-1 = the monitor pair) and listens
+    // on firstInput. Returns -1 while running; result in samples when done (0 = nothing heard).
+    void startLatencyTest(int firstInput, int firstOutput = -1);
     int latencyTestResult() const { return latResult_; }
+
+    // ---- Capture: the programme out to the gear on one set of outputs, the return recorded ----
+    struct CaptureRequest {
+        juce::File file;            // where the return is written
+        bool levelCheck = false;    // route and measure only: nothing is written, nothing stops
+        int firstInput = 0;         // the return
+        int firstOutput = 0;        // the send
+        int channels = 2;           // 1, 2 or 6
+        int bits = 24;
+        double from = 0, to = 0;    // timeline seconds to capture
+        double preRoll = 2.0, postRoll = 2.0;
+    };
+    // Locates to the pre-roll, starts playback to the send outputs and records the return. The
+    // programme is silent after `to`; recording carries on for the post-roll (the gear's tail)
+    // and then stops by itself on the audio thread, whatever the UI is doing.
+    bool startCapture(const CaptureRequest& rq, const Session& s, juce::String& error);
+    void stopCapture();                                          // keeps what was recorded
+    bool captureActive() const { return captureOn_; }            // routed to the gear (capturing or checking levels)
+    bool captureRecording() const { return captureOn_ && !capLevelOnly_; }
+    bool captureComplete() const { return capDone_; }            // the range and its post-roll are in the file
+    double captureProgress() const;                              // 0..1 through the range
+    // Samples the master chain delays playback by (0 for a 5.1 programme, which bypasses it). What
+    // goes out to the gear is this late, so a capture is moved earlier by it as well.
+    int masterLatency() const { return surround_ ? 0 : chain_.lastLatency(); }
+    // Sets the unprocessed side of the compare to another session (the capture on its own), so
+    // "what was sent" and "what came back" can be switched in step; level matching then turns
+    // down whichever side is louder. Cleared by loadSession().
+    void loadSessionWithAlternate(const Session& main, const Session& alternate);
+    bool hasAlternate() const { return altCompare_; }
 
     // ---- DDP player (plays a finished image straight to the outputs, no processing) ----
     bool loadPlayer(const juce::File& image);
@@ -238,10 +310,35 @@ private:
     void syncDryTo(juce::int64 pos);   // UI thread: start the unprocessed copy where the transport now is
     bool dryFresh_ = true;   // the copy's resampler was just flushed (audio thread, or under dryLock_)
     void processCompare(const juce::AudioSourceChannelInfo& info, juce::int64 endPos, bool playing);
+    void loadSessionImpl(const Session& s, const Session* alternate);
+    std::atomic<bool> altCompare_{false};
+    // The device's block: inputs out, programme rendered on its own, then routed to the outputs.
+    void renderBlock(const juce::AudioSourceChannelInfo& info);
+    void updateRouting();                       // message thread: device channel numbers -> buffer channels
+    int programmeOutputs() const;               // 6 when a 5.1 programme can play on six outputs
+    std::atomic<int> numIn_{-1}, numOut_{-1};   // channels switched on; -1 = no device (tests): the buffer is both
+    std::atomic<int> monitorOut_{-1};
+    std::atomic<bool> monitorSix_{false};
+    std::atomic<int> monIdx_{0}, sendIdx_{-1}, latOutIdx_{-1}, inIdx_{0};   // buffer channels
+    std::atomic<int> inFirst_{0}, inChannels_{2}, sendFirst_{0}, latOutFirst_{-1}, latInFirst_{0}, latInIdx_{0};
+    bool blockPlaying_ = false;        // audio thread: the transport played this block
+    juce::int64 blockEnd_ = 0;         // audio thread: the transport's read position after it
+    float matchGainB_ = 1.0f;
+    bool openWriter(const juce::File& file, int channels, int bits, juce::String& error);
+    std::atomic<bool> armed_{false}, inputMonitoring_{false};
+    std::atomic<int> inOvers_{0};
+    std::atomic<float> inMax_{0.0f};
+    juce::AudioBuffer<float> playBuf_;
+    MeterTap inTap_;
+    // capture
+    std::atomic<bool> captureOn_{false}, capLevelOnly_{false}, capDone_{false};
+    std::atomic<juce::int64> capFrom_{0}, capEnd_{0}, capPost_{0};
+    juce::int64 capTail_ = 0;     // audio thread: samples recorded after the range
+    bool capStarted_ = false;     // audio thread: the transport has been seen playing
     std::atomic<bool> recording_{false}, recWithPlayback_{false};
     std::atomic<double> recStart_{0.0};
-    std::atomic<juce::int64> recSamples_{0};
-    std::atomic<int> recFirstInput_{0};
+    std::atomic<juce::int64> recSamples_{0}, recStartSample_{0};
+    std::atomic<int> recChannels_{2};
     juce::TimeSliceThread writerThread_{"Lathe recorder"};
     std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter> recWriter_;
     juce::CriticalSection recLock_;
@@ -249,7 +346,7 @@ private:
     // latency test (audio thread)
     std::atomic<int> latState_{0};   // 0 idle, 1 running
     std::atomic<int> latResult_{0};
-    int latPos_ = 0, latFirstInput_ = 0, latBest_ = -1;
+    int latPos_ = 0, latBest_ = -1;
     float latPeak_ = 0;
     float refMix_ = 0.0f;   // audio thread only: 0 = master, 1 = reference
     juce::CriticalSection refLock_;   // UI swaps the reference under this; audio thread only try-locks

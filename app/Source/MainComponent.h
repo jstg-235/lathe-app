@@ -15,6 +15,7 @@
 #include "Commands.h"
 #include "EditPanels.h"
 #include "Exporter.h"
+#include "IoPanels.h"
 #include "Session.h"
 #include "SourceView.h"
 #include "Timeline.h"
@@ -214,7 +215,34 @@ private:
     std::unique_ptr<juce::DocumentWindow> markInfoWindow_;
     juce::Component::SafePointer<MarkInfoPanel> markInfoPanel_;
     void crossfadeNewEdits(const juce::Array<int>& ids, Session& s);   // default crossfade on new splices
-    MeterHub meterHub_;
+    MeterHub meterHub_, inputHub_;
+    // ---- Audio Setup, inputs, capture ----
+    IoSettings io_;
+    bool armInputs_ = false, inputsWereLive_ = false;
+    int armTried_ = -1;
+    std::unique_ptr<juce::DocumentWindow> audioSetupWindow_, captureWindow_;
+    struct CaptureRun {
+        bool levelCheck = false, capturing = false;
+        CapturePlan plan;
+        juce::File file;
+        int roundTrip = 0;
+        Session before;          // the session as it was sent to the gear
+        int regionId = 0;        // the capture, once it is on the timeline
+        bool haveTake = false;
+        int hearing = 0;         // 0 not checking, 1 what was sent, 2 the capture
+        juce::String message;
+    } cap_;
+    void saveIo();
+    void applyIo();
+    void showCapture();
+    CapturePanel::Status captureStatus() const;
+    void captureLevelCheck(bool on);
+    void beginCapture();
+    void finishCapture();
+    void captureHear(int which);
+    void endCaptureCheck();
+    void captureNullTest();
+    int captureRoundTrip() const;
     std::unique_ptr<MeterStrip> meters_;
     std::unique_ptr<juce::DocumentWindow> meterWindow_;
     juce::Component::SafePointer<MeterBridge> meterBridge_;

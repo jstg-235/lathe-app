@@ -89,9 +89,10 @@ MainComponent::MainComponent() {
     studio_.fromVar(juce::JSON::parse(props_.getUserSettings()->getValue("studioProfile")));
 
     getLookAndFeel().setColour(juce::ResizableWindow::backgroundColourId, colours::bg);
-    meters_ = std::make_unique<MeterStrip>(meterHub_);
+    meters_ = std::make_unique<MeterStrip>(meterHub_, &inputHub_);
     meters_->onOpenBridge = [this] { showMeterBridge(); };
     meters_->onReset = [this] { meterHub_.reset(); };
+    meters_->onResetInput = [this] { inputHub_.reset(); engine_.resetInputOvers(); };
     addAndMakeVisible(*meters_);
     meterHub_.standard = props_.getUserSettings()->getIntValue("meterStandard", -1);
     srcSession_.lanes = 1;
@@ -233,8 +234,15 @@ MainComponent::MainComponent() {
     recordBtn_.setColour(juce::TextButton::textColourOffId, colours::text);
     recordBtn_.onClick = [this] { commands_.invokeDirectly(cmd::record, true); };
     addAndMakeVisible(recordBtn_);
-    rec_.firstInput = props_.getUserSettings()->getIntValue("recInput", 0);
-    rec_.bits = props_.getUserSettings()->getIntValue("recBits", 24);
+    {
+        // Audio Setup's settings. The first time, the recording format carries over from the Record window.
+        const auto saved = props_.getUserSettings()->getValue("ioSettings");
+        if (saved.isNotEmpty()) io_.fromVar(juce::JSON::parse(saved));
+        else io_.bits = props_.getUserSettings()->getIntValue("recBits", 24) == 32 ? 32 : 24;
+        applyIo();
+    }
+    rec_.firstInput = props_.getUserSettings()->getIntValue("recInput", io_.defaultInput);
+    rec_.bits = io_.bits;
     rec_.extraLatency = props_.getUserSettings()->getIntValue("recExtraLatency", 0);
     rec_.measured = props_.getUserSettings()->getIntValue("recMeasuredLatency", -1);
     rec_.print = props_.getUserSettings()->getBoolValue("recPrint", true);
@@ -457,6 +465,7 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::toggleSnap: info.setTicked(snapBtn_.getToggleState()); break;
         case cmd::followProjectRate: info.setTicked(followRate_); break;
         case cmd::repeatPlay: info.setTicked(repeat_); break;
+        case cmd::armInputs: info.setTicked(armInputs_); break;
         case cmd::lockAllMarks: info.setTicked(session_.lockMarks); break;
         case cmd::gainOverlay: info.setTicked(activeTimeline().gainOverlay()); break;
         case cmd::gainBypass: info.setTicked(activeSession().gainBypass); break;
@@ -785,8 +794,14 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::restoreRegion: showRestore(targetRegion()); break;
         case cmd::spectralEditor: showSpectral(targetRegion()); break;
         case cmd::record:
-            if (engine_.isRecording()) finishRecording();
+            if (cap_.capturing) finishCapture();
+            else if (engine_.isRecording()) finishRecording();
             else showRecordDialog();
+            break;
+        case cmd::capture: showCapture(); break;
+        case cmd::armInputs:
+            armInputs_ = !armInputs_;
+            commands_.commandStatusChanged();
             break;
         case cmd::openDdpSession: {
             chooser_ = std::make_unique<juce::FileChooser>("Open a DDP folder as a session");
@@ -891,7 +906,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::listenReference, cmd::compareUnprocessed, cmd::compareLevelMatch, cmd::compareEnd});
             m.addSeparator();
-            add({cmd::record});
+            add({cmd::record, cmd::capture, cmd::armInputs});
             m.addSeparator();
             add({cmd::playFromPlayhead, cmd::playRepeatInOut});
             m.addSeparator();
@@ -1580,6 +1595,7 @@ void MainComponent::toggleCompareUnprocessed() {
     // First press: Compare Unprocessed comes on and you hear B. After that, W switches sides
     // (A / B, or B / C with Level Match); End (Option-W) goes back to normal playback.
     if (!compare_) {
+        endCaptureCheck();
         compare_ = true;
         engine_.setHearUnprocessed(true);
     } else {
@@ -1628,9 +1644,10 @@ public:
         auto pairs = e_.inputPairNames();
         for (int i = 0; i < pairs.size(); ++i) input_.addItem(pairs[i], i + 1);
         input_.setSelectedId(juce::jlimit(1, juce::jmax(1, pairs.size()), firstInput / 2 + 1), juce::dontSendNotification);
-        bits_.addItem("24-bit", 24);
-        bits_.addItem("32-bit float", 32);
-        bits_.setSelectedId(bits == 32 ? 32 : 24, juce::dontSendNotification);
+        bitsValue_ = bits == 32 ? 32 : 24;
+        bitsInfo_.setText(juce::String(bitsValue_ == 32 ? "32-bit float" : "24-bit") + " WAV  (the format and the folder are in Audio Setup)", juce::dontSendNotification);
+        input_.onChange = [this] { e_.setInputSelection(this->firstInput(), 2); };
+        e_.setInputSelection(this->firstInput(), 2);
         print_.setButtonText("Play the session while recording (print through outboard)");
         print_.setToggleState(print && haveSession, juce::dontSendNotification);
         print_.setEnabled(haveSession);
@@ -1640,7 +1657,7 @@ public:
         mute_.setButtonText("Mute the source regions after printing");
         mute_.setToggleState(mute, juce::dontSendNotification);
         for (auto* t : {&print_, &punch_, &mute_}) { t->setColour(juce::ToggleButton::textColourId, colours::text); addAndMakeVisible(*t); }
-        for (auto* l : {&inLbl_, &bitsLbl_, &latLbl_, &latInfo_}) { l->setColour(juce::Label::textColourId, colours::dim); addAndMakeVisible(*l); }
+        for (auto* l : {&inLbl_, &bitsLbl_, &bitsInfo_, &latLbl_, &latInfo_}) { l->setColour(juce::Label::textColourId, colours::dim); addAndMakeVisible(*l); }
         inLbl_.setText("Inputs", juce::dontSendNotification);
         bitsLbl_.setText("Format", juce::dontSendNotification);
         latLbl_.setText("Extra offset (samples)", juce::dontSendNotification);
@@ -1649,7 +1666,6 @@ public:
         extra_.setColour(juce::TextEditor::backgroundColourId, colours::panel);
         extra_.setColour(juce::TextEditor::textColourId, colours::text);
         addAndMakeVisible(input_);
-        addAndMakeVisible(bits_);
         addAndMakeVisible(extra_);
         for (auto* b : {&measure_, &record_, &cancel_}) { styleButton(*b, b == &record_); addAndMakeVisible(*b); }
         record_.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff9a2a24));
@@ -1670,7 +1686,7 @@ public:
     }
     std::function<void()> onRecord, onCancel;
     int firstInput() const { return (input_.getSelectedId() - 1) * 2; }
-    int bits() const { return bits_.getSelectedId(); }
+    int bits() const { return bitsValue_; }
     bool print() const { return print_.getToggleState(); }
     bool punch() const { return punch_.getToggleState(); }
     bool mute() const { return mute_.getToggleState(); }
@@ -1681,7 +1697,7 @@ public:
         auto r = getLocalBounds().reduced(12);
         auto row = [&](juce::Label& l, juce::Component& c) { auto x = r.removeFromTop(26); l.setBounds(x.removeFromLeft(150)); c.setBounds(x); r.removeFromTop(6); };
         row(inLbl_, input_);
-        row(bitsLbl_, bits_);
+        row(bitsLbl_, bitsInfo_);
         for (auto* t : {&print_, &punch_, &mute_}) { t->setBounds(r.removeFromTop(24)); r.removeFromTop(2); }
         r.removeFromTop(6);
         auto x = r.removeFromTop(26);
@@ -1713,31 +1729,28 @@ private:
     AudioEngine& e_;
     int measured_;
     bool testing_ = false;
-    juce::ComboBox input_, bits_;
+    juce::ComboBox input_;
+    int bitsValue_ = 24;
     juce::ToggleButton print_, punch_, mute_;
-    juce::Label inLbl_, bitsLbl_, latLbl_, latInfo_;
+    juce::Label inLbl_, bitsLbl_, bitsInfo_, latLbl_, latInfo_;
     juce::TextEditor extra_;
     juce::TextButton measure_{"Measure (loopback)"}, record_{"Record"}, cancel_{"Cancel"};
 };
 }  // namespace
 
-juce::File MainComponent::recordingsFolder() const {
-    if (session_.file.existsAsFile())
-        return session_.file.getSiblingFile(session_.file.getFileNameWithoutExtension() + " Recordings");
-    return juce::File::getSpecialLocation(juce::File::userMusicDirectory).getChildFile("Lathe Recordings");
-}
+juce::File MainComponent::recordingsFolder() const { return lathe::recordingsFolder(io_, session_.file); }
 
 void MainComponent::showRecordDialog() {
     recWindow_.reset();
     auto sel = timeline_.selection();
-    auto* p = new RecordPanel(engine_, !session_.regions.isEmpty(), !sel.isEmpty(), rec_.firstInput, rec_.bits, rec_.print, rec_.autoPunch,
+    auto* p = new RecordPanel(engine_, !session_.regions.isEmpty(), !sel.isEmpty(), rec_.firstInput, io_.bits, rec_.print, rec_.autoPunch,
                               rec_.muteSources, rec_.extraLatency, rec_.measured);
     juce::Component::SafePointer<RecordPanel> safe(p);
     p->onCancel = [this] { juce::MessageManager::callAsync([this] { recWindow_.reset(); }); };
     p->onRecord = [this, safe] {
         if (!safe) return;
         rec_.firstInput = safe->firstInput();
-        rec_.bits = safe->bits();
+        rec_.bits = io_.bits;
         rec_.print = safe->print();
         rec_.autoPunch = safe->punch();
         rec_.muteSources = safe->mute();
@@ -1745,7 +1758,6 @@ void MainComponent::showRecordDialog() {
         rec_.measured = safe->measured();
         auto* u = props_.getUserSettings();
         u->setValue("recInput", rec_.firstInput);
-        u->setValue("recBits", rec_.bits);
         u->setValue("recExtraLatency", rec_.extraLatency);
         u->setValue("recMeasuredLatency", rec_.measured);
         u->setValue("recPrint", rec_.print);
@@ -1759,12 +1771,13 @@ void MainComponent::showRecordDialog() {
 
 void MainComponent::beginRecording() {
     auto folder = recordingsFolder();
-    auto stamp = juce::Time::getCurrentTime().formatted("%Y-%m-%d %H%M%S");
-    recFile_ = folder.getNonexistentChildFile((rec_.print ? "Print " : "Recording ") + stamp, ".wav", false);
+    if (cap_.capturing || cap_.levelCheck) return;
+    endCaptureCheck();
+    recFile_ = folder.getNonexistentChildFile(recordingName(session_.file, rec_.print ? "Print" : "Recording", juce::Time::getCurrentTime()), ".wav", false);
     recPunch_ = rec_.autoPunch ? timeline_.selection() : juce::Range<double>();
     if (rec_.print && !recPunch_.isEmpty()) engine_.setPositionSeconds(juce::jmax(0.0, recPunch_.getStart() - 2.0));   // 2 s pre-roll
     juce::String err;
-    if (!engine_.startRecording(recFile_, rec_.firstInput, rec_.bits, rec_.print && !session_.regions.isEmpty(), err)) {
+    if (!engine_.startRecording(recFile_, rec_.firstInput, io_.bits, rec_.print && !session_.regions.isEmpty(), err)) {
         juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Couldn't record", err);
         return;
     }
@@ -1774,7 +1787,8 @@ void MainComponent::beginRecording() {
 void MainComponent::finishRecording() {
     if (!engine_.isRecording()) return;
     const bool printed = rec_.print && !session_.regions.isEmpty();
-    const double start = engine_.recordStartPosition();
+    const double start = engine_.recordStartPosition();   // (to the sample when the session was playing)
+    const int chainLatency = engine_.masterLatency();     // the print left the master plugins this late
     engine_.stopRecording();
     std::unique_ptr<juce::AudioFormatReader> r(engine_.formats().createReaderFor(recFile_));
     if (!r || r->lengthInSamples < 16) {
@@ -1785,7 +1799,7 @@ void MainComponent::finishRecording() {
     reg.start = start;
     if (printed) {
         // The return arrives one round trip late: drop those samples so the print lines up.
-        int lat = (rec_.measured > 0 ? rec_.measured : engine_.reportedRoundTrip()) + rec_.extraLatency;
+        int lat = (rec_.measured > 0 ? rec_.measured : engine_.reportedRoundTrip()) + rec_.extraLatency + chainLatency;
         reg.srcIn = juce::jlimit<juce::int64>(0, reg.srcOut - 1, lat);
         if (!recPunch_.isEmpty()) {
             // Auto-punch: keep only the destination In-Out of the print.
@@ -1813,6 +1827,284 @@ void MainComponent::finishRecording() {
     timeline_.resized();
     timeline_.selectRegion(reg.id);
     commands_.commandStatusChanged();
+}
+
+// ---------------------------------------------------------------- audio setup settings, capture
+
+void MainComponent::saveIo() { props_.getUserSettings()->setValue("ioSettings", juce::JSON::toString(io_.toVar(), true)); }
+
+void MainComponent::applyIo() {
+    const int was = engine_.playbackChannels();
+    if (io_.monitorOut >= 0) engine_.setMonitorOutput(io_.monitorOut, io_.monitorSix);
+    engine_.setInputMonitoring(io_.inputMonitoring);
+    // A 5.1 programme changes between six outputs and the stereo fold-down with the setting.
+    if (session_.programmeChannels() == 6 && !cap_.capturing && !cap_.levelCheck && cap_.hearing == 0) {
+        engine_.loadSession(session_);
+        juce::ignoreUnused(was);
+    }
+}
+
+int MainComponent::captureRoundTrip() const {
+    const int saved = io_.delay(IoSettings::delayKey(engine_.outputDeviceName(), engine_.inputDeviceName(), io_.captureOut, io_.captureIn,
+                                                     engine_.deviceRate(), engine_.bufferSize()));
+    return saved > 0 ? saved : engine_.reportedRoundTrip();
+}
+
+CapturePanel::Status MainComponent::captureStatus() const {
+    CapturePanel::Status st;
+    st.checkingLevels = cap_.levelCheck;
+    st.capturing = cap_.capturing;
+    st.progress = engine_.captureProgress();
+    st.haveTake = cap_.haveTake && session_.findRegion(cap_.regionId) != nullptr;
+    st.hearing = cap_.hearing;
+    st.levelMatch = engine_.levelMatch() && cap_.hearing != 0;
+    st.matchMeasured = cap_.hearing != 0 && engine_.matchMeasured();
+    st.matchDifferenceDb = engine_.matchDifferenceDb();
+    st.message = cap_.message;
+    return st;
+}
+
+void MainComponent::showCapture() {
+    if (captureWindow_) { captureWindow_->setVisible(true); captureWindow_->toFront(true); return; }
+    CapturePanel::Host h;
+    h.plan = [this] { return planCapture(session_, timeline_.selection()); };
+    h.status = [this] { return captureStatus(); };
+    h.levelCheck = [this](bool on) { captureLevelCheck(on); };
+    h.capture = [this] { beginCapture(); };
+    h.stop = [this] { finishCapture(); };
+    h.hear = [this](int which) { captureHear(which); };
+    h.levelMatch = [this](bool on) { if (cap_.hearing != 0) engine_.setLevelMatch(on); };
+    h.nullTest = [this] { captureNullTest(); };
+    h.settingsChanged = [this] { saveIo(); };
+    h.audioSetup = [this] { showAudioSettings(); };
+    h.folder = [this] { return recordingsFolder(); };
+    auto* p = new CapturePanel(engine_, io_, meterHub_, inputHub_, std::move(h));
+    auto* w = new PlainWindow(p, "Capture Through Outboard", true);
+    w->onClose = [this] {
+        juce::MessageManager::callAsync([this] {
+            if (cap_.levelCheck) captureLevelCheck(false);
+            endCaptureCheck();
+            if (!cap_.capturing) captureWindow_.reset();   // (a capture in progress keeps its window)
+        });
+    };
+    captureWindow_.reset(w);
+    engine_.setInputSelection(io_.captureIn, planCapture(session_, timeline_.selection()).channels);
+}
+
+void MainComponent::captureLevelCheck(bool on) {
+    if (cap_.capturing) return;
+    if (!on) {
+        if (!cap_.levelCheck) return;
+        cap_.levelCheck = false;
+        engine_.stopCapture();
+        engine_.loadSession(session_);
+        return;
+    }
+    endCaptureCheck();
+    endCompare();
+    auto plan = planCapture(session_, timeline_.selection());
+    if (!plan.valid()) return;
+    AudioEngine::CaptureRequest rq;
+    rq.levelCheck = true;
+    rq.firstInput = io_.captureIn;
+    rq.firstOutput = io_.captureOut;
+    rq.channels = plan.channels;
+    rq.from = plan.range.getStart();
+    rq.to = plan.range.getEnd();
+    rq.preRoll = 0.0;
+    juce::String err;
+    if (!engine_.startCapture(rq, session_, err)) {
+        engine_.loadSession(session_);
+        cap_.message = "!" + err;
+        return;
+    }
+    cap_.plan = plan;
+    cap_.levelCheck = true;
+    cap_.message = {};
+    meterHub_.reset();
+    inputHub_.reset();
+    engine_.resetInputOvers();
+}
+
+void MainComponent::beginCapture() {
+    if (cap_.capturing || engine_.isRecording()) return;
+    if (cap_.levelCheck) captureLevelCheck(false);
+    endCaptureCheck();
+    endCompare();
+    auto plan = planCapture(session_, timeline_.selection());
+    if (!plan.valid()) return;
+    const auto folder = recordingsFolder();
+    folder.createDirectory();
+    // Room on the disk for the whole take, with some to spare.
+    const auto need = recordingBytes(plan.range.getLength() + 2.0 + io_.capturePostRoll, engine_.deviceRate(), plan.channels, io_.bits);
+    const auto freeBytes = folder.getBytesFreeOnVolume();
+    if (!folder.isDirectory()) { cap_.message = "!Couldn't create " + folder.getFullPathName(); return; }
+    if (freeBytes > 0 && freeBytes < need + (juce::int64(64) << 20)) {
+        cap_.message = "!Not enough room: the capture needs " + byteSize(need) + " and " + byteSize(freeBytes) + " is free in " + folder.getFullPathName() +
+                       ". Choose another folder in Audio Setup.";
+        return;
+    }
+    cap_.file = folder.getNonexistentChildFile(recordingName(session_.file, "Capture", juce::Time::getCurrentTime()), ".wav", false);
+    cap_.plan = plan;
+    cap_.before = session_;
+    cap_.before.source = nullptr;
+    cap_.roundTrip = captureRoundTrip();
+    cap_.haveTake = false;
+    cap_.regionId = 0;
+    AudioEngine::CaptureRequest rq;
+    rq.file = cap_.file;
+    rq.firstInput = io_.captureIn;
+    rq.firstOutput = io_.captureOut;
+    rq.channels = plan.channels;
+    rq.bits = io_.bits;
+    rq.from = plan.range.getStart();
+    rq.to = plan.range.getEnd();
+    rq.preRoll = 2.0;
+    rq.postRoll = io_.capturePostRoll;
+    juce::String err;
+    if (!engine_.startCapture(rq, session_, err)) {
+        engine_.loadSession(session_);
+        cap_.message = "!" + err;
+        return;
+    }
+    cap_.capturing = true;
+    cap_.message = {};
+    meterHub_.reset();
+    inputHub_.reset();
+    engine_.resetInputOvers();
+    commands_.commandStatusChanged();
+}
+
+void MainComponent::finishCapture() {
+    if (!cap_.capturing) return;
+    cap_.capturing = false;
+    const bool complete = engine_.captureComplete();
+    const juce::int64 startSample = engine_.recordStartSample();
+    const int overs = engine_.inputOvers();
+    const int chainLatency = engine_.masterLatency();   // the send left the master plugins this late
+    engine_.stopCapture();   // closes the file: whatever was recorded is kept
+    lastStopDest_ = engine_.positionSeconds();
+    wasPlaying_ = false;
+    CaptureTake take;
+    take.file = cap_.file;
+    take.startSample = startSample;
+    take.roundTrip = cap_.roundTrip + chainLatency;
+    if (std::unique_ptr<juce::AudioFormatReader> r{engine_.formats().createReaderFor(cap_.file)}) {
+        take.rate = r->sampleRate;
+        take.length = r->lengthInSamples;
+    }
+    const int id = placeCapture(session_, cap_.plan, take, io_.captureMute, cap_.file.getFileNameWithoutExtension());
+    if (id == 0) {
+        engine_.loadSession(session_);
+        cap_.message = "!Stopped before the range began, so there is nothing to put on the timeline.";
+        commands_.commandStatusChanged();
+        return;
+    }
+    cap_.regionId = id;
+    cap_.haveTake = true;
+    const auto* reg = session_.findRegion(id);
+    const double got = reg ? reg->length() : 0.0, want = cap_.plan.range.getLength();
+    sessionChanged();
+    timeline_.resized();
+    timeline_.selectRegion(id);
+    engine_.setPositionSeconds(cap_.plan.range.getStart());
+    timeline_.setPlayhead(cap_.plan.range.getStart(), false);
+    cap_.message = complete || got >= want - 0.01 ? "Captured " + msfString(got) + " onto lane " + juce::String(cap_.plan.underLane + 2) + ", in sync." +
+                                                        (io_.captureMute ? " The original is muted." : " The original still plays too: mute one of them (U).")
+                                                  : "!Stopped early: kept the first " + msfString(got) + " of " + msfString(want) + ".";
+    if (overs > 0) cap_.message = "!" + cap_.message.trimCharactersAtStart("!") + " The return clipped (" + juce::String(overs) + " samples): turn the gear down and capture again.";
+    commands_.commandStatusChanged();
+}
+
+void MainComponent::captureHear(int which) {
+    if (which == 0) { endCaptureCheck(); return; }
+    if (cap_.capturing || cap_.levelCheck || !cap_.haveTake || !session_.findRegion(cap_.regionId)) return;
+    if (cap_.hearing == 0) {
+        // The engine plays the session as it was sent (through the master plugins) with the
+        // capture alongside, in step and untouched; switching between them is instant.
+        endCompare();
+        engine_.loadSessionWithAlternate(cap_.before, captureAlone(session_, cap_.regionId));
+        engine_.resetMatch();
+    }
+    cap_.hearing = which;
+    engine_.setHearUnprocessed(which == 2);
+}
+
+void MainComponent::endCaptureCheck() {
+    if (cap_.hearing == 0) return;
+    cap_.hearing = 0;
+    engine_.setHearUnprocessed(false);
+    engine_.setLevelMatch(false);
+    engine_.loadSession(session_);
+}
+
+void MainComponent::captureNullTest() {
+    const auto* reg = session_.findRegion(cap_.regionId);
+    if (!cap_.haveTake || !reg || cap_.capturing) return;
+    if (std::abs(cap_.before.effectiveRate() - reg->fileRate) > 0.5) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Null test",
+                                               "The capture was made at " + juce::String(reg->fileRate / 1000.0, 1) + " kHz and the session is " +
+                                                   juce::String(cap_.before.effectiveRate() / 1000.0, 1) +
+                                                   " kHz, so they can't be compared sample for sample. Capture with the interface at the session's rate.");
+        return;
+    }
+    endCaptureCheck();
+    const Region capture = *reg;
+    const Session before = cap_.before;
+    const juce::Range<double> range(capture.start, capture.end());
+    auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("Lathe null test");
+    dir.createDirectory();
+    const auto sent = dir.getChildFile("sent.wav"), back = dir.getChildFile("capture.wav");
+    auto es = exportSettings();
+    auto res = std::make_shared<NullResult>();
+    auto err = std::make_shared<juce::String>();
+    runJob("Null test: the capture against what was sent...",
+           [this, capture, before, range, sent, back, es, res, err](Job& j) {
+               *err = exporter_.exportRangeWav(before, sent, 32, es, range, [&](double p) { return j.keep(p * 0.5); });
+               if (err->isNotEmpty()) return;
+               // The captured stretch on its own, as the region plays it.
+               std::unique_ptr<juce::AudioFormatReader> r(engine_.formats().createReaderFor(capture.file));
+               if (!r) { *err = "Couldn't read " + capture.file.getFileName(); return; }
+               back.deleteFile();
+               juce::WavAudioFormat wav;
+               std::unique_ptr<juce::OutputStream> os(back.createOutputStream().release());
+               const int ch = int(r->numChannels);
+               const auto layout = ch == 6 ? juce::AudioChannelSet::create5point1() : ch == 1 ? juce::AudioChannelSet::mono() : juce::AudioChannelSet::stereo();
+               std::unique_ptr<juce::AudioFormatWriter> w(os ? wav.createWriterFor(os.get(), r->sampleRate, layout, 32, {}, 0) : nullptr);
+               if (!w) { *err = "Couldn't write " + back.getFullPathName(); return; }
+               os.release();
+               w->writeFromAudioReader(*r, capture.srcIn, capture.srcOut - capture.srcIn);
+               w.reset();
+               *res = nullTest(engine_.formats(), sent, back, juce::File(), [&](double p) { return j.keep(0.5 + p * 0.5); });
+           },
+           [this, res, err, sent, back](bool cancelled) {
+               sent.deleteFile();
+               back.deleteFile();
+               if (cancelled) return;
+               if (err->isNotEmpty() || !res->ok) {
+                   juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Null test", err->isNotEmpty() ? *err : res->error);
+                   return;
+               }
+               const auto& r = *res;
+               const double left = r.signalRms > 0 && r.residualRmsGainMatched > 0 ? 20.0 * std::log10(r.residualRmsGainMatched / r.signalRms) : -200.0;
+               juce::String t;
+               t << "THE CAPTURE AGAINST WHAT WAS SENT\n\n";
+               t << "Timing     " << (r.offset == 0 ? juce::String("lines up to the sample")
+                                                     : "the capture is " + juce::String(std::abs(int(r.offset))) + " samples " + (r.offset > 0 ? "late" : "early") +
+                                                           " (" + juce::String(std::abs(double(r.offset)) * 1000.0 / r.rateA, 2) + " ms)")
+                 << "\n";
+               t << "Polarity   " << (r.inverted ? "INVERTED: a cable or the gear flips the polarity" : "the same") << "\n";
+               t << "Level      the capture is " << juce::String(std::abs(r.gainDiffDb), 2) << " dB " << (r.gainDiffDb > 0 ? "quieter" : "louder") << " than what was sent\n";
+               t << "Left over  " << (left <= -150.0 ? juce::String("nothing") : juce::String(left, 1) + " dB below the music (after matching the level)") << "\n\n";
+               if (r.offset != 0)
+                   t << "The capture isn't lined up. Measure the round trip again in the Capture window (with the gear set as it was for the capture) and capture "
+                        "again, or nudge the region by the amount above.\n";
+               else if (left < -60.0)
+                   t << "Patch and alignment are right, and the path is transparent: with the level matched, what came back is what was sent.\n";
+               else
+                   t << "Patch and alignment are right. What is left over is what the gear (and its converters) did to the sound.\n";
+               showText("Null test", t);
+           });
 }
 
 // ---------------------------------------------------------------- control surfaces
@@ -2091,6 +2383,11 @@ void MainComponent::sessionChanged(bool undoable) {
     if (analysis_ && !analysisStale_) { analysisStale_ = true; timeline_.setAnalysisStale(true); }
     applyFollowRate();
     engine_.loadSession(session_);
+    if (cap_.hearing != 0) {   // (the engine was playing the session as sent, against the capture)
+        cap_.hearing = 0;
+        engine_.setHearUnprocessed(false);
+        engine_.setLevelMatch(false);
+    }
     if (auto st = juce::JSON::toString(srcSession_.toVar(), true); st != lastSourceState_) {
         lastSourceState_ = st;
         engine_.loadSourceSession(srcSession_);
@@ -2369,6 +2666,8 @@ void MainComponent::locateDest(double t) {
 }
 
 void MainComponent::stopAll() {
+    if (cap_.capturing) { finishCapture(); return; }   // keeps what was recorded
+    if (cap_.levelCheck) captureLevelCheck(false);
     lastStopDest_ = engine_.positionSeconds();
     lastStopSource_ = engine_.sourcePosition();
     auditionEnd_ = -1;
@@ -3151,14 +3450,13 @@ void MainComponent::verifyDdp() {
 }
 
 void MainComponent::showAudioSettings() {
-    auto* sel = new juce::AudioDeviceSelectorComponent(engine_.devices(), 0, 0, 2, 2, false, false, true, false);
-    sel->setSize(500, 400);
-    juce::DialogWindow::LaunchOptions o;
-    o.content.setOwned(sel);
-    o.dialogTitle = "Audio Setup";
-    o.dialogBackgroundColour = colours::bg;
-    o.useNativeTitleBar = true;
-    o.launchAsync();
+    if (audioSetupWindow_) { audioSetupWindow_->setVisible(true); audioSetupWindow_->toFront(true); return; }
+    auto* p = new AudioSetupPanel(engine_, io_, [this] { return session_.file; },
+                                  [this] { return session_.regions.isEmpty() ? 0.0 : session_.effectiveRate(); });
+    p->onChange = [this] { saveIo(); applyIo(); };
+    auto* w = new PlainWindow(p, "Audio Setup", true);
+    w->onClose = [this] { juce::MessageManager::callAsync([this] { audioSetupWindow_.reset(); }); };
+    audioSetupWindow_.reset(w);
 }
 
 void MainComponent::showText(const juce::String& title, const juce::String& text) {
@@ -3259,7 +3557,17 @@ void MainComponent::timerCallback() {
         timeDisplay_.setColour(juce::Label::textColourId, colours::wave);
     }
     recordBtn_.setToggleState(engine_.isRecording(), juce::dontSendNotification);
-    if (engine_.isRecording()) {
+    if (cap_.capturing) {
+        timeDisplay_.setColour(juce::Label::textColourId, colours::error);
+        if (engine_.captureComplete() || !engine_.captureActive()) finishCapture();
+    } else if (cap_.levelCheck) {
+        // Round and round the range, until Level check is switched off.
+        if (!engine_.captureActive()) cap_.levelCheck = false;
+        else if (!engine_.isPlaying() || pos >= cap_.plan.range.getEnd()) {
+            engine_.setPositionSeconds(cap_.plan.range.getStart());
+            if (!engine_.isPlaying()) engine_.play();
+        }
+    } else if (engine_.isRecording()) {
         timeDisplay_.setColour(juce::Label::textColourId, colours::error);
         if (!engine_.isPlaying() && !rec_.print) timeDisplay_.setText("REC " + msfString(double(engine_.recordedSamples()) / engine_.recordRate()), juce::dontSendNotification);
         if (rec_.print && rec_.autoPunch && !recPunch_.isEmpty() && pos > recPunch_.getEnd() + 1.0) finishRecording();
@@ -3287,6 +3595,37 @@ void MainComponent::timerCallback() {
     meterHub_.sessionTarget = session_.loudnessTarget;
     meterHub_.prepare(engine_.deviceRate());
     meterHub_.feed(engine_.meterTap());
+    {
+        // Inputs: armed while Record or Capture is open, or with Arm Inputs on.
+        const bool arm = armInputs_ || recWindow_ != nullptr || captureWindow_ != nullptr;
+        if (arm != engine_.isArmed()) {
+            engine_.setArmed(arm);
+            if (arm && !recWindow_ && !captureWindow_) engine_.setInputSelection(io_.defaultInput, 2);
+        }
+        if (arm && !engine_.inputSelectionOn()) {
+            // Switch the armed inputs on at the interface (once per choice: it may not have them).
+            const int key = engine_.inputSelection() * 8 + engine_.inputSelectionChannels();
+            if (key != armTried_) {
+                armTried_ = key;
+                engine_.ensureChannels(engine_.inputSelection(), engine_.inputSelectionChannels(), 0, 0);
+            }
+        } else if (!arm) {
+            armTried_ = -1;
+        }
+        const bool live = engine_.inputsLive();
+        inputHub_.standard = meterHub_.standard;
+        inputHub_.sessionTarget = session_.loudnessTarget;
+        inputHub_.prepare(engine_.deviceRate());
+        if (live && !inputsWereLive_) { inputHub_.reset(); engine_.inputTap().clear(); engine_.resetInputOvers(); }
+        inputsWereLive_ = live;
+        inputHub_.feed(engine_.inputTap());
+        meters_->showInput = live;
+        meters_->inputOvers = engine_.inputOvers();
+        meters_->inputMaxDb = juce::Decibels::gainToDecibels(engine_.inputMax(), -200.0f);
+        const int first = engine_.inputSelection(), n = engine_.inputSelectionChannels();
+        meters_->inputName = n == 1 ? juce::String(first + 1) : juce::String(first + 1) + "-" + juce::String(first + n);
+        if (meterBridge_) meterBridge_->inputsLive = live;
+    }
     meters_->repaint();
     if (meterBridge_ && meterWindow_ && meterWindow_->isVisible()) meterBridge_->refresh();
 
@@ -3538,8 +3877,10 @@ void MainComponent::exportSelectedSegments() {
 
 void MainComponent::showMeterBridge() {
     if (meterWindow_) { meterWindow_->setVisible(true); meterWindow_->toFront(true); return; }
-    auto* bridge = new MeterBridge(meterHub_);
-    bridge->onReset = [this] { meterHub_.reset(); };
+    auto* bridge = new MeterBridge(meterHub_, &inputHub_);
+    bridge->onReset = [this] { meterHub_.reset(); inputHub_.reset(); engine_.resetInputOvers(); };
+    bridge->setSource(MeterBridge::Source(juce::jlimit(0, 2, props_.getUserSettings()->getIntValue("meterSource", 0))));
+    bridge->onSourceChanged = [this] { if (meterBridge_) props_.getUserSettings()->setValue("meterSource", int(meterBridge_->source())); };
     bridge->onStandardChanged = [this] { props_.getUserSettings()->setValue("meterStandard", meterHub_.standard); meters_->repaint(); };
     bridge->onRefreshReferences = [this] { loadReferenceProfiles(true); };
     meterBridge_ = bridge;

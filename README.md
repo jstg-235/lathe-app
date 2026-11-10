@@ -108,6 +108,49 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
 - **End** (Option-W) returns to normal playback. Nothing here reaches an export, and the meters
   always read the processed side (A).
 
+## Audio Setup, input meters and Capture (v0.12)
+
+- **Audio Setup** (Tools > Audio Setup) is now a full window in three parts:
+  - **Output**: interface, sample rate, buffer size and the output pair you monitor on (with six
+    outputs from that pair for a 5.1 programme, when the interface has them).
+  - **Input**: the input interface, which input pairs are switched on, and the default input pair.
+  - **Recording**: where recordings go (next to the session by default, in "<Session> Recordings",
+    or a folder you choose, shown with its full path and the free space), the format (24-bit or
+    32-bit float; this moved here from the Record window), how files are named (session, then
+    Recording / Print / Capture, then date and time), the round-trip delay, and input monitoring
+    through Lathe (off by default).
+  - The **round-trip delay** is measured with one click on the sockets you choose, and remembered
+    for that interface, output pair, input pair, sample rate and buffer size.
+  - It warns when inputs and outputs are on different interfaces (their clocks drift) and when
+    the interface isn't at the session's sample rate.
+- **Input meters**. Whenever the inputs are armed (the Record or Capture window is open, or
+  Transport > Arm Inputs, Ctrl-Shift-R), the main meter splits into **OUT | IN**. The IN side shows
+  peak, true peak, a 3 s hold, the maximum, momentary loudness, and a clip light with an overs count
+  that both stay lit until you click them. The Meter Bridge has a source choice: **Output**,
+  **Input** or **Both**. On Both, the Loudness view shows the two sets of bars side by side and the
+  gain through the outboard in LU.
+- **Capture Through Outboard** (Transport menu, Ctrl-R) sends the programme through your gear and
+  records what comes back:
+  - **Route**: an output pair to the gear and an input pair for the return. The saved round-trip
+    delay for those sockets is used; Measure now re-measures it.
+  - **Level check** plays the range round and round through the gear without recording, with OUT
+    and IN meters and the gain between them; it warns within 1 dB of clipping and when nothing comes
+    back.
+  - **What is captured**: the destination In-Out, or the whole programme when nothing is selected,
+    with a 2 s pre-roll and a post-roll for the gear's tail. The channels follow the lane type:
+    mono, stereo or 5.1.
+  - **The result** lands on a new lane directly under the original, in sync with it: the round trip
+    and the master plugins' own delay are taken off, to the sample. The pre-roll and the tail stay in
+    the file behind the region's edges. The original is left playing unless "Mute the original" is
+    ticked (only the captured stretch is muted).
+  - **Check the capture**: switch between what was sent and what came back, in step and
+    level-matched (the louder side is turned down), and run a **null test** that reports timing,
+    polarity, level and what is left over. With a cable in place of the gear, nothing should be left.
+  - **Safety**: free disk space is checked before it starts, the recording runs on the audio and
+    disk threads (a busy screen doesn't interrupt it), and stopping early keeps what was recorded.
+- While capturing, Lathe plays nothing on your output pair unless input monitoring is on, and it
+  never plays the return back onto the outputs that feed the gear.
+
 ## Stability by design
 
 - Audio is streamed from disk on a background thread; the audio callback never touches the disk.

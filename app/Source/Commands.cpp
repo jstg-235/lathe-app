@@ -105,6 +105,8 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::editPointFollowsStop, "Edit Point Follows Playhead on Stop", "Transport", "When on, stopping moves the Edit Point to where you stopped; when off, Play returns to the Edit Point", ""},
         {cmd::playbackSettings, "Playback & Nudge Settings...", "Transport", "Pre-roll, post-roll and the three nudge sizes", ""},
         {cmd::record, "Record / Stop Recording", "Transport", "Record the inputs, or print the session through outboard and record the return", "shift + R"},
+        {cmd::capture, "Capture Through Outboard...", "Transport", "Send the In-Out (or the whole programme) through your gear and record the return onto a new lane, in sync", "control + R"},
+        {cmd::armInputs, "Arm Inputs (Input Meters)", "Transport", "Measure the inputs without recording: the meter splits into OUT and IN", "control + shift + R"},
         // Markers
         {cmd::addTrackMarker, "Add Track Marker", "Markers", "New CD track (index 01) at the playhead", "M"},
         {cmd::addIndexMarker, "Add Index Marker", "Markers", "New sub-index in the current track at the playhead", "shift + M"},

@@ -152,8 +152,100 @@ dsp::BalanceProfile MeterHub::profileOfFile(juce::AudioFormatManager& fm, const 
 
 // ================================================================= MeterStrip
 
+void MeterStrip::paintSplit(juce::Graphics& g) {
+    // OUT | IN: what is played, and what comes back on the armed inputs.
+    auto r = getLocalBounds().reduced(6);
+    auto bottom = r.removeFromBottom(18);
+    bridgeBtn_ = bottom.removeFromRight(90);
+    g.setColour(colours::panel2);
+    g.fillRoundedRectangle(bridgeBtn_.toFloat(), 3);
+    g.setColour(colours::text);
+    g.setFont(juce::FontOptions(11.5f));
+    g.drawText("Meter Bridge", bridgeBtn_, juce::Justification::centred);
+    {
+        const double a = hub_.loudness().shortTermLufs(), b = in_->loudness().shortTermLufs();
+        g.setColour(colours::dim);
+        g.drawText(std::isfinite(a) && std::isfinite(b) && a > -150 && b > -150 ? "IN - OUT  " + signedNum(b - a) + " LU" : juce::String("IN - OUT  --"), bottom,
+                   juce::Justification::left);
+    }
+    r.removeFromBottom(4);
+    auto left = r.removeFromLeft(r.getWidth() / 2 - 3);
+    r.removeFromLeft(6);
+    inHalf_ = r;
+    g.setColour(colours::line);
+    g.drawVerticalLine(left.getRight() + 3, float(left.getY()), float(left.getBottom()));
+    auto scale = [](float db, float h) { return h * juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f); };
+    auto half = [&](juce::Rectangle<int> a, MeterHub& h, bool input) {
+        const auto& L = h.loudness();
+        auto title = a.removeFromTop(16);
+        g.setFont(juce::FontOptions(12.5f, juce::Font::bold));
+        g.setColour(input ? kCyan : kYellow);
+        g.drawText(input ? "IN" + (inputName.isNotEmpty() ? " " + inputName : juce::String()) : juce::String("OUT"), title, juce::Justification::left);
+        if (input) {
+            // Clip light and overs count: they stay until clicked.
+            auto light = title.removeFromRight(58).reduced(0, 1);
+            g.setColour(inputOvers > 0 ? kRed : colours::line);
+            g.fillRoundedRectangle(light.toFloat(), 3);
+            g.setColour(inputOvers > 0 ? juce::Colours::white : colours::dim);
+            g.setFont(juce::FontOptions(10.5f, juce::Font::bold));
+            g.drawText(inputOvers > 0 ? "CLIP " + (inputOvers > 9999 ? juce::String("9999+") : juce::String(inputOvers)) : juce::String("no clip"), light,
+                       juce::Justification::centred);
+        }
+        a.removeFromTop(2);
+        auto bars = a.removeFromLeft(30);
+        for (int c = 0; c < 2; ++c) {
+            auto b = bars.removeFromLeft(12).toFloat();
+            bars.removeFromLeft(3);
+            g.setColour(colours::line);
+            g.fillRect(b);
+            juce::ColourGradient grad(kGreen, 0, b.getBottom(), kRed, 0, b.getY(), false);
+            grad.addColour(1.0 - 6.0 / 60.0, kYellow);
+            g.setGradientFill(grad);
+            g.fillRect(b.withTop(b.getBottom() - scale(h.peakDb(c), b.getHeight())));
+            const bool hot = input ? h.holdDb(c) > -1.0f : L.truePeakDb(c) > h.maxTruePeak();
+            g.setColour(hot ? kRed : colours::text);
+            g.drawHorizontalLine(int(b.getBottom() - scale(h.holdDb(c), b.getHeight())), b.getX(), b.getRight());
+        }
+        a.removeFromLeft(4);
+        g.setFont(juce::FontOptions(11.5f));
+        auto row = [&](const juce::String& k, const juce::String& v, juce::Colour c = colours::text) {
+            auto x = a.removeFromTop(15);
+            g.setColour(colours::dim);
+            g.drawText(k, x.removeFromLeft(40), juce::Justification::left);
+            g.setColour(c);
+            g.drawText(v, x, juce::Justification::right);
+        };
+        const double tp = L.truePeakDb();
+        if (input) {
+            const float pk = juce::jmax(h.peakDb(0), h.peakDb(1)), hold = juce::jmax(h.holdDb(0), h.holdDb(1));
+            const float mx = juce::jmax(inputMaxDb, h.maxSampleDb(0), h.maxSampleDb(1));
+            row("Peak", num(pk, 1, "dB"), pk > -1.0f ? kRed : colours::text);
+            row("TP", num(tp, 1, "dBTP"), std::isfinite(tp) && tp > -1.0 ? kRed : colours::text);
+            row("Hold", num(hold, 1, "dB"), hold > -1.0f ? kRed : colours::text);
+            row("Max", num(mx, 1, "dB"), mx > -1.0f ? kRed : colours::text);
+            row("Mom", num(L.momentaryLufs(), 1, "LUFS"));
+            if (mx > -1.0f) {
+                g.setColour(kRed);
+                g.setFont(juce::FontOptions(10.5f));
+                g.drawText(inputOvers > 0 ? "clipped: turn it down" : "within 1 dB of clipping", a.removeFromTop(14), juce::Justification::right);
+            }
+        } else {
+            const double I = L.integratedLufs(), target = h.targetLufs();
+            row("Int", num(I, 1, "LUFS"), std::isfinite(I) ? (std::abs(I - target) <= h.tolerance() ? kGreen : (I > target ? kYellow : kCyan)) : colours::dim);
+            row("Short", num(L.shortTermLufs(), 1, "LUFS"));
+            row("Mom", num(L.momentaryLufs(), 1, "LUFS"));
+            row("Range", num(L.loudnessRange(), 1, "LU"));
+            row("TP", num(tp, 1, "dBTP"), std::isfinite(tp) && tp > h.maxTruePeak() ? kRed : colours::text);
+        }
+    };
+    half(left, hub_, false);
+    half(inHalf_, *in_, true);
+}
+
 void MeterStrip::paint(juce::Graphics& g) {
     g.fillAll(colours::panel);
+    if (showInput && in_) { paintSplit(g); return; }
+    inHalf_ = {};
     auto r = getLocalBounds().reduced(6);
     const auto& L = hub_.loudness();
     // Peak bars (dBFS, -60..0) with held peak and true-peak overs in red.
@@ -222,12 +314,13 @@ void MeterStrip::paint(juce::Graphics& g) {
 
 void MeterStrip::mouseDown(const juce::MouseEvent& e) {
     if (bridgeBtn_.contains(e.getPosition())) { if (onOpenBridge) onOpenBridge(); return; }
+    if (showInput && inHalf_.contains(e.getPosition())) { if (onResetInput) onResetInput(); return; }   // clears the clip light too
     if (onReset) onReset();
 }
 
 // ================================================================= MeterBridge
 
-MeterBridge::MeterBridge(MeterHub& h) : hub_(h) {
+MeterBridge::MeterBridge(MeterHub& out, MeterHub* in) : out_(out), in_(in) {
     for (int i = 0; i < 4; ++i) {
         styleButton(tabs_[i], false);
         tabs_[i].setClickingTogglesState(true);
@@ -241,13 +334,26 @@ MeterBridge::MeterBridge(MeterHub& h) : hub_(h) {
     for (size_t i = 0; i < st.size(); ++i)
         standard_.addItem(juce::String(st[i].name) + "  (" + juce::String(st[i].targetLufs, 0) + " LUFS, " + juce::String(st[i].maxTruePeak, 1) + " dBTP)",
                           int(i) + 2);
-    standard_.setSelectedId(hub_.standard + 2, juce::dontSendNotification);
+    standard_.setSelectedId(out_.standard + 2, juce::dontSendNotification);
     standard_.onChange = [this] {
-        hub_.standard = standard_.getSelectedId() - 2;
+        out_.standard = standard_.getSelectedId() - 2;
+        if (in_) in_->standard = out_.standard;
         if (onStandardChanged) onStandardChanged();
         repaint();
     };
     addAndMakeVisible(standard_);
+    sourceBox_.addItem("Output", 1);
+    sourceBox_.addItem("Input", 2);
+    sourceBox_.addItem("Both", 3);
+    sourceBox_.setSelectedId(1, juce::dontSendNotification);
+    sourceBox_.setTooltip("Output: what is played. Input: what comes back on the armed inputs. Both: the two side by side on the Loudness view, "
+                          "with the gain through the outboard.");
+    sourceBox_.onChange = [this] {
+        source_ = Source(sourceBox_.getSelectedId() - 1);
+        if (onSourceChanged) onSourceChanged();
+        repaint();
+    };
+    if (in_) addAndMakeVisible(sourceBox_);
     for (int m : {1, 2, 4, 10, 30, 60}) speed_.addItem("Radar: " + juce::String(m) + " min", m);
     speed_.setSelectedId(4, juce::dontSendNotification);
     speed_.onChange = [this] { radarMinutes = speed_.getSelectedId(); repaint(); };
@@ -266,11 +372,20 @@ MeterBridge::MeterBridge(MeterHub& h) : hub_(h) {
     tiltBtn_.setTooltip("Show the spectrum with a 3 dB per octave tilt, so pink noise looks flat");
     fastBtn_.setTooltip("Also draw the live spectrum over the long-term average");
     reset_.onClick = [this] { if (onReset) onReset(); };
-    pause_.onClick = [this] { hub_.paused = pause_.getToggleState(); };
+    pause_.onClick = [this] {
+        out_.paused = pause_.getToggleState();
+        if (in_) in_->paused = out_.paused;
+    };
     refs_.onClick = [this] { if (onRefreshReferences) onRefreshReferences(); };
     tiltBtn_.onClick = [this] { tilt = tiltBtn_.getToggleState(); repaint(); };
     fastBtn_.onClick = [this] { showFast = fastBtn_.getToggleState(); repaint(); };
     setSize(900, 640);
+}
+
+void MeterBridge::setSource(Source s) {
+    source_ = in_ ? s : Source::Output;
+    sourceBox_.setSelectedId(int(source_) + 1, juce::dontSendNotification);
+    repaint();
 }
 
 void MeterBridge::setView(View v) {
@@ -285,6 +400,10 @@ void MeterBridge::resized() {
     auto bar = r.removeFromTop(26);
     for (auto& t : tabs_) { t.setBounds(bar.removeFromLeft(86)); bar.removeFromLeft(3); }
     bar.removeFromLeft(10);
+    if (in_) {
+        sourceBox_.setBounds(bar.removeFromLeft(86));
+        bar.removeFromLeft(8);
+    }
     reset_.setBounds(bar.removeFromRight(60));
     bar.removeFromRight(4);
     pause_.setBounds(bar.removeFromRight(60));
@@ -315,13 +434,28 @@ void MeterBridge::mouseDown(const juce::MouseEvent&) {}
 
 void MeterBridge::paint(juce::Graphics& g) {
     g.fillAll(juce::Colour(0xff0d0f12));
-    switch (view_) {
-        case View::Radar: paintRadar(g, content_); break;
-        case View::Loudness: paintLoudness(g, content_); break;
-        case View::Balance: paintBalance(g, content_); break;
-        case View::Stereo: paintStereo(g, content_); break;
+    auto area = content_;
+    if (in_ && source_ != Source::Output) {
+        // Say what is being read, and when nothing is arriving.
+        auto note = area.removeFromBottom(18);
+        g.setFont(juce::FontOptions(12.0f));
+        g.setColour(inputsLive ? colours::dim : kYellow);
+        juce::String t = !inputsLive ? "The inputs aren't armed: open Record or Capture, or switch Arm Inputs on (Transport menu), to read them."
+                         : source_ == Source::Input ? "Reading the armed inputs (what comes back)."
+                         : view_ == View::Loudness ? "Output and input side by side. The difference is the gain through the outboard."
+                                                   : "Both applies to the Loudness view; this view shows the output.";
+        g.drawText(t, note, juce::Justification::centredLeft);
     }
-    if (hub_.paused) {
+    switch (view_) {
+        case View::Radar: paintRadar(g, area); break;
+        case View::Loudness:
+            if (in_ && source_ == Source::Both) paintLoudnessBoth(g, area);
+            else paintLoudness(g, area);
+            break;
+        case View::Balance: paintBalance(g, area); break;
+        case View::Stereo: paintStereo(g, area); break;
+    }
+    if (out_.paused) {
         g.setColour(kYellow);
         g.setFont(juce::FontOptions(12.0f, juce::Font::bold));
         g.drawText("PAUSED", content_.removeFromTop(16), juce::Justification::centredRight);
@@ -331,15 +465,15 @@ void MeterBridge::paint(juce::Graphics& g) {
 // ---------------------------------------------------------------- radar
 
 void MeterBridge::paintRadar(juce::Graphics& g, juce::Rectangle<int> area) {
-    const auto& L = hub_.loudness();
-    const double target = hub_.targetLufs();
+    const auto& L = hub().loudness();
+    const double target = hub().targetLufs();
     auto side = area.withTrimmedRight(220);
     const float size = float(juce::jmin(side.getWidth(), side.getHeight())) - 40.0f;
     const auto c = side.getCentre().toFloat();
     const float rOuter = size * 0.5f, rRing = rOuter - 14.0f, rMax = rRing - 10.0f, rMin = rMax * 0.16f;
     // LU relative to the target: -36 at the centre hole, +18 at the edge.
     auto radiusOf = [&](double lu) { return rMin + (rMax - rMin) * float(juce::jlimit(0.0, 1.0, (lu + 36.0) / 54.0)); };
-    const auto& hist = hub_.shortTermHistory();
+    const auto& hist = hub().shortTermHistory();
     const int perTurn = juce::jmax(60, int(radarMinutes * 600.0));   // 10 points a second
     // Grid rings.
     g.setColour(juce::Colour(0xff26303a));
@@ -405,8 +539,8 @@ void MeterBridge::paintRadar(juce::Graphics& g, juce::Rectangle<int> area) {
 }
 
 void MeterBridge::paintBigNumbers(juce::Graphics& g, juce::Rectangle<int> r) {
-    const auto& L = hub_.loudness();
-    const double target = hub_.targetLufs(), I = L.integratedLufs();
+    const auto& L = hub().loudness();
+    const double target = hub().targetLufs(), I = L.integratedLufs();
     auto block = [&](const juce::String& label, const juce::String& value, const juce::String& unit, juce::Colour c, float size = 40.0f) {
         auto b = r.removeFromTop(int(size) + 30);
         g.setColour(c);
@@ -417,25 +551,25 @@ void MeterBridge::paintBigNumbers(juce::Graphics& g, juce::Rectangle<int> r) {
         g.drawText(label + (unit.isNotEmpty() ? "  (" + unit + ")" : juce::String()), b, juce::Justification::topLeft);
         r.removeFromTop(6);
     };
-    const bool inside = std::isfinite(I) && std::abs(I - target) <= hub_.tolerance();
+    const bool inside = std::isfinite(I) && std::abs(I - target) <= hub().tolerance();
     block("Programme loudness, against target", std::isfinite(I) ? signedNum(I - target) : "--", "LU", inside ? kGreen : (std::isfinite(I) ? kYellow : colours::dim));
     block("Integrated", std::isfinite(I) ? juce::String(I, 1) : "--", "LUFS", colours::text, 28.0f);
     block("Loudness range", L.loudnessRange() > 0 ? juce::String(L.loudnessRange(), 1) : "--", "LRA, LU", kYellow, 28.0f);
     const double tp = L.truePeakDb();
-    block("Max true peak", std::isfinite(tp) ? juce::String(tp, 1) : "--", "dBTP", std::isfinite(tp) && tp > hub_.maxTruePeak() ? kRed : colours::text, 28.0f);
+    block("Max true peak", std::isfinite(tp) ? juce::String(tp, 1) : "--", "dBTP", std::isfinite(tp) && tp > hub().maxTruePeak() ? kRed : colours::text, 28.0f);
     const int secs = int(L.durationSeconds());
     g.setColour(colours::dim);
     g.setFont(juce::FontOptions(14.0f));
     g.drawText(juce::String(secs / 3600).paddedLeft('0', 2) + ":" + juce::String((secs / 60) % 60).paddedLeft('0', 2) + ":" + juce::String(secs % 60).paddedLeft('0', 2) +
-                   "   " + hub_.standardName(),
+                   "   " + hub().standardName(),
                r.removeFromTop(20), juce::Justification::left);
 }
 
 // ---------------------------------------------------------------- loudness
 
 void MeterBridge::paintLoudness(juce::Graphics& g, juce::Rectangle<int> area) {
-    const auto& L = hub_.loudness();
-    const double target = hub_.targetLufs();
+    const auto& L = hub().loudness();
+    const double target = hub().targetLufs();
     // Bars: L, R (dBFS with true peak), then M, S, I on a loudness scale around the target.
     auto bars = area.removeFromLeft(300);
     auto scaleBox = bars.removeFromLeft(34);
@@ -473,8 +607,8 @@ void MeterBridge::paintLoudness(juce::Graphics& g, juce::Rectangle<int> area) {
         g.drawText(std::isfinite(value) && value > -150 ? juce::String(value, 1) : "--", juce::Rectangle<float>(b.getX() - 8, bottom + 16, b.getWidth() + 16, 12),
                    juce::Justification::centred);
     };
-    bar("L", hub_.peakDb(0), L.truePeakDb(0), hub_.maxTruePeak(), false);
-    bar("R", hub_.peakDb(1), L.truePeakDb(1), hub_.maxTruePeak(), false);
+    bar("L", hub().peakDb(0), L.truePeakDb(0), hub().maxTruePeak(), false);
+    bar("R", hub().peakDb(1), L.truePeakDb(1), hub().maxTruePeak(), false);
     bars.removeFromLeft(10);
     bar("M", L.momentaryLufs(), L.maxMomentaryLufs(), NAN, true);
     bar("S", L.shortTermLufs(), L.maxShortTermLufs(), NAN, true);
@@ -497,7 +631,7 @@ void MeterBridge::paintLoudness(juce::Graphics& g, juce::Rectangle<int> area) {
     g.fillRect(hist);
     auto yL = [&](double lufs) { return hist.getBottom() - hist.getHeight() * float(juce::jlimit(0.0, 1.0, (lufs - (target - 30)) / 40.0)); };
     g.setColour(kGreen.withAlpha(0.12f));
-    g.fillRect(juce::Rectangle<float>(hist.getX(), yL(target + hub_.tolerance()), hist.getWidth(), yL(target - hub_.tolerance()) - yL(target + hub_.tolerance())));
+    g.fillRect(juce::Rectangle<float>(hist.getX(), yL(target + hub().tolerance()), hist.getWidth(), yL(target - hub().tolerance()) - yL(target + hub().tolerance())));
     g.setFont(juce::FontOptions(10.5f));
     for (int k = -30; k <= 10; k += 10) {
         g.setColour(juce::Colour(0xff26303a));
@@ -505,8 +639,8 @@ void MeterBridge::paintLoudness(juce::Graphics& g, juce::Rectangle<int> area) {
         g.setColour(colours::dim);
         g.drawText(juce::String(target + k, 0), int(hist.getX()) + 2, int(yL(target + k)) - 12, 40, 12, juce::Justification::left);
     }
-    const auto& hs = hub_.shortTermHistory();
-    const auto& hm = hub_.momentaryHistory();
+    const auto& hs = hub().shortTermHistory();
+    const auto& hm = hub().momentaryHistory();
     const int span = 3000;   // 5 minutes
     auto curve = [&](const std::vector<float>& v, juce::Colour col, float w) {
         juce::Path p;
@@ -549,21 +683,21 @@ void MeterBridge::paintLoudness(juce::Graphics& g, juce::Rectangle<int> area) {
     line(col1, "Max momentary", num(L.maxMomentaryLufs(), 1, "LUFS"));
     line(col1, "Max short-term", num(L.maxShortTermLufs(), 1, "LUFS"));
     line(col1, "Max true peak L / R", num(L.truePeakDb(0), 1) + " / " + num(L.truePeakDb(1), 1) + " dBTP");
-    line(col1, "Max sample peak L / R", num(hub_.maxSampleDb(0), 1) + " / " + num(hub_.maxSampleDb(1), 1) + " dBFS");
-    line(col1, "PLR (peak to loudness)", num(hub_.plr(), 1, "dB"));
-    line(col1, "PSR (short-term)", num(hub_.psr(), 1, "dB"));
+    line(col1, "Max sample peak L / R", num(hub().maxSampleDb(0), 1) + " / " + num(hub().maxSampleDb(1), 1) + " dBFS");
+    line(col1, "PLR (peak to loudness)", num(hub().plr(), 1, "dB"));
+    line(col1, "PSR (short-term)", num(hub().psr(), 1, "dB"));
     line(col1, "Overs (full scale)", juce::String(L.clippedSamples()), L.clippedSamples() ? kRed : colours::text);
     auto col2 = stats;
     g.setColour(colours::text);
     g.setFont(juce::FontOptions(13.0f, juce::Font::bold));
-    g.drawText(hub_.standardName(), col2.removeFromTop(20), juce::Justification::left);
+    g.drawText(hub().standardName(), col2.removeFromTop(20), juce::Justification::left);
     g.setFont(juce::FontOptions(13.0f));
-    const bool iOk = std::isfinite(I) && std::abs(I - target) <= hub_.tolerance();
-    const bool tpOk = !std::isfinite(tp) || tp <= hub_.maxTruePeak();
-    line(col2, "Target", juce::String(target, 1) + " LUFS +/- " + juce::String(hub_.tolerance(), 1));
+    const bool iOk = std::isfinite(I) && std::abs(I - target) <= hub().tolerance();
+    const bool tpOk = !std::isfinite(tp) || tp <= hub().maxTruePeak();
+    line(col2, "Target", juce::String(target, 1) + " LUFS +/- " + juce::String(hub().tolerance(), 1));
     line(col2, "Integrated", std::isfinite(I) ? signedNum(I - target) + " LU  " + (iOk ? "in range" : "out of range") : "--",
          std::isfinite(I) ? (iOk ? kGreen : kYellow) : colours::dim);
-    line(col2, "True peak limit", juce::String(hub_.maxTruePeak(), 1) + " dBTP");
+    line(col2, "True peak limit", juce::String(hub().maxTruePeak(), 1) + " dBTP");
     line(col2, "True peak", std::isfinite(tp) ? juce::String(tp, 1) + " dBTP  " + (tpOk ? "ok" : "over") : "--", tpOk ? kGreen : kRed);
     line(col2, "Measured for", juce::String(L.durationSeconds(), 0) + " s of playback");
     col2.removeFromTop(8);
@@ -574,10 +708,152 @@ void MeterBridge::paintLoudness(juce::Graphics& g, juce::Rectangle<int> area) {
                      col2.removeFromTop(48), juce::Justification::topLeft, 3);
 }
 
+// ---------------------------------------------------------------- loudness, output and input together
+
+void MeterBridge::paintLoudnessBoth(juce::Graphics& g, juce::Rectangle<int> area) {
+    MeterHub& O = out_;
+    MeterHub& I = *in_;
+    const double target = O.targetLufs();
+    auto diff = [](double in, double out) { return std::isfinite(in) && std::isfinite(out) && in > -150 && out > -150 ? in - out : double(NAN); };
+    // Bars: for each side L, R (dBFS with true peak hold), then M, S, I around the target.
+    auto bars = area.removeFromLeft(404);
+    auto scaleBox = bars.removeFromLeft(34);
+    const auto top = float(bars.getY() + 28), bottom = float(bars.getBottom() - 30);
+    auto yDb = [&](double db) { return bottom - (bottom - top) * float(juce::jlimit(0.0, 1.0, (db + 60.0) / 60.0)); };
+    g.setFont(juce::FontOptions(11.0f));
+    g.setColour(colours::dim);
+    for (int db = 0; db >= -60; db -= 6) g.drawText(juce::String(db), juce::Rectangle<float>(30, 12).withCentre({float(scaleBox.getCentreX()), yDb(db)}), juce::Justification::centredRight);
+    auto bar = [&](const juce::String& name, double value, double hold, double over, bool loudness) {
+        auto b = bars.removeFromLeft(30).reduced(4, 0).toFloat();
+        bars.removeFromLeft(4);
+        auto col = b.withTop(top).withBottom(bottom);
+        g.setColour(juce::Colour(0xff20252c));
+        g.fillRect(col);
+        auto y = [&](double v) { return loudness ? yDb(v - target - 18.0) : yDb(v); };
+        if (std::isfinite(value)) {
+            juce::ColourGradient grad(loudness ? kCyan : kGreen, 0, bottom, kRed, 0, top, false);
+            grad.addColour(loudness ? double(bottom - y(target)) / (bottom - top) : 0.9, loudness ? kGreen : kYellow);
+            g.setGradientFill(grad);
+            g.fillRect(col.withTop(y(value)));
+        }
+        if (std::isfinite(hold)) {
+            g.setColour(std::isfinite(over) && hold > over ? kRed : colours::text);
+            g.drawHorizontalLine(int(y(hold)), col.getX(), col.getRight());
+        }
+        if (loudness) {
+            g.setColour(kGreen.withAlpha(0.6f));
+            g.drawHorizontalLine(int(y(target)), col.getX() - 2, col.getRight() + 2);
+        }
+        g.setFont(juce::FontOptions(11.0f));
+        g.setColour(colours::text);
+        g.drawText(name, juce::Rectangle<float>(b.getX() - 4, bottom + 4, b.getWidth() + 8, 14), juce::Justification::centred);
+        g.setColour(colours::dim);
+        g.drawText(std::isfinite(value) && value > -150 ? juce::String(value, 1) : "--", juce::Rectangle<float>(b.getX() - 6, bottom + 16, b.getWidth() + 12, 12),
+                   juce::Justification::centred);
+    };
+    auto group = [&](MeterHub& h, const juce::String& title, juce::Colour c) {
+        const auto& L = h.loudness();
+        g.setColour(c);
+        g.setFont(juce::FontOptions(13.0f, juce::Font::bold));
+        g.drawText(title, juce::Rectangle<int>(bars.getX(), bars.getY(), 170, 18), juce::Justification::centredLeft);
+        bar("L", h.peakDb(0), L.truePeakDb(0), h.maxTruePeak(), false);
+        bar("R", h.peakDb(1), L.truePeakDb(1), h.maxTruePeak(), false);
+        bars.removeFromLeft(4);
+        bar("M", L.momentaryLufs(), L.maxMomentaryLufs(), NAN, true);
+        bar("S", L.shortTermLufs(), L.maxShortTermLufs(), NAN, true);
+        bar("I", L.integratedLufs(), NAN, NAN, true);
+        bars.removeFromLeft(12);
+    };
+    group(O, "OUT  (to the gear)", kYellow);
+    group(I, "IN  (the return)", kCyan);
+    area.removeFromLeft(6);
+
+    // The gain through the outboard.
+    const auto& LO = O.loudness();
+    const auto& LI = I.loudness();
+    auto head = area.removeFromTop(92);
+    g.setColour(juce::Colour(0xff151a20));
+    g.fillRoundedRectangle(head.toFloat(), 4);
+    auto in = head.reduced(10, 6);
+    g.setColour(colours::dim);
+    g.setFont(juce::FontOptions(12.0f));
+    g.drawText("Gain through the outboard (input minus output)", in.removeFromTop(16), juce::Justification::left);
+    const double dS = diff(LI.shortTermLufs(), LO.shortTermLufs()), dI = diff(LI.integratedLufs(), LO.integratedLufs());
+    const double dTp = diff(LI.truePeakDb(), LO.truePeakDb());
+    auto big = in.removeFromTop(44);
+    g.setFont(juce::FontOptions(36.0f));
+    g.setColour(std::isfinite(dS) ? (std::abs(dS) <= 0.5 ? kGreen : colours::text) : colours::dim);
+    g.drawText(std::isfinite(dS) ? signedNum(dS) + " LU" : juce::String("--"), big.removeFromLeft(big.getWidth() / 2), juce::Justification::centredLeft);
+    g.setFont(juce::FontOptions(13.0f));
+    g.setColour(colours::text);
+    g.drawText("Integrated  " + (std::isfinite(dI) ? signedNum(dI) + " LU" : juce::String("--")), big.removeFromTop(22), juce::Justification::centredLeft);
+    g.drawText("True peak  " + (std::isfinite(dTp) ? signedNum(dTp) + " dB" : juce::String("--")), big, juce::Justification::centredLeft);
+    g.setColour(colours::dim);
+    g.setFont(juce::FontOptions(11.5f));
+    g.drawText("Large number: short-term, the last 3 seconds. Both sides are measured from Reset.", in, juce::Justification::left);
+    area.removeFromTop(8);
+
+    // History: short-term of both.
+    auto hist = area.removeFromTop(juce::jmax(90, area.getHeight() / 2 - 20)).toFloat();
+    g.setColour(juce::Colour(0xff151a20));
+    g.fillRect(hist);
+    auto yL = [&](double lufs) { return hist.getBottom() - hist.getHeight() * float(juce::jlimit(0.0, 1.0, (lufs - (target - 30)) / 40.0)); };
+    g.setFont(juce::FontOptions(10.5f));
+    for (int k = -30; k <= 10; k += 10) {
+        g.setColour(juce::Colour(0xff26303a));
+        g.drawHorizontalLine(int(yL(target + k)), hist.getX(), hist.getRight());
+        g.setColour(colours::dim);
+        g.drawText(juce::String(target + k, 0), int(hist.getX()) + 2, int(yL(target + k)) - 12, 40, 12, juce::Justification::left);
+    }
+    const int span = 3000;
+    auto curve = [&](const std::vector<float>& v, juce::Colour col, float w) {
+        juce::Path p;
+        bool started = false;
+        const int n = int(v.size()), first = juce::jmax(0, n - span);
+        for (int i = first; i < n; ++i) {
+            if (!std::isfinite(v[size_t(i)]) || v[size_t(i)] < -80) { started = false; continue; }
+            const float x = hist.getRight() - hist.getWidth() * float(n - 1 - i) / float(span);
+            const float y = yL(v[size_t(i)]);
+            if (!started) { p.startNewSubPath(x, y); started = true; } else p.lineTo(x, y);
+        }
+        g.setColour(col);
+        g.strokePath(p, juce::PathStrokeType(w));
+    };
+    curve(O.shortTermHistory(), kYellow, 1.8f);
+    curve(I.shortTermHistory(), kCyan, 1.8f);
+    g.setColour(colours::dim);
+    g.drawText("Short-term, last 5 minutes: output (yellow), input (blue)", hist.toNearestInt().removeFromTop(14).reduced(4, 0), juce::Justification::right);
+    area.removeFromTop(10);
+
+    // Figures side by side.
+    g.setFont(juce::FontOptions(13.0f));
+    auto row = [&](const juce::String& k, const juce::String& a, const juce::String& b, const juce::String& d, juce::Colour cb = colours::text) {
+        auto x = area.removeFromTop(19);
+        const int w = (x.getWidth() - 150) / 3;
+        g.setColour(colours::dim);
+        g.drawText(k, x.removeFromLeft(150), juce::Justification::left);
+        g.setColour(colours::text);
+        g.drawText(a, x.removeFromLeft(w), juce::Justification::right);
+        g.setColour(cb);
+        g.drawText(b, x.removeFromLeft(w), juce::Justification::right);
+        g.setColour(colours::dim);
+        g.drawText(d, x.withTrimmedRight(8), juce::Justification::right);
+    };
+    auto d1 = [&](double a, double b) { const double d = diff(b, a); return std::isfinite(d) ? signedNum(d) : juce::String("--"); };
+    row("", "Output", "Input", "Difference");
+    row("Integrated (LUFS)", num(LO.integratedLufs()), num(LI.integratedLufs()), d1(LO.integratedLufs(), LI.integratedLufs()));
+    row("Short-term (LUFS)", num(LO.shortTermLufs()), num(LI.shortTermLufs()), d1(LO.shortTermLufs(), LI.shortTermLufs()));
+    row("Momentary (LUFS)", num(LO.momentaryLufs()), num(LI.momentaryLufs()), d1(LO.momentaryLufs(), LI.momentaryLufs()));
+    row("Loudness range (LU)", num(LO.loudnessRange()), num(LI.loudnessRange()), d1(LO.loudnessRange(), LI.loudnessRange()));
+    row("Max true peak (dBTP)", num(LO.truePeakDb()), num(LI.truePeakDb()), d1(LO.truePeakDb(), LI.truePeakDb()),
+        std::isfinite(LI.truePeakDb()) && LI.truePeakDb() > -1.0 ? kRed : colours::text);
+    row("Overs (full scale)", juce::String(LO.clippedSamples()), juce::String(LI.clippedSamples()), "", LI.clippedSamples() ? kRed : colours::text);
+}
+
 // ---------------------------------------------------------------- balance
 
 void MeterBridge::paintBalance(juce::Graphics& g, juce::Rectangle<int> area) {
-    const auto& sp = hub_.spectrum();
+    const auto& sp = hub().spectrum();
     const auto& b = sp.bands();
     if (b.size() == 0) return;
     auto graph = area.removeFromTop(int(area.getHeight() * 0.6f)).toFloat();
@@ -615,7 +891,7 @@ void MeterBridge::paintBalance(juce::Graphics& g, juce::Rectangle<int> area) {
         return o;
     };
     // Reference zone.
-    const auto& t = hub_.target();
+    const auto& t = hub().target();
     if (t.valid() && int(t.mean.size()) == b.size()) {
         const auto tm = smooth(t.mean), tw = smooth(t.halfWidth);
         juce::Path zone;
@@ -670,7 +946,7 @@ void MeterBridge::paintBalance(juce::Graphics& g, juce::Rectangle<int> area) {
                graph.toNearestInt().removeFromTop(14).reduced(40, 0), juce::Justification::left);
     area.removeFromTop(10);
     // Ranges.
-    auto ranges = hub_.ranges();
+    auto ranges = hub().ranges();
     auto rr = area.removeFromTop(86);
     const int w = rr.getWidth() / juce::jmax(1, int(ranges.size()));
     for (auto& rg : ranges) {
@@ -720,14 +996,14 @@ void MeterBridge::paintBalance(juce::Graphics& g, juce::Rectangle<int> area) {
         for (auto& n : notes) g.drawText(juce::String(n), area.removeFromTop(18), juce::Justification::left);
         g.setColour(colours::dim);
         g.setFont(juce::FontOptions(11.5f));
-        g.drawText("References: " + hub_.referenceNames().joinIntoString(", "), area.removeFromBottom(16), juce::Justification::left, true);
+        g.drawText("References: " + hub().referenceNames().joinIntoString(", "), area.removeFromBottom(16), juce::Justification::left, true);
     }
 }
 
 // ---------------------------------------------------------------- stereo
 
 void MeterBridge::paintStereo(juce::Graphics& g, juce::Rectangle<int> area) {
-    const auto& st = hub_.stereo();
+    const auto& st = hub().stereo();
     // Goniometer: M up, S across (L at top-left, R at top-right).
     auto gon = area.removeFromLeft(juce::jmin(area.getHeight(), area.getWidth() / 2)).reduced(6).toFloat();
     g.setColour(juce::Colour(0xff151a20));
@@ -795,7 +1071,7 @@ void MeterBridge::paintStereo(juce::Graphics& g, juce::Rectangle<int> area) {
         g.fillRect(hist);
         g.setColour(juce::Colour(0xff26303a));
         g.drawHorizontalLine(int(hist.getCentreY()), hist.getX(), hist.getRight());
-        const auto& hc = hub_.correlationHistory();
+        const auto& hc = hub().correlationHistory();
         const int span = 600, n = int(hc.size());
         juce::Path p;
         for (int i = juce::jmax(0, n - span); i < n; ++i) {
@@ -812,8 +1088,8 @@ void MeterBridge::paintStereo(juce::Graphics& g, juce::Rectangle<int> area) {
     }
     // Correlation per band.
     {
-        const auto& b = hub_.spectrum().bands();
-        const auto& bc = hub_.spectrum().bandCorrelation();
+        const auto& b = hub().spectrum().bands();
+        const auto& bc = hub().spectrum().bandCorrelation();
         auto chart = area.toFloat();
         g.setColour(juce::Colour(0xff151a20));
         g.fillRect(chart);

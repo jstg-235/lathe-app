@@ -455,6 +455,16 @@ void Session::setLaneFormat(int lane, int channels) {
     laneFormats.set(lane, channels == 1 || channels == 6 ? channels : 2);
 }
 
+void Session::insertLane(int at) {
+    at = juce::jlimit(0, lanes, at);
+    for (auto& r : regions)
+        if (r.lane >= at) ++r.lane;
+    for (auto& l : lanesOff)
+        if (l >= at) ++l;
+    if (at < laneFormats.size()) laneFormats.insert(at, 2);
+    ++lanes;
+}
+
 int Session::programmeChannels() const {
     for (auto& r : regions)
         if (!r.mute && laneFormat(r.lane) == 6) return 6;

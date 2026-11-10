@@ -59,6 +59,8 @@ enum : juce::CommandID {
     exportSegments = 0x1090,
     // Metering
     meterBridge = 0x14a0, resetMeters,
+    // Inputs and capture
+    capture = 0x14c0, armInputs,
 };
 }  // namespace cmd
 
