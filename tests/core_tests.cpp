@@ -727,6 +727,41 @@ static void testScope() {
     CHECK(dsp::loudnessStandards().size() >= 6 && dsp::loudnessStandards()[0].targetLufs == -23.0);
 }
 
+static void testLoudnessMatch() {
+    // b is a at +4 dB; pauses (both silent) and a fade-out tail are left out of the match.
+    const double sr = 48000;
+    dsp::LoudnessMatch m;
+    m.prepare(sr, 2, 10.0);
+    std::vector<float> a(4800), b(4800);
+    const float g = float(std::pow(10.0, 4.0 / 20.0));
+    for (int blk = 0; blk < 300; ++blk) {
+        const bool silent = blk >= 100 && blk < 140;
+        for (int i = 0; i < 4800; ++i) {
+            const double t = (blk * 4800 + i) / sr;
+            a[size_t(i)] = silent ? 0.0f : float(0.3 * std::sin(2 * M_PI * 997.0 * t));
+            b[size_t(i)] = a[size_t(i)] * g;
+        }
+        const float* pa[2] = {a.data(), a.data()};
+        const float* pb[2] = {b.data(), b.data()};
+        m.process(pa, pb, 4800);
+        if (blk == 10) CHECK(!m.ready());
+    }
+    CHECK(m.ready());
+    CHECK(std::abs(m.differenceDb() - 4.0) < 0.01);
+    std::printf("loudness match: %.3f dB (expect 4.000), %.1f s measured\n", m.differenceDb(), m.seconds());
+    // 5.1: the LFE doesn't count.
+    dsp::LoudnessMatch m6;
+    m6.prepare(sr, 6);
+    std::vector<float> z(4800, 0.0f), lfe(4800);
+    for (int blk = 0; blk < 60; ++blk) {
+        for (int i = 0; i < 4800; ++i) { a[size_t(i)] = float(0.2 * std::sin(2 * M_PI * 440.0 * (blk * 4800 + i) / sr)); lfe[size_t(i)] = a[size_t(i)] * 3.0f; }
+        const float* pa[6] = {a.data(), a.data(), a.data(), z.data(), z.data(), z.data()};
+        const float* pb[6] = {a.data(), a.data(), a.data(), lfe.data(), z.data(), z.data()};
+        m6.process(pa, pb, 4800);
+    }
+    CHECK(m6.ready() && std::abs(m6.differenceDb()) < 0.01);
+}
+
 int main() {
     testRestoration();
     testAnalyzer();
@@ -742,6 +777,7 @@ int main() {
     testCdTextExtras();
     testPdf();
     testScope();
+    testLoudnessMatch();
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

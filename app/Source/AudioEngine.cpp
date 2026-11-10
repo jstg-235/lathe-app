@@ -57,6 +57,12 @@ AudioEngine::~AudioEngine() {
     refReader_.reset();
     playerTransport_.setSource(nullptr);
     playerReader_.reset();
+    {
+        const juce::ScopedLock dl(dryLock_);
+        dryResampler_.reset();
+        dryBuffered_.reset();
+        dryProgram_.reset();
+    }
     buffered_.reset();
     program_.reset();
     readAhead_.stopThread(2000);
@@ -80,6 +86,34 @@ void AudioEngine::loadSession(const Session& s) {
     }
     transport_.setSource(buffered_.get(), 0, nullptr, rate_, chans);
     transport_.setPosition(juce::jmin(pos, transport_.getLengthInSeconds()));
+    {
+        // The unprocessed side of the compare. Without region effects it is simply the signal
+        // before the master chain; with them it needs its own, effect-free copy of the programme.
+        bool regionFx = false;
+        for (auto& r : s.regions) regionFx |= r.fxState.isNotEmpty();
+        std::unique_ptr<ProgramSource> prog;
+        std::unique_ptr<juce::BufferingAudioSource> buf;
+        std::unique_ptr<juce::ResamplingAudioSource> rs;
+        if (regionFx) {
+            prog = std::make_unique<ProgramSource>(formats_, s, rate_, nullptr, chans);
+            buf = std::make_unique<juce::BufferingAudioSource>(prog.get(), readAhead_, false, int(rate_ * 4), chans, false);
+            buf->setNextReadPosition(transport_.getNextReadPosition());   // re-placed on the first block anyway
+            // The transport plays through a resampler even at ratio 1 (it delays a few samples), so
+            // the unprocessed copy goes through an identical one to stay sample-aligned.
+            rs = std::make_unique<juce::ResamplingAudioSource>(buf.get(), false, chans);
+            rs->setResamplingRatio(1.0);
+            rs->prepareToPlay(block_, rate_);
+        }
+        const juce::ScopedLock dl(dryLock_);
+        std::swap(prog, dryProgram_);
+        std::swap(buf, dryBuffered_);
+        std::swap(rs, dryResampler_);
+        dryFresh_ = true;
+        // the old ones are released here, after the swap, outermost first
+        rs.reset();
+        buf.reset();
+        prog.reset();
+    }
     if (wasPlaying) transport_.start();
 }
 
@@ -357,6 +391,15 @@ void AudioEngine::prepareToPlay(int block, double rate) {
     breakTransport_.prepareToPlay(block, rate);
     sourceBuf_.setSize(2, juce::jmax(block, 8192));
     refBuf_.setSize(2, juce::jmax(block, 8192));
+    dryBuf_.setSize(6, juce::jmax(block, 8192));
+    wetBuf_.setSize(6, juce::jmax(block, 8192));
+    delayBuf_.setSize(6, 1 << 18);   // up to about 5 s of master chain latency at 48 kHz
+    delayBuf_.clear();
+    delayPos_ = 0;
+    {
+        const juce::ScopedLock dl(dryLock_);
+        if (dryResampler_) dryResampler_->prepareToPlay(block, rate);
+    }
     inBuf_.setSize(2, juce::jmax(block, 8192));
     chain_.prepare(rate, block);
     juce::ignoreUnused(rateChanged);   // the UI reloads the session when the device rate changes
@@ -449,14 +492,9 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
         tap_.push(*info.buffer, info.startSample, info.numSamples);
         return;
     }
+    const bool playing = transport_.isPlaying();
     transport_.getNextAudioBlock(info);
-    if (surround_) {
-        // 5.1: the master chain is stereo, so it stays out of the path (no half-processed surround).
-    } else if (bypassMaster_) {
-        info.buffer->applyGain(info.startSample, info.numSamples, bypassGain_);   // level-matched unprocessed
-    } else {
-        chain_.process(*info.buffer, info.startSample, info.numSamples);
-    }
+    processCompare(info, transport_.getNextReadPosition(), playing);
 
     // Reference A/B: the reference runs alongside the master; a 10 ms ramp switches between them.
     const juce::ScopedTryLock refSl(refLock_);
@@ -496,7 +534,116 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
     } else {
         srcMix_ = 0.0f;
     }
-    if (transport_.isPlaying()) tap_.push(*info.buffer, info.startSample, info.numSamples);
+    if (transport_.isPlaying()) {
+        // The meters read the processed side before any level match, whichever side is heard
+        // (a reference or the source, when heard, is metered as heard).
+        const bool other = refMix_ > 0.0f || srcMix_ > 0.0f;
+        if (!other && (dryMix_ > 0.0f || matchGain_ < 1.0f) && wetBuf_.getNumSamples() >= info.numSamples) {
+            juce::AudioBuffer<float> view(wetBuf_.getArrayOfWritePointers(), juce::jmin(info.buffer->getNumChannels(), wetBuf_.getNumChannels()), info.numSamples);
+            tap_.push(view, 0, info.numSamples);
+        } else {
+            tap_.push(*info.buffer, info.startSample, info.numSamples);
+        }
+    }
+}
+
+void AudioEngine::processCompare(const juce::AudioSourceChannelInfo& info, juce::int64 endPos, bool playing) {
+    const int n = info.numSamples;
+    const int nch = juce::jmin(info.buffer->getNumChannels(), surround_ ? 6 : 2, dryBuf_.getNumChannels());
+    const bool fits = dryBuf_.getNumSamples() >= n && nch > 0;
+    if (!fits) {   // a block bigger than prepared: play processed, skip the compare this once
+        if (!surround_) chain_.process(*info.buffer, info.startSample, n);
+        return;
+    }
+    // 1. The unprocessed side, before the master chain.
+    bool haveDry = false;
+    {
+        const juce::ScopedTryLock dl(dryLock_);
+        if (dl.isLocked() && dryResampler_ && playing) {
+            // The transport's resampler (ratio 1) reads 3 samples ahead of what it plays, so the
+            // block just played started at endPos - n - 3. The copy follows the same resampler: on a
+            // locate (or any slip) it is flushed and started exactly there.
+            constexpr int kLead = 3;
+            const juce::int64 outStart = endPos - n - kLead;
+            const juce::int64 expect = dryFresh_ ? outStart : outStart + kLead;
+            if (dryBuffered_->getNextReadPosition() != expect) {
+                dryResampler_->flushBuffers();
+                dryBuffered_->setNextReadPosition(juce::jmax<juce::int64>(0, outStart));
+                dryFresh_ = true;
+            }
+            juce::AudioBuffer<float> view(dryBuf_.getArrayOfWritePointers(), nch, n);
+            juce::AudioSourceChannelInfo di(&view, 0, n);
+            dryResampler_->getNextAudioBlock(di);
+            dryFresh_ = false;
+            haveDry = true;
+        }
+    }
+    if (!haveDry)
+        for (int ch = 0; ch < nch; ++ch) dryBuf_.copyFrom(ch, 0, *info.buffer, ch, info.startSample, n);
+
+    // 2. The processed side. 5.1: the master chain is stereo, so it stays out of the path.
+    int latency = 0;
+    if (!surround_) {
+        chain_.process(*info.buffer, info.startSample, n);
+        latency = chain_.lastLatency();
+    }
+
+    // 3. Delay the unprocessed side by the master chain's latency, so both line up.
+    const int dlen = delayBuf_.getNumSamples();
+    latency = juce::jlimit(0, dlen - n - 1, latency);
+    for (int ch = 0; ch < nch; ++ch) {
+        auto* ring = delayBuf_.getWritePointer(ch);
+        auto* d = dryBuf_.getWritePointer(ch);
+        for (int i = 0; i < n; ++i) {
+            const int w = (delayPos_ + i) % dlen;
+            ring[w] = d[i];
+            d[i] = ring[(w - latency + dlen) % dlen];
+        }
+    }
+    delayPos_ = (delayPos_ + n) % dlen;
+
+    // 4. Measure both while the session plays.
+    if (matchResetPending_.exchange(false) || matchChannels_ != nch || std::abs(matchRate_ - rate_) > 0.5) {
+        match_.prepare(rate_, nch);
+        matchChannels_ = nch;
+        matchRate_ = rate_;
+        matchReady_ = false;
+        matchCut_ = 0.0;
+        matchDiff_ = 0.0;
+    }
+    if (playing) {
+        const float* a[6]{};
+        const float* b[6]{};
+        for (int ch = 0; ch < nch; ++ch) { a[ch] = dryBuf_.getReadPointer(ch); b[ch] = info.buffer->getReadPointer(ch, info.startSample); }
+        match_.process(a, b, n);
+        if (match_.ready()) {
+            const double diff = match_.differenceDb();
+            matchDiff_ = diff;
+            matchCut_ = -juce::jmax(0.0, diff);   // only ever turn the processed side down
+            matchReady_ = true;
+        }
+    }
+
+    // 5. What is heard: processed (times the match), unprocessed, or a crossfade between them.
+    const float targetMix = hearDry_ ? 1.0f : 0.0f;
+    const float targetGain = levelMatch_ ? float(juce::Decibels::decibelsToGain(matchCut_.load())) : 1.0f;
+    if (dryMix_ == targetMix && matchGain_ == targetGain && dryMix_ == 0.0f && matchGain_ == 1.0f) return;   // plain A
+    for (int ch = 0; ch < nch; ++ch) wetBuf_.copyFrom(ch, 0, *info.buffer, ch, info.startSample, n);
+    for (int ch = nch; ch < wetBuf_.getNumChannels(); ++ch) wetBuf_.clear(ch, 0, n);
+    const float step = 1.0f / float(juce::jmax(1.0, rate_ * 0.010));                  // 10 ms switch
+    const float glide = float(1.0 - std::exp(-1.0 / juce::jmax(1.0, rate_ * 0.050)));   // 50 ms gain glide
+    float mix = dryMix_, gain = matchGain_;
+    for (int i = 0; i < n; ++i) {
+        mix = targetMix > mix ? juce::jmin(targetMix, mix + step) : juce::jmax(targetMix, mix - step);
+        gain += (targetGain - gain) * glide;
+        if (std::abs(gain - targetGain) < 1.0e-4f) gain = targetGain;   // (a 0.001 dB step)
+        for (int ch = 0; ch < nch; ++ch) {
+            auto* d = info.buffer->getWritePointer(ch, info.startSample);
+            d[i] = d[i] * gain * (1.0f - mix) + dryBuf_.getSample(ch, i) * mix;
+        }
+    }
+    dryMix_ = mix;
+    matchGain_ = gain;
 }
 
 }  // namespace lathe

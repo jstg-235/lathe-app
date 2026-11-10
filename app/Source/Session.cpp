@@ -1280,6 +1280,7 @@ juce::var Session::toVar() const {
     root->setProperty("activeReference", activeReference);
     root->setProperty("levelMatchReference", levelMatchReference);
     root->setProperty("loudnessTarget", loudnessTarget);
+    root->setProperty("autoSplitNew", autoSplitNew);
     auto* meta = new juce::DynamicObject();
     meta->setProperty("label", label);
     meta->setProperty("catalogue", catalogue);
@@ -1311,6 +1312,7 @@ juce::var Session::toVar() const {
         o->setProperty("maxUnit", p.maxUnit);
         o->setProperty("flipGap", p.flipGap);
         o->setProperty("evenUnits", p.evenUnits);
+        o->setProperty("splitMode", p.splitMode);
         juce::Array<juce::var> ul;
         for (auto& u : p.units)
             ul.add(juce::Array<juce::var>{u.start, u.end, u.fadeIn, u.fadeOut, int(u.inShape), int(u.outShape)});
@@ -1465,6 +1467,7 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     if (activeReference >= references.size()) activeReference = -1;
     levelMatchReference = v.hasProperty("levelMatchReference") ? bool(v["levelMatchReference"]) : true;
     loudnessTarget = v.hasProperty("loudnessTarget") ? double(v["loudnessTarget"]) : -14.0;
+    autoSplitNew = v.hasProperty("autoSplitNew") ? bool(v["autoSplitNew"]) : true;
     {
         auto meta = v["release"];
         label = meta["label"].toString();
@@ -1498,6 +1501,7 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             p.maxUnit = double(o["maxUnit"]);
             p.flipGap = o.hasProperty("flipGap") ? double(o["flipGap"]) : 2.0;
             p.evenUnits = o.hasProperty("evenUnits") ? bool(o["evenUnits"]) : true;
+            p.splitMode = juce::jlimit(0, 1, int(o["splitMode"]));
             if (auto* ul = o["units"].getArray())
                 for (auto& u : *ul) {
                     Unit x;

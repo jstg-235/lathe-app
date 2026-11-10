@@ -27,6 +27,45 @@ static juce::File noiseFile(const juce::File& dir, const juce::String& name, dou
     return f;
 }
 
+// A test plugin: fixed gain with a fixed latency.
+class GainDelayPlugin : public juce::AudioPluginInstance {
+public:
+    GainDelayPlugin(float gain, int latency)
+        : AudioPluginInstance(BusesProperties().withInput("In", juce::AudioChannelSet::stereo()).withOutput("Out", juce::AudioChannelSet::stereo())),
+          gain_(gain), lat_(latency) {}
+    void fillInPluginDescription(juce::PluginDescription& d) const override { d.name = "GainDelay"; d.pluginFormatName = "Test"; d.fileOrIdentifier = "gaindelay"; }
+    const juce::String getName() const override { return "GainDelay"; }
+    void prepareToPlay(double, int) override { setLatencySamples(lat_); reset(); }
+    void reset() override { for (auto& d : delay_) d.assign(size_t(lat_ + 1), 0.0f); pos_ = 0; }
+    void releaseResources() override {}
+    void processBlock(juce::AudioBuffer<float>& b, juce::MidiBuffer&) override {
+        for (int i = 0; i < b.getNumSamples(); ++i) {
+            for (int ch = 0; ch < 2; ++ch) {
+                auto& d = delay_[size_t(ch)];
+                d[size_t(pos_)] = b.getSample(ch, i) * gain_;
+                b.setSample(ch, i, d[size_t((pos_ + 1) % (lat_ + 1))]);
+            }
+            pos_ = (pos_ + 1) % (lat_ + 1);
+        }
+    }
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram(int) override {}
+    const juce::String getProgramName(int) override { return {}; }
+    void changeProgramName(int, const juce::String&) override {}
+    void getStateInformation(juce::MemoryBlock&) override {}
+    void setStateInformation(const void*, int) override {}
+private:
+    float gain_;
+    int lat_, pos_ = 0;
+    std::vector<float> delay_[2];
+};
+
 // Records which commands a control surface triggers.
 struct CommandSpy : juce::ApplicationCommandTarget {
     juce::Array<juce::CommandID> fired;
@@ -377,6 +416,90 @@ int main() {
         engine.releaseResources();
     }
 
+
+    // ---- Compare Unprocessed (A / B / C): time-aligned, instant, level matched by measurement.
+    for (int withRegionFx = 0; withRegionFx < 2; ++withRegionFx) {
+        auto a = noiseFile(dir, "cmp.wav", 44100, 8.0, 21);
+        engine.prepareToPlay(512, 44100);
+        engine.chain().prepare(44100, 512);
+        juce::StringArray problems;
+        engine.chain().setState({}, problems);
+        engine.chain().addInstance(std::make_unique<GainDelayPlugin>(2.0f, 300));   // master: +6 dB, 300 samples late
+        Session s;
+        std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(a));
+        const int id = s.append(s.makeRegion(a, r->sampleRate, r->lengthInSamples), 0.0);
+        if (withRegionFx) {
+            engine.regionFx().prepare(44100, 2048, false);
+            engine.regionFx().chainFor(id, true, "cmp")->addInstance(std::make_unique<GainDelayPlugin>(0.5f, 700));   // region: -6 dB, 700 late
+            engine.regionFx().syncAndCapture(s);
+            CHECK(s.findRegion(id)->fxState.isNotEmpty());
+        }
+        engine.loadSession(s);
+        engine.resetMatch();
+        // Plays the first `blocks` blocks from the top and returns the output.
+        auto run = [&](bool dry, bool match, int blocks) {
+            engine.stop();
+            engine.setPositionSeconds(2.0);   // the programme starts after the 2 s pre-gap
+            engine.setHearUnprocessed(dry);
+            engine.setLevelMatch(match);
+            engine.play();
+            juce::AudioBuffer<float> all(2, blocks * 512);
+            for (int b = 0; b < blocks; ++b) {
+                juce::Thread::sleep(b < 8 ? 60 : 2);
+                juce::AudioBuffer<float> out(2, 512);
+                juce::AudioSourceChannelInfo info(&out, 0, 512);
+                engine.getNextAudioBlock(info);
+                for (int ch = 0; ch < 2; ++ch) all.copyFrom(ch, b * 512, out, ch, 0, 512);
+            }
+            return all;
+        };
+        const int blocks = 40;
+        run(false, false, 100);   // let any earlier level-match gain glide back to unity
+        auto A = run(false, false, blocks);
+        auto B = run(true, false, blocks);
+        // Region effects (when present) are -6 dB and the master +6 dB, so A = 2x B (no region
+        // effects) or A = B; either way the same samples at the same time.
+        const float expect = withRegionFx ? 1.0f : 2.0f;
+        double err = 0, ref = 0;
+        for (int i = 20 * 512; i < blocks * 512; ++i) {
+            const double d = A.getSample(0, i) - expect * B.getSample(0, i);
+            err += d * d;
+            ref += double(A.getSample(0, i)) * A.getSample(0, i);
+        }
+        const double nullDb = 10.0 * std::log10(juce::jmax(1e-30, err / juce::jmax(1e-30, ref)));
+        std::printf("compare%s: A against B nulls to %.1f dB (time-aligned)\n", withRegionFx ? " with region effects" : "", nullDb);
+        CHECK(nullDb < -100.0);
+        // Level match: about 3 s of play measures the difference, then C sits at B's level.
+        engine.resetMatch();
+        auto C = run(false, true, 400);
+        const double expectDiff = withRegionFx ? 0.0 : 6.0206;
+        std::printf("  measured A against B %.2f dB, cut %.2f dB (match %s)\n", engine.matchDifferenceDb(), engine.matchCutDb(),
+                    engine.matchMeasured() ? "measured" : "not measured");
+        CHECK(engine.matchMeasured());
+        CHECK(std::abs(engine.matchDifferenceDb() - expectDiff) < 0.05);
+        CHECK(std::abs(engine.matchCutDb() + expectDiff) < 0.05);
+        auto Bl = run(true, false, 400);
+        const double rc = C.getRMSLevel(0, 370 * 512, 25 * 512), rb = Bl.getRMSLevel(0, 370 * 512, 25 * 512);
+        std::printf("  C against B level %.2f dB\n", 20.0 * std::log10(rc / rb));
+        CHECK(std::abs(20.0 * std::log10(rc / rb)) < 0.1);
+        // The meters read A, even while C or B is heard.
+        run(false, true, 30);   // (locating clears the meter feed, so it holds just this run)
+        juce::AudioBuffer<float> tapped(2, 30 * 512);
+        const int got = engine.meterTap().pull(tapped);
+        CHECK(got == 30 * 512);
+        if (got == 30 * 512) {
+            const double rt = tapped.getRMSLevel(0, 20 * 512, 10 * 512), ra = A.getRMSLevel(0, 20 * 512, 10 * 512);
+            std::printf("  meters against A %.2f dB\n", 20.0 * std::log10(rt / ra));
+            CHECK(std::abs(20.0 * std::log10(rt / ra)) < 0.05);
+        }
+        engine.stop();
+        engine.setHearUnprocessed(false);
+        engine.setLevelMatch(false);
+        engine.chain().setState({}, problems);
+        engine.regionFx().clear();
+        engine.loadSession(Session());
+        engine.releaseResources();
+    }
 
     // ---- Products: per-disc DDPs and LP side files with their own fades, plus paperwork ----
     {

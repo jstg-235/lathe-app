@@ -384,6 +384,7 @@ ProductsPanel::ProductsPanel(Session& s, std::function<const dsp::LoudnessMap*()
         if (auto* p = product()) {
             SplitOptions o;
             o.overlap = overlap_.getValue();
+            o.atTrackMarkers = p->splitMode == 1;
             auto msg = autoSplit(s_, *p, loudness_ ? loudness_() : nullptr, o);
             summary_.setText(msg, juce::dontSendNotification);
             commit();
@@ -447,6 +448,21 @@ ProductsPanel::ProductsPanel(Session& s, std::function<const dsp::LoudnessMap*()
     overlap_.setValue(5.0, juce::dontSendNotification);
     overlap_.setTextValueSuffix(" s");
     for (auto* sl : {&gap_, &overlap_}) addAndMakeVisible(*sl);
+    mode_.addItem("Balanced", 1);
+    mode_.addItem("Fill to track markers", 2);
+    mode_.setTooltip("Balanced: units as even as possible, breaking inside music only when it must.\n"
+                     "Fill to track markers: as many whole tracks per unit as fit, always breaking at a track marker.");
+    mode_.onChange = [this] {
+        if (updating_) return;
+        if (auto* p = product()) { p->splitMode = mode_.getSelectedId() == 2 ? 1 : 0; commit(); }
+    };
+    addAndMakeVisible(mode_);
+    autoNew_.setColour(juce::ToggleButton::textColourId, colours::text);
+    autoNew_.setTooltip("On: a new product is split as soon as it's added. Off: it starts as one unit for the whole programme, "
+                        "for you to split here or on the timeline (right-click the product strip).");
+    autoNew_.setToggleState(s_.autoSplitNew, juce::dontSendNotification);
+    autoNew_.onClick = [this] { s_.autoSplitNew = autoNew_.getToggleState(); commit(); };
+    addAndMakeVisible(autoNew_);
     even_.setColour(juce::ToggleButton::textColourId, colours::text);
     even_.onClick = [this] { if (!updating_) if (auto* p = product()) { p->evenUnits = even_.getToggleState(); commit(); } };
     addAndMakeVisible(even_);
@@ -484,9 +500,18 @@ void ProductsPanel::addProduct(ProductKind k) {
     int same = 0;
     for (auto& x : s_.products) same += x.kind == k ? 1 : 0;
     if (same) p.name << " " << (same + 1);
-    SplitOptions o;
-    o.overlap = overlap_.getValue();
-    auto msg = autoSplit(s_, p, loudness_ ? loudness_() : nullptr, o);
+    p.splitMode = mode_.getSelectedId() == 2 ? 1 : 0;   // the mode last shown
+    juce::String msg;
+    if (s_.autoSplitNew) {
+        SplitOptions o;
+        o.overlap = overlap_.getValue();
+        o.atTrackMarkers = p.splitMode == 1;
+        msg = autoSplit(s_, p, loudness_ ? loudness_() : nullptr, o);
+    } else {
+        singleUnit(s_, p);
+        msg = p.name + ": one unit for the whole programme. Split it with Auto-Split, Add Unit, or on the timeline "
+                       "(drag the unit edges in the product strip; right-click it to split or join).";
+    }
     s_.products.add(p);
     productId_ = p.id;
     summary_.setText(msg, juce::dontSendNotification);
@@ -516,8 +541,10 @@ void ProductsPanel::refresh() {
 
 void ProductsPanel::updateFields() {
     updating_ = true;
+    autoNew_.setToggleState(s_.autoSplitNew, juce::dontSendNotification);
+    if (mode_.getSelectedId() == 0) mode_.setSelectedId(1, juce::dontSendNotification);
     auto* p = product();
-    for (juce::Component* c : std::initializer_list<juce::Component*>{&name_, &cat_, &upc_, &limit_, &gap_, &even_, &split_, &addUnit_, &removeUnit_, &editBreak_, &remove_})
+    for (juce::Component* c : std::initializer_list<juce::Component*>{&name_, &cat_, &upc_, &limit_, &gap_, &even_, &split_, &mode_, &addUnit_, &removeUnit_, &editBreak_, &remove_})
         c->setEnabled(p != nullptr);
     if (p) {
         name_.setText(p->name, false);
@@ -526,6 +553,7 @@ void ProductsPanel::updateFields() {
         limit_.setText(mmss(p->limit()), false);
         gap_.setValue(p->flipGap, juce::dontSendNotification);
         even_.setToggleState(p->evenUnits, juce::dontSendNotification);
+        mode_.setSelectedId(p->splitMode == 1 ? 2 : 1, juce::dontSendNotification);
         even_.setVisible(productSpec(p->kind).sides);
         juce::String issues;
         for (auto& i : validateProduct(s_, *p)) issues << (i.error ? "ERROR: " : "Warning: ") << i.message << "\n";
@@ -553,7 +581,9 @@ void ProductsPanel::resized() {
     add_.setBounds(lb.removeFromLeft(120));
     lb.removeFromLeft(6);
     remove_.setBounds(lb);
-    left.removeFromBottom(6);
+    left.removeFromBottom(4);
+    autoNew_.setBounds(left.removeFromBottom(24));
+    left.removeFromBottom(4);
     list_.setBounds(left);
     r.removeFromLeft(10);
     auto row1 = r.removeFromTop(26);
@@ -574,8 +604,10 @@ void ProductsPanel::resized() {
     even_.setBounds(row2.removeFromLeft(180));
     r.removeFromTop(6);
     auto row3 = r.removeFromTop(28);
-    split_.setBounds(row3.removeFromLeft(110));
-    row3.removeFromLeft(6);
+    split_.setBounds(row3.removeFromLeft(96));
+    row3.removeFromLeft(4);
+    mode_.setBounds(row3.removeFromLeft(160));
+    row3.removeFromLeft(8);
     addUnit_.setBounds(row3.removeFromLeft(90));
     row3.removeFromLeft(6);
     removeUnit_.setBounds(row3.removeFromLeft(100));

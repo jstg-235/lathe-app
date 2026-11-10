@@ -129,7 +129,8 @@ private:
     juce::Label nameL_, catL_, upcL_, limitL_, gapL_, overlapL_, summary_;
     juce::TextEditor name_, cat_, upc_, limit_;
     juce::Slider gap_, overlap_;
-    juce::ToggleButton even_{"Even number of sides"};
+    juce::ToggleButton even_{"Even number of sides"}, autoNew_{"Auto-split new products"};
+    juce::ComboBox mode_;
     juce::TableListBox units_{"Units", this};
     juce::TextEditor issues_;
     bool updating_ = false;

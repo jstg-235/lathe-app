@@ -12,6 +12,63 @@ constexpr double kAbsGate = -70.0;
 
 double energyToLufs(double ms) { return ms > 0 ? -0.691 + 10.0 * std::log10(ms) : -INFINITY; }
 
+void LoudnessMatch::prepare(double fs, int channels, double windowSeconds) {
+    sr_ = fs;
+    ch_ = std::clamp(channels, 1, kMax);
+    hop_ = std::max(1, int(std::lround(fs * 0.1)));
+    window_ = std::max(20, int(std::lround(windowSeconds * 10.0)));
+    for (int s = 0; s < 2; ++s)
+        for (int c = 0; c < kMax; ++c) designKWeighting(fs, shelf_[s][c], hp_[s][c]);
+    for (int c = 0; c < kMax; ++c) weight_[c] = 1.0;
+    if (ch_ == 6) { weight_[3] = 0.0; weight_[4] = weight_[5] = 1.41; }   // LFE out, surrounds +1.5 dB
+    reset();
+}
+
+void LoudnessMatch::reset() {
+    for (int s = 0; s < 2; ++s) {
+        for (int c = 0; c < kMax; ++c) { shelf_[s][c].reset(); hp_[s][c].reset(); }
+        hopSum_[s] = 0;
+        avg_[s] = 0;
+        for (auto& h : hops_[s]) h = 0;
+    }
+    inHop_ = hopsSeen_ = hopPos_ = 0;
+    blocks_ = 0;
+}
+
+void LoudnessMatch::process(const float* const* a, const float* const* b, int n) {
+    const float* const* sig[2] = {a, b};
+    static const double kSilent = std::pow(10.0, (-70.0 + 0.691) / 10.0);
+    for (int i = 0; i < n; ++i) {
+        for (int s = 0; s < 2; ++s) {
+            double e = 0;
+            for (int c = 0; c < ch_; ++c) {
+                if (weight_[c] == 0.0) continue;
+                const double y = hp_[s][c].process(shelf_[s][c].process(double(sig[s][c][i])));
+                e += weight_[c] * y * y;
+            }
+            hopSum_[s] += e;
+        }
+        if (++inHop_ < hop_) continue;
+        for (int s = 0; s < 2; ++s) { hops_[s][hopPos_] = hopSum_[s] / double(hop_); hopSum_[s] = 0; }
+        hopPos_ = (hopPos_ + 1) % 4;
+        inHop_ = 0;
+        if (++hopsSeen_ < 4) continue;
+        double blk[2];
+        for (int s = 0; s < 2; ++s) blk[s] = (hops_[s][0] + hops_[s][1] + hops_[s][2] + hops_[s][3]) * 0.25;
+        if (blk[0] < kSilent || blk[1] < kSilent) continue;
+        if (blocks_ >= 20 && (blk[0] < avg_[0] * 0.01 || blk[1] < avg_[1] * 0.01)) continue;
+        // A plain mean until the window is full, then a sliding (exponential) average over it.
+        const double k = 1.0 / double(std::min<int64_t>(blocks_ + 1, window_));
+        for (int s = 0; s < 2; ++s) avg_[s] += (blk[s] - avg_[s]) * k;
+        ++blocks_;
+    }
+}
+
+double LoudnessMatch::differenceDb() const {
+    if (blocks_ == 0 || avg_[0] <= 0 || avg_[1] <= 0) return 0.0;
+    return 10.0 * std::log10(avg_[1] / avg_[0]);
+}
+
 void designKWeighting(double fs, Biquad& shelf, Biquad& hp) {
     // Stage 1: high-shelf (head acoustics). Analog parameters from BS.1770, re-derived for fs.
     {

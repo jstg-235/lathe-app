@@ -222,6 +222,8 @@ MainComponent::MainComponent() {
     timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
     timeline_.onCrossfade = [this](int a, int b) { openCrossfade(a, b); };
     timeline_.onBreakEdit = [this](int pid, int k) { openBreakEditor(pid, k); };
+    timeline_.onProductsEdited = [this] { if (productsPanel_) productsPanel_->refresh(); };
+    timeline_.onProductMenu = [this](int pid, double t, int k) { showProductStripMenu(pid, t, k); };
     timeline_.onRegionFx = [this](int id) { openRegionFx(id); };
     timeline_.onRegionRestore = [this](int id) { showRestore(id); };
     timeline_.onRegionSpectral = [this](int id) { showSpectral(id); };
@@ -267,6 +269,10 @@ MainComponent::MainComponent() {
     chainList_.setColour(juce::ListBox::backgroundColourId, colours::panel);
     chainList_.setRowHeight(24);
     addAndMakeVisible(chainList_);
+    addChildComponent(compareBar_);
+    compareBar_.onSwitch = [this] { toggleCompareUnprocessed(); };
+    compareBar_.onToggleMatch = [this] { setLevelMatch(!engine_.levelMatch()); };
+    compareBar_.onEnd = [this] { endCompare(); };
 
     issues_.setMultiLine(true);
     issues_.setReadOnly(true);
@@ -397,6 +403,10 @@ void MainComponent::resized() {
     right.removeFromBottom(6);
     issues_.setBounds(right.removeFromBottom(160));
     right.removeFromBottom(6);
+    if (compare_) {
+        compareBar_.setBounds(right.removeFromTop(62));
+        right.removeFromTop(4);
+    }
     chainList_.setBounds(right);
 
     sourceView_.setBounds(r.removeFromTop(juce::jlimit(170, 260, r.getHeight() / 4)));
@@ -481,6 +491,8 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::bypassRegionFx: info.setTicked(engine_.regionFx().bypassAll()); break;
         case cmd::listenReference: info.setTicked(engine_.listeningToReference()); info.setActive(engine_.hasReference()); break;
         case cmd::compareUnprocessed: info.setTicked(compare_); break;
+        case cmd::compareLevelMatch: info.setTicked(engine_.levelMatch()); info.setActive(compare_); break;
+        case cmd::compareEnd: info.setActive(compare_); break;
         case cmd::toggleLoudness: info.setTicked(timeline_.showLoudness()); break;
         case cmd::showAnalysis: info.setActive(analysis_ != nullptr); break;
         default: break;
@@ -788,6 +800,8 @@ bool MainComponent::perform(const InvocationInfo& info) {
             else showReferences();
             break;
         case cmd::compareUnprocessed: toggleCompareUnprocessed(); break;
+        case cmd::compareLevelMatch: if (compare_) setLevelMatch(!engine_.levelMatch()); break;
+        case cmd::compareEnd: endCompare(); break;
         case cmd::toggleLoudness: timeline_.setShowLoudness(!timeline_.showLoudness()); break;
         case cmd::verifyDdp: verifyDdp(); break;
         case cmd::nullTest: runNullTest(); break;
@@ -875,7 +889,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::editPointFollowsStop, cmd::playbackSettings});
             m.addSeparator();
-            add({cmd::listenReference, cmd::compareUnprocessed});
+            add({cmd::listenReference, cmd::compareUnprocessed, cmd::compareLevelMatch, cmd::compareEnd});
             m.addSeparator();
             add({cmd::record});
             m.addSeparator();
@@ -1415,7 +1429,6 @@ void MainComponent::runAnalysis() {
                timeline_.setAnalysis(proc, raw);
                timeline_.setShowLoudness(true);
                commands_.commandStatusChanged();
-               if (compare_) engine_.setCompareUnprocessed(true, analysis_->lufs - rawAnalysis_->lufs);
                showAnalysisWindow();
            });
 }
@@ -1549,7 +1562,8 @@ void MainComponent::showReferences() {
         [this] { sessionChanged(false); },
         [this] {
             juce::String why;
-            double g = referenceGainDb(&why);
+            if (compare_) updateCompareBar();
+        double g = referenceGainDb(&why);
             juce::String s;
             if (session_.activeReference < 0) return juce::String("Add a reference and select it. Press Q (or the button) to switch between it and the master; both keep playing so you hear the same moment.");
             s << why << "\nApplied to the reference: " << (g >= 0 ? "+" : "") << juce::String(g, 1) << " dB";
@@ -1563,20 +1577,45 @@ void MainComponent::showReferences() {
 }
 
 void MainComponent::toggleCompareUnprocessed() {
-    compare_ = !compare_;
-    auto& bank = engine_.regionFx();
-    if (compare_) {
-        compareRestoreRegionBypass_ = bank.bypassAll();
-        bank.setBypassAll(true);
-        double match = (analysis_ && rawAnalysis_ && std::isfinite(analysis_->lufs) && std::isfinite(rawAnalysis_->lufs))
-                           ? analysis_->lufs - rawAnalysis_->lufs : 0.0;
-        engine_.setCompareUnprocessed(true, match);
+    // First press: Compare Unprocessed comes on and you hear B. After that, W switches sides
+    // (A / B, or B / C with Level Match); End (Option-W) goes back to normal playback.
+    if (!compare_) {
+        compare_ = true;
+        engine_.setHearUnprocessed(true);
     } else {
-        bank.setBypassAll(compareRestoreRegionBypass_);
-        engine_.setCompareUnprocessed(false, 0.0);
+        engine_.setHearUnprocessed(!engine_.hearingUnprocessed());
     }
-    engine_.loadSession(session_);   // region effects change latency, so re-time playback
+    updateCompareBar();
+    resized();
     commands_.commandStatusChanged();
+}
+
+void MainComponent::setLevelMatch(bool on) {
+    engine_.setLevelMatch(on);
+    if (on) engine_.setHearUnprocessed(false);   // straight to C, so you hear the match
+    updateCompareBar();
+    commands_.commandStatusChanged();
+}
+
+void MainComponent::endCompare() {
+    if (!compare_) return;
+    compare_ = false;
+    engine_.setHearUnprocessed(false);
+    engine_.setLevelMatch(false);
+    updateCompareBar();
+    resized();
+    commands_.commandStatusChanged();
+}
+
+void MainComponent::updateCompareBar() {
+    CompareBar::State st;
+    st.hearingUnprocessed = engine_.hearingUnprocessed();
+    st.levelMatch = engine_.levelMatch();
+    st.measured = engine_.matchMeasured();
+    st.cutDb = engine_.matchCutDb();
+    st.differenceDb = engine_.matchDifferenceDb();
+    compareBar_.setState(st);
+    compareBar_.setVisible(compare_);
 }
 
 // ---------------------------------------------------------------- recording
@@ -2132,7 +2171,8 @@ void MainComponent::newSession() {
     analysis_.reset();
     rawAnalysis_.reset();
     timeline_.setAnalysis(nullptr, nullptr);
-    if (compare_) toggleCompareUnprocessed();
+    endCompare();
+    engine_.resetMatch();
     refWindow_.reset();
     analysisWindow_.reset();
     session_ = Session();
@@ -2159,7 +2199,8 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
     analysis_.reset();
     rawAnalysis_.reset();
     timeline_.setAnalysis(nullptr, nullptr);
-    if (compare_) toggleCompareUnprocessed();
+    endCompare();
+    engine_.resetMatch();
     refWindow_.reset();
     analysisWindow_.reset();
     restoreWindow_.reset();
@@ -3233,9 +3274,14 @@ void MainComponent::timerCallback() {
         juce::String ab;
         if (engine_.listeningToReference() && juce::isPositiveAndBelow(session_.activeReference, session_.references.size()))
             ab = "REF: " + session_.references[session_.activeReference].name + "  " + (g >= 0 ? "+" : "") + juce::String(g, 1) + " dB";
-        else if (compare_)
-            ab = "UNPROCESSED" + juce::String(rawAnalysis_ && analysis_ && std::isfinite(rawAnalysis_->lufs) && std::isfinite(analysis_->lufs)
-                                                   ? "  (level-matched)" : "  (not level-matched)");
+        else if (compare_) {
+            CompareBar::State st;
+            st.hearingUnprocessed = engine_.hearingUnprocessed();
+            st.levelMatch = engine_.levelMatch();
+            st.measured = engine_.matchMeasured();
+            st.cutDb = engine_.matchCutDb();
+            ab = CompareBar::describe(st);
+        }
         abDisplay_.setText(ab, juce::dontSendNotification);
     }
     meterHub_.sessionTarget = session_.loudnessTarget;
@@ -3298,6 +3344,63 @@ void MainComponent::showProducts() {
     w->onClose = [this] { juce::MessageManager::callAsync([this] { productsWindow_.reset(); }); };
     productsWindow_.reset(w);
     if (panel->selectedProduct()) timeline_.setProductView(panel->selectedProduct());
+}
+
+void MainComponent::showProductStripMenu(int pid, double t, int k) {
+    auto* p = session_.findProduct(pid);
+    if (!p) return;
+    const auto noun = juce::String(productSpec(p->kind).unitNoun);
+    bool inside = false;
+    for (auto& u : p->units) inside |= t > u.start + 1.0 && t < u.end - 1.0;
+    juce::PopupMenu m;
+    m.addSectionHeader(p->name + " at " + msfString(t));
+    m.addItem(1, "Split " + noun + " Here", inside);
+    m.addItem(2, "Join " + noun + "s at This Break", k >= 0);
+    m.addItem(3, "Edit Break...", k >= 0);
+    m.addSeparator();
+    m.addItem(4, "Auto-Split (Balanced)");
+    m.addItem(5, "Auto-Split (Fill to Track Markers)");
+    m.addItem(6, "One " + noun + " for the Whole Programme");
+    m.addSeparator();
+    if (session_.products.size() > 1) {
+        juce::PopupMenu show;
+        for (int i = 0; i < session_.products.size(); ++i)
+            show.addItem(100 + i, session_.products[i].name, true, session_.products[i].id == pid);
+        m.addSubMenu("Show Product", show);
+    }
+    m.addItem(7, "Products & Splitting...");
+    m.showMenuAsync(juce::PopupMenu::Options().withMousePosition(), [this, pid, t, k](int r) {
+        auto* q = session_.findProduct(pid);
+        if (!q || r == 0) return;
+        juce::String msg;
+        bool changed = false;
+        if (r == 1) changed = splitUnitAt(*q, t);
+        if (r == 2) changed = joinUnits(*q, k);
+        if (r == 3) { openBreakEditor(pid, k); return; }
+        if (r == 4 || r == 5) {
+            SplitOptions o;
+            o.atTrackMarkers = r == 5;
+            q->splitMode = r == 5 ? 1 : 0;
+            msg = autoSplit(session_, *q, analysis_ && !analysis_->map.momentary.empty() ? &analysis_->map : nullptr, o);
+            changed = true;
+        }
+        if (r == 6) { singleUnit(session_, *q); changed = true; }
+        if (r == 7) { showProducts(); return; }
+        if (r >= 100) { timeline_.setProductView(session_.products[r - 100].id); return; }
+        if (changed) {
+            sessionChanged();
+            timeline_.resized();
+            timeline_.repaint();
+            if (productsPanel_) productsPanel_->refresh();
+            if (breakEditor_) {
+                auto* pp = session_.findProduct(breakEditor_->productId());
+                if (!pp || breakEditor_->breakIndex() + 1 >= pp->units.size()) breakWindow_.reset();
+                else breakEditor_->setBreak(pp->id, breakEditor_->breakIndex());
+            }
+        }
+        if (msg.startsWith("Couldn't"))
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Auto-Split", msg);
+    });
 }
 
 void MainComponent::openBreakEditor(int pid, int k) {

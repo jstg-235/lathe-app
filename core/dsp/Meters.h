@@ -83,6 +83,34 @@ private:
 
 double energyToLufs(double meanSquare);
 
+// Loudness match: measures two time-aligned signals together (BS.1770 K-weighting and channel
+// weights, 400 ms blocks every 100 ms) and keeps a sliding average of each, over about the last
+// `windowSeconds` of programme. Blocks where either signal is silent (below -70 LUFS) or far
+// below the running level (-20 LU, like the relative gate) are left out, so pauses and fades
+// don't pull the match around. differenceDb() is how much louder `b` is than `a`.
+// Real-time safe: no allocation after prepare(). Up to 6 channels (5.1: L R C LFE Ls Rs, the LFE
+// is not counted).
+class LoudnessMatch {
+public:
+    void prepare(double sampleRate, int channels, double windowSeconds = 10.0);
+    void reset();
+    void process(const float* const* a, const float* const* b, int numSamples);
+    bool ready() const { return blocks_ >= 20; }   // 2 s of programme measured
+    double differenceDb() const;
+    double seconds() const { return double(blocks_) * 0.1; }
+private:
+    static constexpr int kMax = 6;
+    double sr_ = 48000;
+    int ch_ = 2, hop_ = 4800, inHop_ = 0, hopsSeen_ = 0, window_ = 100;
+    Biquad shelf_[2][kMax], hp_[2][kMax];
+    double weight_[kMax]{};
+    double hopSum_[2]{};
+    double hops_[2][4]{};
+    int hopPos_ = 0;
+    double avg_[2]{};
+    int64_t blocks_ = 0;
+};
+
 // TPDF dither with optional error-feedback noise shaping, from 64-bit float to integer PCM.
 //  None    flat TPDF (the reference: noise is white, signal fully decorrelated from the error)
 //  Light   1st-order high-pass shaping

@@ -45,6 +45,9 @@ public:
     std::function<void(int regionId)> onRegionRestore, onRegionSpectral;
     // Product strip (units of one product drawn under the markers); double-click a break to edit it.
     std::function<void(int productId, int breakIndex)> onBreakEdit;
+    // Right-click on the product strip: time clicked and the break there (-1 = none).
+    std::function<void(int productId, double t, int breakIndex)> onProductMenu;
+    std::function<void()> onProductsEdited;   // a unit edge was dragged (after onEdit)
     void setProductView(int productId) { productView_ = productId; resized(); repaint(); }
     int productView() const;   // the product shown (first one if none chosen), 0 = none
 
@@ -135,7 +138,10 @@ private:
     int top() const { return trackBarY() + trackBarH(); }   // first lane's y
     void paintProducts(juce::Graphics&);
     int breakAt(juce::Point<int> p) const;   // break index in the shown product, -1 = none
-    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint, SrpMove, TrackBar, GainNode };
+    // A unit edge under p in the product strip: unit index and which end; false if none.
+    bool unitEdgeAt(juce::Point<int> p, int& unit, bool& isEnd) const;
+    struct UnitDrag { int unit = -1; bool isEnd = false; int linked = -1; bool linkedIsEnd = false; double orig = 0; } unitDrag_;
+    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint, SrpMove, TrackBar, GainNode, UnitEdge };
 
     double xToTime(float x) const { return view0_ + double(x) / pps_; }
     float timeToX(double t) const { return float((t - view0_) * pps_); }

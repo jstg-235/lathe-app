@@ -251,7 +251,12 @@ private:
     int fxWindowRegion_ = 0;
     std::shared_ptr<dsp::AnalysisResult> analysis_, rawAnalysis_;
     bool analysisStale_ = false;
-    bool compare_ = false, compareRestoreRegionBypass_ = false;
+    bool compare_ = false;   // Compare Unprocessed is on (the banner shows)
+    CompareBar compareBar_;
+    void setLevelMatch(bool on);
+    void endCompare();
+    void showProductStripMenu(int productId, double t, int breakIndex);
+    void updateCompareBar();
     std::unique_ptr<juce::DocumentWindow> refWindow_, analysisWindow_, playerWindow_;
     juce::Label abDisplay_;
     juce::TextButton recordBtn_{"Rec"};

@@ -100,4 +100,73 @@ void ChainPanel::resized() {
     list_.setBounds(r);
 }
 
+CompareBar::CompareBar() {
+    for (auto* b : {&match_, &end_}) { styleButton(*b); addAndMakeVisible(*b); }
+    match_.setClickingTogglesState(false);
+    match_.setTooltip("Turn the processed side down to the loudness of the unprocessed side, so you compare sound, "
+                      "not level (Shift-W). It never turns anything up, and never reaches exports.");
+    end_.setTooltip("Back to normal playback (Option-W)");
+    match_.onClick = [this] { if (onToggleMatch) onToggleMatch(); };
+    end_.onClick = [this] { if (onEnd) onEnd(); };
+    setTooltip("Click (or press W) to switch between processed and unprocessed");
+}
+
+void CompareBar::setState(const State& s) {
+    const bool changed = s.hearingUnprocessed != st_.hearingUnprocessed || s.levelMatch != st_.levelMatch || s.measured != st_.measured
+                         || std::abs(s.cutDb - st_.cutDb) >= 0.05 || std::abs(s.differenceDb - st_.differenceDb) >= 0.05;
+    st_ = s;
+    match_.setToggleState(s.levelMatch, juce::dontSendNotification);
+    if (changed) repaint();
+}
+
+static juce::String dbText(double v) { return (v > 0.05 ? "+" : "") + juce::String(v, 1) + " dB"; }
+
+juce::String CompareBar::describe(const State& s) {
+    if (s.hearingUnprocessed) return "B  UNPROCESSED";
+    if (!s.levelMatch) return "A  PROCESSED";
+    if (!s.measured) return "C  MATCHING... (play)";
+    if (s.cutDb > -0.05) return "C  MATCHED (no cut)";
+    return "C  MATCHED " + dbText(s.cutDb);
+}
+
+void CompareBar::paint(juce::Graphics& g) {
+    auto r = getLocalBounds().toFloat();
+    const bool lit = st_.hearingUnprocessed || st_.levelMatch;
+    const juce::Colour fill = st_.hearingUnprocessed ? colours::accent : (st_.levelMatch ? colours::wave : colours::panel2);
+    g.setColour(fill);
+    g.fillRoundedRectangle(r, 4.0f);
+    g.setColour(colours::accent);
+    g.drawRoundedRectangle(r.reduced(0.5f), 4.0f, 1.0f);
+    const juce::Colour ink = lit ? colours::bg : colours::text;
+    auto t = readout_;
+    g.setColour(ink);
+    g.setFont(juce::FontOptions(14.0f, juce::Font::bold));
+    g.drawText(describe(st_), t.removeFromTop(20), juce::Justification::centredLeft, true);
+    g.setFont(juce::FontOptions(11.5f));
+    g.setColour(ink.withAlpha(0.85f));
+    g.drawText(juce::String(st_.levelMatch ? "W switches B / C" : "W switches A / B") + "   meters read A", t.removeFromTop(15),
+               juce::Justification::centredLeft, true);
+    juce::String level = "Processed level: measuring as it plays";
+    if (st_.measured) {
+        const double d = st_.differenceDb;
+        level = std::abs(d) < 0.05 ? juce::String("Processed is at the same level")
+                                   : "Processed is " + juce::String(std::abs(d), 1) + " dB " + (d > 0 ? "louder" : "quieter");
+    }
+    g.drawText(level, t.removeFromTop(15), juce::Justification::centredLeft, true);
+}
+
+void CompareBar::resized() {
+    auto r = getLocalBounds().reduced(6, 5);
+    auto buttons = r.removeFromRight(86);
+    match_.setBounds(buttons.removeFromTop(buttons.getHeight() / 2 - 1));
+    buttons.removeFromTop(2);
+    end_.setBounds(buttons);
+    r.removeFromRight(6);
+    readout_ = r;
+}
+
+void CompareBar::mouseUp(const juce::MouseEvent& e) {
+    if (readout_.contains(e.getPosition()) && onSwitch) onSwitch();
+}
+
 }  // namespace lathe

@@ -104,6 +104,7 @@ struct Product {
     double maxUnit = 0;         // per-unit limit used by auto-split (0 = the spec's target)
     double flipGap = 2.0;       // break audition: silence between units (0 = no gap)
     bool evenUnits = true;      // vinyl/cassette: always an even number of sides
+    int splitMode = 0;          // auto-split: 0 balanced, 1 fill each unit up to a track marker
     juce::Array<Unit> units;
     double limit() const { return maxUnit > 0 ? maxUnit : productSpec(kind).target; }
 };
@@ -165,6 +166,7 @@ public:
     int activeReference = -1;
     bool levelMatchReference = true;
     double loudnessTarget = -14.0;   // drawn on the loudness overlay
+    bool autoSplitNew = true;        // a new product is split straight away (else one unit for everything)
     juce::Array<Region> regions;
     juce::Array<Marker> markers;
     int lanes = 2;

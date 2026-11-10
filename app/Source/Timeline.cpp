@@ -722,7 +722,10 @@ void Timeline::paintSrps(juce::Graphics& g) {
 
 void Timeline::mouseMove(const juce::MouseEvent& e) {
     auto cursor = juce::MouseCursor::NormalCursor;
+    int ui = -1;
+    bool ue = false;
     if (markerAt(e.getPosition())) cursor = juce::MouseCursor::LeftRightResizeCursor;
+    else if (unitEdgeAt(e.getPosition(), ui, ue)) cursor = juce::MouseCursor::LeftRightResizeCursor;
     else if (int id = regionAt(e.getPosition())) {
         auto* r = s_.findRegion(id);
         float xa = timeToX(r->start), xb = timeToX(r->end());
@@ -804,6 +807,30 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
         if (onMarkerSelected) onMarkerSelected(m);
         repaint();
         return;
+    }
+    if (productH() > 0 && e.y >= kRuler + kMarkerStrip && e.y < kRuler + kMarkerStrip + productH()) {
+        Product* prod = s_.findProduct(productView());
+        if (prod && e.mods.isPopupMenu()) {
+            if (onProductMenu) onProductMenu(prod->id, juce::jmax(0.0, dragT0_), breakAt(p));
+            return;
+        }
+        int ui = -1;
+        bool isEnd = false;
+        if (prod && unitEdgeAt(p, ui, isEnd)) {
+            unitDrag_ = {};
+            unitDrag_.unit = ui;
+            unitDrag_.isEnd = isEnd;
+            const auto& u = prod->units.getReference(ui);
+            unitDrag_.orig = isEnd ? u.end : u.start;
+            // A butt break moves both sides together.
+            const int nb = isEnd ? ui + 1 : ui - 1;
+            if (nb >= 0 && nb < prod->units.size()) {
+                const auto& v = prod->units.getReference(nb);
+                if (std::abs((isEnd ? v.start : v.end) - unitDrag_.orig) < 1e-6) { unitDrag_.linked = nb; unitDrag_.linkedIsEnd = !isEnd; }
+            }
+            drag_ = Drag::UnitEdge;
+            return;
+        }
     }
     if (trackBarH() > 0 && e.y >= trackBarY() && e.y < top()) {
         trackFrom_ = trackTo_ = trackAtX(float(e.x));
@@ -917,6 +944,26 @@ void Timeline::mouseDrag(const juce::MouseEvent& e) {
             break;
         }
         case Drag::TrackBar: trackTo_ = trackAtX(float(e.x)); break;
+        case Drag::UnitEdge: {
+            Product* prod = s_.findProduct(productView());
+            if (!prod || unitDrag_.unit < 0 || unitDrag_.unit >= prod->units.size()) break;
+            auto& u = prod->units.getReference(unitDrag_.unit);
+            double nt = snapTime(juce::jmax(0.0, unitDrag_.orig + (t - dragT0_)), 0);
+            // Keep every unit at least a second long, its fades inside it, and within the programme.
+            const double T = juce::jmax(u.end, s_.end());
+            if (unitDrag_.isEnd) nt = juce::jlimit(u.start + juce::jmax(1.0, u.fadeIn + u.fadeOut), T, nt);
+            else nt = juce::jlimit(0.0, u.end - juce::jmax(1.0, u.fadeIn + u.fadeOut), nt);
+            if (unitDrag_.linked >= 0 && unitDrag_.linked < prod->units.size()) {
+                auto& v = prod->units.getReference(unitDrag_.linked);
+                if (unitDrag_.linkedIsEnd) nt = juce::jmax(nt, v.start + juce::jmax(1.0, v.fadeIn + v.fadeOut));
+                else nt = juce::jmin(nt, v.end - juce::jmax(1.0, v.fadeIn + v.fadeOut));
+                (unitDrag_.linkedIsEnd ? v.end : v.start) = nt;
+            }
+            (unitDrag_.isEnd ? u.end : u.start) = nt;
+            edit_ = nt;
+            changed_ = true;
+            break;
+        }
         case Drag::GainNode: {
             // Vertical: 1 dB steps (0.1 dB with Option). Horizontal: a single ungrouped node only.
             const double step = e.mods.isAltDown() ? 0.1 : 1.0;
@@ -992,7 +1039,9 @@ void Timeline::mouseUp(const juce::MouseEvent&) {
     }
     if (drag_ == Drag::Move && changed_ && dropMode_ != Session::DropMode::Overlay)
         if (auto* r = s_.findRegion(dragId_)) s_.dropRegion(dragId_, r->start, r->lane, dropMode_);
+    const bool unitEdited = drag_ == Drag::UnitEdge && changed_;
     if (changed_ && onEdit) onEdit();
+    if (unitEdited && onProductsEdited) onProductsEdited();
     drag_ = Drag::None;
     changed_ = false;
     repaint();
@@ -1059,6 +1108,25 @@ int Timeline::breakAt(juce::Point<int> p) const {
         if (d < juce::jmax(bestD, span) && (best < 0 || d < bestD)) { best = k; bestD = d; }
     }
     return best;
+}
+
+bool Timeline::unitEdgeAt(juce::Point<int> p, int& unit, bool& isEnd) const {
+    if (!productH() || p.y < kRuler + kMarkerStrip || p.y >= kRuler + kMarkerStrip + productH()) return false;
+    const Product* prod = nullptr;
+    for (auto& x : s_.products) if (x.id == productView()) prod = &x;
+    if (!prod) return false;
+    float best = 6.0f;
+    for (int i = 0; i < prod->units.size(); ++i) {
+        // Units alternate between two rows; prefer the row under the pointer.
+        const int rowY = kRuler + kMarkerStrip + 2 + (i % 2) * 9;
+        const float rowPenalty = (p.y >= rowY - 1 && p.y < rowY + 10) ? 0.0f : 2.5f;
+        const auto& u = prod->units.getReference(i);
+        for (int k = 0; k < 2; ++k) {
+            const float d = std::abs(timeToX(k ? u.end : u.start) - float(p.x)) + rowPenalty;
+            if (d < best) { best = d; unit = i; isEnd = k == 1; }
+        }
+    }
+    return best < 6.0f;
 }
 
 void Timeline::paintProducts(juce::Graphics& g) {

@@ -76,6 +76,8 @@ public:
     void process(juce::AudioBuffer<double>& b, int start, int n);   // offline master path
     int countDoublePrecision() const;
     int latencySamples() const;
+    // The latency of the last real-time process() call (audio thread; safe to read anywhere).
+    int lastLatency() const { return lastLatency_.load(); }
     void setNonRealtime(bool offline);
 
     // Offline (export): exclusive use from a background thread.
@@ -95,6 +97,7 @@ private:
     double rate_ = 44100;
     int block_ = 512;
     bool prepared_ = false, preparedDouble_ = false;
+    std::atomic<int> lastLatency_{0};
 };
 
 }  // namespace lathe

@@ -565,6 +565,45 @@ int main() {
         int onDiscs = int(m2.tracks.size()) + int(multi.toDiscForUnit(cdm.units[0], 1, 2, lead, nullptr).tracks.size());
         CHECK(onDiscs == 30);
 
+        // Fill to track markers: 30 x 5 min on CD (79:57 limit): 15 tracks fit on disc 1 (2 s pregap + 15 x 302 s = 75:32),
+        // the rest on disc 2; every break is a track start.
+        {
+            Product fill;
+            fill.kind = ProductKind::CD;
+            fill.name = "CD";
+            SplitOptions o;
+            o.atTrackMarkers = true;
+            auto fm2 = autoSplit(multi, fill, nullptr, o);
+            std::printf("%s\n", fm2.toRawUTF8());
+            juce::Array<double> starts;
+            for (auto& m : multi.markers) if (m.type == Marker::TrackStart) starts.add(m.t);
+            bool atMarks = fill.units.size() >= 2;
+            for (int i = 1; i < fill.units.size(); ++i)
+                atMarks = atMarks && starts.contains(fill.units[i].start) && fill.units[i].start == fill.units[i - 1].end && fill.units[i].fadeIn == 0;
+            bool within = true;
+            for (auto& x : fill.units) within = within && x.length() <= fill.limit() + 1e-6;
+            CHECK(atMarks && within && fill.units.size() == 2);
+            // Disc 1 is as full as it can be: one more track would not fit.
+            const int idx = starts.indexOf(fill.units[1].start);
+            CHECK(idx > 0 && idx + 1 < starts.size() && starts[idx + 1] - fill.units[0].start > fill.limit());
+            // A track longer than a unit can't be split at markers: a clear message, units untouched.
+            Product live1;
+            live1.kind = ProductKind::CD;
+            live1.name = "CD";
+            singleUnit(live, live1);
+            auto lm = autoSplit(live, live1, nullptr, o);
+            CHECK(lm.startsWith("Couldn't split at track markers") && live1.units.size() == 1 && live1.units[0].end == live.end());
+            // Manual split and join.
+            Product man;
+            man.kind = ProductKind::CD;
+            singleUnit(multi, man);
+            CHECK(man.units.size() == 1 && man.units[0].start == 0 && man.units[0].end == multi.end());
+            CHECK(splitUnitAt(man, 1000.0) && man.units.size() == 2 && man.units[0].end == 1000.0 && man.units[1].start == 1000.0);
+            CHECK(!splitUnitAt(man, 1000.5));   // under a second from the new break
+            CHECK(splitUnitAt(man, 3000.0) && man.units.size() == 3);
+            CHECK(joinUnits(man, 0) && man.units.size() == 2 && man.units[0].end == 3000.0 && !joinUnits(man, 1));
+        }
+
         // Gaps between units are errors.
         Product broken = cdp;
         broken.units.getReference(1).start = broken.units[0].end + 3.0;

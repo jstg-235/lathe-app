@@ -227,7 +227,9 @@ void PluginChain::release() {
 
 void PluginChain::process(juce::AudioBuffer<float>& b, int start, int n) {
     const juce::ScopedTryLock sl(lock_);
-    if (!sl.isLocked() || !prepared_ || slots_.isEmpty()) return;
+    if (!sl.isLocked()) return;   // being edited: passes through, latency reading kept
+    if (!prepared_ || slots_.isEmpty()) { lastLatency_ = 0; return; }
+    lastLatency_ = latencySamples();
     // Plugins are given at most block_ samples at a time, in a buffer they own.
     for (int done = 0; done < n;) {
         int k = juce::jmin(n - done, block_, scratch_.getNumSamples());

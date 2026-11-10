@@ -33,11 +33,23 @@ std::vector<UnitIssue> validateProduct(const Session& s, const Product& p);
 // Breaks are at track starts whenever every unit can fit that way; otherwise it breaks inside
 // music at the quietest moment near the ideal point (needs `map`; otherwise at the ideal point).
 // Mid-music breaks get an overlap with fades (`overlap` seconds each side).
+// With `atTrackMarkers`, units are instead filled in running order: each holds as many whole
+// tracks as fit within the limit and breaks at the next track marker (never inside music).
 struct SplitOptions {
     double overlap = 5.0;
     double searchWindow = 90.0;   // seconds either side of the ideal point for a quiet break
+    bool atTrackMarkers = false;
 };
 juce::String autoSplit(const Session& s, Product& p, const dsp::LoudnessMap* map, SplitOptions o = {});
+
+// Manual splitting (also from the timeline's product strip).
+// One unit covering the whole programme.
+void singleUnit(const Session& s, Product& p);
+// Cuts the unit under `t` in two at t (a butt break, no fades). False if t isn't inside a unit
+// or either part would be shorter than a second.
+bool splitUnitAt(Product& p, double t);
+// Joins unit k with unit k+1 (the combined unit keeps k's fade-in and k+1's fade-out).
+bool joinUnits(Product& p, int k);
 
 // Programme extent used for products: from 0 to the end of the session.
 double programmeLength(const Session& s);

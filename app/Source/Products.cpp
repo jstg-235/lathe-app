@@ -177,6 +177,39 @@ juce::String autoSplit(const Session& s, Product& p, const dsp::LoudnessMap* map
     for (auto& m : s.markers)
         if (m.type == Marker::TrackStart) trackStarts.push_back({m.t, false});
     std::sort(trackStarts.begin(), trackStarts.end(), [](const Cand& a, const Cand& b) { return a.t < b.t; });
+    const juce::String noun = juce::String(spec.unitNoun).toLowerCase();
+
+    if (o.atTrackMarkers) {
+        // Fill each unit with as many whole tracks as fit, breaking at the last track marker that does.
+        juce::Array<Unit> units;
+        double a = 0;
+        while (T - a > 1e-6) {
+            Unit u;
+            u.start = a;
+            if (T - a <= limit + 1e-6) {
+                u.end = T;
+            } else {
+                double best = -1;
+                for (auto& c : trackStarts)
+                    if (c.t > a + 1.0 && c.t - a <= limit + 1e-6) best = c.t;
+                if (best < 0) {
+                    double next = T;
+                    for (auto& c : trackStarts) if (c.t > a + 1.0) { next = c.t; break; }
+                    return "Couldn't split at track markers: the material from " + mmss(a) + " to " + mmss(next) + " is longer than "
+                           + mmss(limit) + " with no track marker inside it. Use Balanced, which can break inside music.";
+                }
+                u.end = best;
+            }
+            units.add(u);
+            a = u.end;
+        }
+        p.units = units;
+        juce::String msg;
+        msg << p.name << ": " << units.size() << " " << noun << (units.size() == 1 ? "" : "s") << ", filled to track markers";
+        if (spec.sides && p.evenUnits && units.size() % 2 == 1) msg << " (odd number of sides: add one or turn off Even)";
+        msg << ".";
+        return msg;
+    }
 
     int n = juce::jmax(1, int(std::ceil(T / limit - 1e-9)));
     const bool even = spec.sides && p.evenUnits;
@@ -212,13 +245,48 @@ juce::String autoSplit(const Session& s, Product& p, const dsp::LoudnessMap* map
             aMid = bMid;
         }
         juce::String msg;
-        msg << p.name << ": " << p.units.size() << " " << juce::String(spec.unitNoun).toLowerCase() << (p.units.size() == 1 ? "" : "s");
+        msg << p.name << ": " << p.units.size() << " " << noun << (p.units.size() == 1 ? "" : "s");
         if (mids) msg << ", " << mids << " break(s) inside music" << (map ? " at quiet points" : " (analyse first to find quiet points)") << " with "
                       << juce::String(o.overlap, 1) << " s overlap and fades";
         msg << ".";
         return msg;
     }
     return "Couldn't split within " + mmss(limit) + " per unit.";
+}
+
+void singleUnit(const Session& s, Product& p) {
+    p.units.clear();
+    Unit u;
+    u.end = programmeLength(s);
+    if (u.end > 0) p.units.add(u);
+}
+
+bool splitUnitAt(Product& p, double t) {
+    for (int i = 0; i < p.units.size(); ++i) {
+        auto& u = p.units.getReference(i);
+        if (t <= u.start + 1.0 || t >= u.end - 1.0) continue;
+        Unit second = u;
+        second.start = t;
+        second.fadeIn = 0;
+        second.fadeOut = juce::jmin(u.fadeOut, second.length());
+        u.end = t;
+        u.fadeOut = 0;
+        u.fadeIn = juce::jmin(u.fadeIn, u.length());
+        p.units.insert(i + 1, second);
+        return true;
+    }
+    return false;
+}
+
+bool joinUnits(Product& p, int k) {
+    if (k < 0 || k + 1 >= p.units.size()) return false;
+    auto& a = p.units.getReference(k);
+    const auto& b = p.units.getReference(k + 1);
+    a.end = juce::jmax(a.end, b.end);
+    a.fadeOut = b.fadeOut;
+    a.outShape = b.outShape;
+    p.units.remove(k + 1);
+    return true;
 }
 
 // ---------------------------------------------------------------- break audition

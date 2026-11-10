@@ -31,6 +31,12 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
   fade back in on side B.
 - **Auto-Split** balances unit lengths under each format's limit, breaking at track starts where it
   can and at the quietest moment near the ideal point where it can't (run Analyse first).
+  **Fill to track markers** (v0.11) instead puts as many whole tracks on each unit as fit and always
+  breaks at a track marker. **Auto-split new products** can be turned off: a new product then starts
+  as one unit for the whole programme.
+- **On the timeline** (v0.11): drag a unit's edges in the product strip (a butt break moves both
+  sides; Snap applies); right-click the strip to split a unit at that point, join units at a break,
+  auto-split either way, or show another product.
 - **Break Editor** (K): the outgoing unit's fade-out and the incoming unit's fade-in over the
   waveform, draggable, with an audition that plays through the flip gap (or no gap).
 - **Rendering**: a verified DDP per disc (a "(cont.)" track reusing the ISRC when a disc starts
@@ -87,6 +93,20 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
     left / right balance, a minute of correlation history and correlation per band.
 - The main window keeps a compact meter: peak bars, integrated loudness coloured against the
   target, momentary, short-term, LRA, true peak, PLR / PSR and correlation.
+
+## Compare Unprocessed (v0.11)
+
+- **W** switches between the processed mix (A) and the mix without the master plugins and region
+  effects (B). Edits, gains and fades stay in both. The two play side by side, time-aligned (the
+  unprocessed side is delayed by the master chain's latency; region effect latency is compensated
+  per region), so the switch is instant and crossfades in 10 ms.
+- A banner across the top of the plugin list shows the side you're hearing while the compare is on.
+- **Level Match** (Shift-W, or the banner's button) adds C: the processed side turned down to the
+  unprocessed loudness, so W switches B / C and you hear what the processing does, not just that it
+  is louder. The loudness of both sides is measured as the session plays (BS.1770, the last ten
+  seconds or so, pauses left out); it only ever turns the processed side down. No Analyse needed.
+- **End** (Option-W) returns to normal playback. Nothing here reaches an export, and the meters
+  always read the processed side (A).
 
 ## Stability by design
 

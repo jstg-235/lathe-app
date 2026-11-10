@@ -7,6 +7,8 @@
 #include "ProgramRenderer.h"
 #include "Session.h"
 
+#include "../../core/dsp/Meters.h"
+
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_audio_utils/juce_audio_utils.h>
 
@@ -164,13 +166,24 @@ public:
     void setReferencePosition(double s) { refTransport_.setPosition(s); }
     double referenceLength() const { return refTransport_.getLengthInSeconds(); }
 
-    // ---- Processed / unprocessed compare: bypasses the master chain (region effects are
-    // bypassed through the region bank) and applies a level-match gain. ----
-    void setCompareUnprocessed(bool b, double matchGainDb) {
-        bypassGain_ = float(juce::Decibels::decibelsToGain(matchGainDb));
-        bypassMaster_ = b;
-    }
-    bool comparingUnprocessed() const { return bypassMaster_; }
+    // ---- Processed / unprocessed compare ----
+    //  A  processed: master chain and region effects (normal playback)
+    //  B  unprocessed: no master chain, no region effects (edits, gains and fades stay)
+    //  C  processed, turned down to the loudness of B
+    // Both sides play all the time, time-aligned (the unprocessed side is delayed by the master
+    // chain's latency, region effect latency is compensated per region), so switching is
+    // instant and crossfades in 10 ms. The loudness of both is measured together while the
+    // session plays; level matching only ever turns the processed side down. None of this
+    // reaches exports. The meters always read the processed side before any match.
+    void setHearUnprocessed(bool b) { hearDry_ = b; }
+    bool hearingUnprocessed() const { return hearDry_; }
+    void setLevelMatch(bool b) { levelMatch_ = b; }
+    bool levelMatch() const { return levelMatch_; }
+    // Cut applied to the processed side in C (dB, 0 or below), and whether it has been measured.
+    double matchCutDb() const { return matchCut_.load(); }
+    bool matchMeasured() const { return matchReady_.load(); }
+    double matchDifferenceDb() const { return matchDiff_.load(); }   // processed minus unprocessed, LU
+    void resetMatch() { matchResetPending_ = true; }
 
     // Switches the interface to `rate` when it supports it, so playback reaches the converters
     // with no sample-rate conversion anywhere (ours or the OS's). Returns a status message.
@@ -204,8 +217,23 @@ private:
     juce::CriticalSection playerLock_;
     std::unique_ptr<juce::AudioFormatReaderSource> refReader_;
     juce::AudioBuffer<float> refBuf_;
-    std::atomic<bool> listenRef_{false}, bypassMaster_{false};
-    std::atomic<float> refGain_{1.0f}, bypassGain_{1.0f};
+    std::atomic<bool> listenRef_{false};
+    std::atomic<float> refGain_{1.0f};
+    // compare (audio thread state below the atomics)
+    std::atomic<bool> hearDry_{false}, levelMatch_{false}, matchReady_{false}, matchResetPending_{false};
+    std::atomic<double> matchCut_{0.0}, matchDiff_{0.0};
+    std::unique_ptr<ProgramSource> dryProgram_;                   // only when regions have effects
+    std::unique_ptr<juce::BufferingAudioSource> dryBuffered_;
+    std::unique_ptr<juce::ResamplingAudioSource> dryResampler_;   // matches the transport's own (ratio 1, a few samples late)
+    juce::CriticalSection dryLock_;
+    juce::AudioBuffer<float> dryBuf_, wetBuf_, delayBuf_;
+    int delayPos_ = 0;
+    float dryMix_ = 0.0f, matchGain_ = 1.0f;
+    dsp::LoudnessMatch match_;
+    int matchChannels_ = 0;
+    double matchRate_ = 0;
+    bool dryFresh_ = true;   // the copy's resampler was just flushed (audio thread, or under dryLock_)
+    void processCompare(const juce::AudioSourceChannelInfo& info, juce::int64 endPos, bool playing);
     std::atomic<bool> recording_{false}, recWithPlayback_{false};
     std::atomic<double> recStart_{0.0};
     std::atomic<juce::int64> recSamples_{0};
