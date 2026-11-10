@@ -445,7 +445,7 @@ int main() {
             engine.play();
             juce::AudioBuffer<float> all(2, blocks * 512);
             for (int b = 0; b < blocks; ++b) {
-                juce::Thread::sleep(b < 8 ? 60 : 2);
+                CHECK(engine.waitForReadAhead(5000));   // CI machines can be slow: never play an underrun
                 juce::AudioBuffer<float> out(2, 512);
                 juce::AudioSourceChannelInfo info(&out, 0, 512);
                 engine.getNextAudioBlock(info);

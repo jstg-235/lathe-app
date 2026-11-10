@@ -357,7 +357,7 @@ void AudioEngine::play() {
     breakTransport_.stop();
     sourceTransport_.stop();
     playerTransport_.stop();
-    if (transport_.getCurrentPosition() >= transport_.getLengthInSeconds() - 0.01) transport_.setPosition(0);
+    if (transport_.getCurrentPosition() >= transport_.getLengthInSeconds() - 0.01) { transport_.setPosition(0); syncDryTo(0); }
     transport_.start();
     if (refReader_) refTransport_.start();
 }
@@ -371,6 +371,7 @@ void AudioEngine::stop() {
 
 void AudioEngine::setPositionSeconds(double sec) {
     transport_.setPosition(juce::jlimit(0.0, juce::jmax(0.0, transport_.getLengthInSeconds()), sec));
+    syncDryTo(transport_.getNextReadPosition());
     tap_.clear();
 }
 
@@ -545,6 +546,29 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
             tap_.push(*info.buffer, info.startSample, info.numSamples);
         }
     }
+}
+
+void AudioEngine::syncDryTo(juce::int64 pos) {
+    const juce::ScopedLock dl(dryLock_);
+    if (!dryResampler_) return;
+    dryResampler_->flushBuffers();
+    dryBuffered_->setNextReadPosition(pos);
+    dryFresh_ = true;
+}
+
+bool AudioEngine::waitForReadAhead(int timeoutMs) {
+    juce::AudioBuffer<float> scratch(6, juce::jmax(512, block_) * 4);
+    juce::AudioSourceChannelInfo info(&scratch, 0, scratch.getNumSamples());
+    bool ok = true;
+    {
+        const juce::ScopedLock sl(sourceLock_);
+        if (buffered_) ok = buffered_->waitForNextAudioBlockReady(info, timeoutMs) && ok;
+    }
+    {
+        const juce::ScopedLock dl(dryLock_);
+        if (dryBuffered_) ok = dryBuffered_->waitForNextAudioBlockReady(info, timeoutMs) && ok;
+    }
+    return ok;
 }
 
 void AudioEngine::processCompare(const juce::AudioSourceChannelInfo& info, juce::int64 endPos, bool playing) {

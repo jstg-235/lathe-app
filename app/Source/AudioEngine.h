@@ -184,6 +184,9 @@ public:
     bool matchMeasured() const { return matchReady_.load(); }
     double matchDifferenceDb() const { return matchDiff_.load(); }   // processed minus unprocessed, LU
     void resetMatch() { matchResetPending_ = true; }
+    // Waits (up to `timeoutMs`) until the read-ahead holds the next few blocks of the programme
+    // and of the unprocessed copy. For tests and offline use, not the audio thread.
+    bool waitForReadAhead(int timeoutMs);
 
     // Switches the interface to `rate` when it supports it, so playback reaches the converters
     // with no sample-rate conversion anywhere (ours or the OS's). Returns a status message.
@@ -232,6 +235,7 @@ private:
     dsp::LoudnessMatch match_;
     int matchChannels_ = 0;
     double matchRate_ = 0;
+    void syncDryTo(juce::int64 pos);   // UI thread: start the unprocessed copy where the transport now is
     bool dryFresh_ = true;   // the copy's resampler was just flushed (audio thread, or under dryLock_)
     void processCompare(const juce::AudioSourceChannelInfo& info, juce::int64 endPos, bool playing);
     std::atomic<bool> recording_{false}, recWithPlayback_{false};
