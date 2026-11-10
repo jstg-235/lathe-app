@@ -25,6 +25,12 @@ public:
     // Takes a snapshot of the session; safe to call while nothing else uses this object.
     void setSession(const Session& s, double targetRate, bool offline = false);
     void setRegionFx(RegionFxBank* fx) { fx_ = fx; }
+    // Print buses (call before setSession; stereo programmes only): prints made through one of
+    // these External Gear inserts are kept out of the main mix and rendered on a stereo pair of
+    // their own, bus k on channels 2 + 2k and 3 + 2k of `out`, so the master chain can take them in
+    // after that insert. Timeline gain is in a print already and isn't applied to it again.
+    void setPrintBuses(const juce::Array<int>& anchors) { anchors_ = anchors; }
+    int printBuses() const { return busCount_; }
     void seek(juce::int64 programSample);
     juce::int64 position() const { return pos_; }
     juce::int64 totalSamples() const { return total_; }
@@ -48,6 +54,8 @@ private:
     juce::Array<juce::int64> starts_, ends_;
     juce::Array<GainNode> gain_;   // timeline gain (empty = none)
     juce::Array<int> laneFormats_;  // per region in regions_
+    juce::Array<int> anchors_, bus_;   // bus_: per region, -1 = the main mix
+    int busCount_ = 0;
     int channels_ = 2;
     juce::AudioBuffer<double> mix_;
     std::vector<std::unique_ptr<ClipStream>> streams_;

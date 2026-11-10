@@ -143,6 +143,9 @@ void ProgramRenderer::setSession(const Session& s, double targetRate, bool offli
     channels_ = s.programmeChannels();
     laneFormats_.clear();
     for (auto& r : regions_) laneFormats_.add(s.laneFormat(r.lane));
+    busCount_ = channels_ == 2 ? anchors_.size() : 0;
+    bus_.clear();
+    for (auto& r : regions_) bus_.add(busCount_ > 0 && r.afterGear != 0 ? anchors_.indexOf(r.afterGear) : -1);
     gain_.clear();
     if (s.gainActive()) gain_ = s.gainNodes;
     starts_.clear();
@@ -172,6 +175,7 @@ bool ProgramRenderer::renderT(juce::AudioBuffer<T>& out, int start, int n) {
     // Mix straight into `out` when it has the programme's channels; otherwise mix the programme
     // in a scratch buffer and fold it down (5.1 heard or written as stereo).
     const bool direct = out.getNumChannels() >= channels_;
+    const bool buses = busCount_ > 0 && direct && out.getNumChannels() >= 2 + 2 * busCount_;
     if (!direct && (mix_.getNumChannels() < channels_ || mix_.getNumSamples() < n)) mix_.setSize(channels_, n, false, false, true);
     if (!direct) mix_.clear(0, n);
     bool ok = true;
@@ -201,6 +205,7 @@ bool ProgramRenderer::renderT(juce::AudioBuffer<T>& out, int start, int n) {
         if (st->channels() == 6 && channels_ == 6) map = {0, 1, 2, 3, 4, 5};
         else if (st->channels() == 1 && channels_ == 6 && laneFormats_[i] == 1) map = {2};   // a mono lane in 5.1: centre
         else map = {0, 1};
+        if (buses && bus_[i] >= 0) map = {2 + 2 * bus_[i], 3 + 2 * bus_[i]};
         if (direct) {
             if (out.getNumChannels() >= 2) st->addTo(out, start + offset, len, map);
         } else {
@@ -234,7 +239,7 @@ bool ProgramRenderer::renderT(juce::AudioBuffer<T>& out, int start, int n) {
             }
             if (db == 0.0) continue;
             const T g = T(std::pow(10.0, db / 20.0));
-            for (int ch = 0; ch < out.getNumChannels(); ++ch) out.getWritePointer(ch)[start + i] *= g;
+            for (int ch = 0; ch < (buses ? channels_ : out.getNumChannels()); ++ch) out.getWritePointer(ch)[start + i] *= g;
         }
     }
     pos_ = b;

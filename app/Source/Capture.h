@@ -5,6 +5,7 @@
 
 #include "Session.h"
 
+#include <functional>
 #include <map>
 
 namespace lathe {
@@ -66,7 +67,27 @@ struct CaptureTake {
 // behind the region's edges. With muteSources, what was captured is muted (regions are cut at
 // the edges of the range, so only that stretch goes quiet). Returns the new region's id, or 0
 // when the file doesn't reach the range.
-int placeCapture(Session& s, const CapturePlan& plan, const CaptureTake& take, bool muteSources, const juce::String& name);
+int placeCapture(Session& s, const CapturePlan& plan, const CaptureTake& take, bool muteSources, const juce::String& name,
+                 juce::Array<int>* muted = nullptr);   // the pieces that were muted
+
+// ---- Renaming ----
+// Renames an audio file on disk (same folder, same kind of file) and points the session, its
+// references and its source timeline at the new name. Regions that carried the file's name take
+// the new one. The name is made legal for a file; an existing file is never replaced. Returns what
+// went wrong, or nothing; `renamed` is the file afterwards.
+juce::String renameAudioFile(Session& s, const juce::File& from, const juce::String& newName, juce::File& renamed);
+
+// ---- External Gear and prints ----
+// True when material would still have to pass through External Gear hardware: a region that is
+// heard and enters the master chain before `lastLiveHardwareSlot` (the last hardware insert that
+// is switched in; -1 = none). `slotOfAnchor` gives the slot of the insert a print was made
+// through (-1 when it is no longer in the chain: the print then enters at the top).
+bool needsHardware(const Session& s, int lastLiveHardwareSlot, const std::function<int(int)>& slotOfAnchor);
+// What to tell the user when an export is refused for that reason.
+juce::String hardwareExportMessage();
+// The regions in `plan` that pass through the insert in `gearSlot` (ordinary material, and prints
+// made through inserts above it).
+juce::Array<int> sourcesThrough(const Session& s, const CapturePlan& plan, int gearSlot, const std::function<int(int)>& slotOfAnchor);
 
 // A session holding only that region (no effects, no timeline gain): the capture on its own, for
 // switching against what was sent.

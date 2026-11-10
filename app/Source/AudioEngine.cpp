@@ -35,6 +35,13 @@ AudioEngine::AudioEngine() {
     auto xml = juce::XmlDocument::parse(saved);
     devices_.initialise(2, 2, xml.get(), true);   // stereo in to begin with; Audio Setup and Capture switch on more
     writerThread_.startThread();
+    for (auto& m : inMap_) m = -1;
+    for (auto& m : outMap_) m = -1;
+    for (auto& a : busAnchor_) a = 0;
+    chain_.builtinFactory = [this](const juce::PluginDescription& d) -> std::unique_ptr<juce::AudioPluginInstance> {
+        if (d.fileOrIdentifier == ExternalGear::description().fileOrIdentifier) return std::make_unique<ExternalGear>(this, gearActions);
+        return nullptr;
+    };
     player_.setSource(this);
     devices_.addAudioCallback(&player_);
 }
@@ -80,15 +87,22 @@ void AudioEngine::loadSessionImpl(const Session& s, const Session* alternate) {
     surround_ = s.programmeChannels() == 6;
     const int chans = surround_ && programmeOutputs() >= 6 ? 6 : 2;
     playChannels_ = chans;
+    // Prints made through External Gear travel beside the programme on stereo pairs of their own,
+    // and join the master chain after their insert.
+    const auto anchors = chans == 2 ? s.printAnchors() : juce::Array<int>();
+    const int all = chans + 2 * anchors.size();
+    busCount_ = 0;
     {
         const juce::ScopedLock sl(sourceLock_);
         buffered_.reset();
-        program_ = std::make_unique<ProgramSource>(formats_, s, rate_, &fx_, chans);
+        program_ = std::make_unique<ProgramSource>(formats_, s, rate_, &fx_, chans, anchors);
         // 4 s of read-ahead absorbs slow disks and network volumes.
         buffered_ = std::make_unique<juce::BufferingAudioSource>(program_.get(), readAhead_, false,
-                                                                  int(rate_ * 4), chans, true);
+                                                                  int(rate_ * 4), all, true);
     }
-    transport_.setSource(buffered_.get(), 0, nullptr, rate_, chans);
+    transport_.setSource(buffered_.get(), 0, nullptr, rate_, all);
+    for (int k = 0; k < anchors.size(); ++k) busAnchor_[size_t(k)] = anchors[k];
+    busCount_ = anchors.size();
     transport_.setPosition(juce::jmin(pos, transport_.getLengthInSeconds()));
     {
         // The unprocessed side of the compare. Without region effects it is simply the signal
@@ -244,6 +258,7 @@ void AudioEngine::updateRouting() {
         latOutIdx_ = latOutFirst_.load();
         inIdx_ = inFirst_.load();
         latInIdx_ = latInFirst_.load();
+        for (int c = 0; c < kMaxHw; ++c) { inMap_[size_t(c)] = c; outMap_[size_t(c)] = c; }
         return;
     }
     const auto ins = d->getActiveInputChannels(), outs = d->getActiveOutputChannels();
@@ -259,6 +274,10 @@ void AudioEngine::updateRouting() {
     };
     numIn_ = ins.countNumberOfSetBits();
     numOut_ = outs.countNumberOfSetBits();
+    for (int c = 0, i = 0, o = 0; c < kMaxHw; ++c) {
+        inMap_[size_t(c)] = ins[c] ? i++ : -1;
+        outMap_[size_t(c)] = outs[c] ? o++ : -1;
+    }
     int mon = index(outs, monitorOut_, 2);
     if (mon < 0) mon = index(outs, monitorOut_, 1);
     monIdx_ = juce::jmax(0, mon);   // not switched on (or never chosen): the first outputs that are
@@ -272,7 +291,7 @@ void AudioEngine::updateRouting() {
 }
 
 int AudioEngine::programmeOutputs() const {
-    if (captureOn_) return recChannels_ == 6 ? 6 : 2;
+    if (captureOn_ && !printOn_) return recChannels_ == 6 ? 6 : 2;
     if (monitorOut_ < 0) return deviceOutputs();
     if (!monitorSix_) return 2;
     auto* d = devices_.getCurrentAudioDevice();
@@ -399,20 +418,110 @@ bool AudioEngine::startCapture(const CaptureRequest& rq, const Session& s, juce:
 }
 
 void AudioEngine::stopCapture() {
-    if (!captureOn_) return;
+    if (!captureOn_ && !printOn_) return;
     recording_ = false;
     stop();
     {
         const juce::ScopedLock sl(recLock_);
         recWriter_.reset();
     }
+    chain_.setTap(0, nullptr);
     captureOn_ = false;
+    printOn_ = false;
     capLevelOnly_ = false;
+}
+
+bool AudioEngine::startPrint(const PrintRequest& rq, const Session& s, juce::String& error) {
+    stopCapture();
+    stopRecording();
+    stop();
+    if (rq.to <= rq.from) { error = "There is nothing to print."; return false; }
+    if (chain_.slotOfAnchor(rq.gear) < 0) { error = "That External Gear insert isn't in the master chain."; return false; }
+    if (s.programmeChannels() == 6) { error = "A 5.1 programme doesn't use the master chain, so there is nothing to print through."; return false; }
+    recChannels_ = 2;
+    capLevelOnly_ = false;
+    capDone_ = false;
+    capFrom_ = juce::int64(std::llround(rq.from * rate_));
+    capEnd_ = juce::int64(std::llround(rq.to * rate_));
+    // What leaves the insert is late by the chain's delay up to there: record that much longer.
+    capPost_ = juce::int64(std::llround(juce::jmax(0.0, rq.postRoll) * rate_)) + chain_.latencyThrough(rq.gear);
+    capStarted_ = false;
+    capTail_ = 0;
+    printGear_ = rq.gear;
+    tapBuf_.clear();
+    chain_.setTap(rq.gear, &tapBuf_);
+    printOn_ = true;
+    loadSessionImpl(s, nullptr);
+    setPositionSeconds(juce::jmax(0.0, rq.from - juce::jmax(0.0, rq.preRoll)));
+    waitForReadAhead(1500);
+    if (!openWriter(rq.file, 2, rq.bits, error)) {
+        chain_.setTap(0, nullptr);
+        printOn_ = false;
+        return false;
+    }
+    recSamples_ = 0;
+    recStart_ = transport_.getCurrentPosition();
+    recStartSample_ = transport_.getNextReadPosition();
+    recWithPlayback_ = true;
+    recording_ = true;
+    play();
+    return true;
+}
+
+// ---- External Gear
+
+const float* AudioEngine::gearInput(int channel) const {
+    if (!juce::isPositiveAndBelow(channel, kMaxHw)) return nullptr;
+    const int i = inMap_[size_t(channel)];
+    return i >= 0 && i < hwInCh_ ? hwIn_.getReadPointer(i) : nullptr;
+}
+
+float* AudioEngine::gearOutput(int channel) {
+    if (!juce::isPositiveAndBelow(channel, kMaxHw)) return nullptr;
+    const int i = outMap_[size_t(channel)];
+    if (i < 0 || i >= hwOutCh_) return nullptr;
+    const int mon = monIdx_, width = playChannels_ == 6 ? 6 : 2;
+    if (i >= mon && i < mon + width) return nullptr;   // never onto the outputs you listen on: that feeds back
+    hwOutUsed_ = true;
+    return hwOut_.getWritePointer(i);
+}
+
+bool AudioEngine::gearSendIsMonitor(int firstOutput) const {
+    int mon = monitorOut_;
+    if (mon < 0) {
+        auto* d = devices_.getCurrentAudioDevice();
+        mon = d ? juce::jmax(0, d->getActiveOutputChannels().findNextSetBit(0)) : 0;
+    }
+    const int width = monitorSix_ ? 6 : 2;
+    return firstOutput < mon + width && mon < firstOutput + 2;
+}
+
+juce::String AudioEngine::gearUse(int firstOutput, int firstInput) { return ensureChannels(firstInput, 2, firstOutput, 2); }
+
+juce::String AudioEngine::addExternalGear() {
+    if (chain_.builtinCount() >= 4) return "Four External Gear inserts is the limit.";
+    juce::String err;
+    if (!chain_.add(ExternalGear::description(), err)) return err;
+    auto* gear = dynamic_cast<ExternalGear*>(chain_.pluginAt(chain_.size() - 1));
+    if (!gear) return {};
+    // Start on the first output pair that isn't the monitor pair, and the first input pair.
+    const int outs = devices_.getCurrentAudioDevice() ? numOutputChannels() : 8;
+    for (int first = 0; first + 1 < outs; first += 2)
+        if (!gearSendIsMonitor(first)) { gear->setRoute(first, 0); break; }
+    return {};
+}
+
+int AudioEngine::runChain(juce::AudioBuffer<float>& b, int start, int n) {
+    int anchors[PluginChain::kMaxBuses];
+    const int buses = juce::jmin(busCount_.load(), PluginChain::kMaxBuses, juce::jmax(0, (b.getNumChannels() - 2) / 2));
+    for (int k = 0; k < buses; ++k) anchors[k] = busAnchor_[size_t(k)];
+    chain_.process(b, start, n, anchors, buses);
+    return buses;
 }
 
 double AudioEngine::captureProgress() const {
     const double a = double(capFrom_.load()), b = double(capEnd_.load());
-    if (!captureOn_ || capLevelOnly_ || b <= a) return 0.0;
+    if ((!captureOn_ && !printOn_) || capLevelOnly_ || b <= a) return 0.0;
     if (capDone_) return 1.0;
     return juce::jlimit(0.0, 1.0, (double(transport_.getNextReadPosition()) - a) / (b - a));
 }
@@ -477,10 +586,12 @@ juce::String AudioEngine::matchDeviceRate(double rate) {
     return err;
 }
 
-BreakSource::BreakSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx, BreakPlan plan)
+BreakSource::BreakSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx, BreakPlan plan, const juce::Array<int>& anchors)
     : r_(fm), plan_(plan), rate_(rate) {
     r_.setRegionFx(fx);
+    if (s.programmeChannels() == 2) r_.setPrintBuses(anchors);
     r_.setSession(s, rate);
+    dbl_.setSize(2 + 2 * r_.printBuses(), 8192);
 }
 
 void BreakSource::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
@@ -497,11 +608,11 @@ void BreakSource::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
         else if (p < aLen + gap + bLen) { n = int(juce::jmin<juce::int64>(n, aLen + gap + bLen - p)); timeline = juce::int64(plan_.b0 * rate_) + (p - aLen - gap); }
         if (timeline >= 0) {
             if (r_.position() != timeline) r_.seek(timeline);
-            if (dbl_.getNumSamples() < n) dbl_.setSize(2, n, false, false, true);
+            if (dbl_.getNumSamples() < n) dbl_.setSize(dbl_.getNumChannels(), n, false, false, true);
             r_.render(dbl_, 0, n);
-            for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch) {
+            for (int ch = 0; ch < juce::jmin(info.buffer->getNumChannels(), dbl_.getNumChannels()); ++ch) {
                 auto* d = info.buffer->getWritePointer(ch, info.startSample + done);
-                auto* src = dbl_.getReadPointer(juce::jmin(ch, 1));
+                auto* src = dbl_.getReadPointer(ch);
                 for (int i = 0; i < n; ++i) d[i] = float(src[i]);
             }
         }
@@ -520,9 +631,11 @@ void AudioEngine::startBreakAudition(const Session& s, const BreakPlan& plan) {
         breakTransport_.setSource(nullptr);
         breakBuffered_.reset();
         breakPlan_ = plan;
-        breakSource_ = std::make_unique<BreakSource>(formats_, s, rate_, &fx_, plan);
-        breakBuffered_ = std::make_unique<juce::BufferingAudioSource>(breakSource_.get(), readAhead_, false, int(rate_ * 4), 2, true);
-        breakTransport_.setSource(breakBuffered_.get(), 0, nullptr, rate_, 2);
+        const auto anchors = s.programmeChannels() == 2 ? s.printAnchors() : juce::Array<int>();
+        const int all = 2 + 2 * anchors.size();
+        breakSource_ = std::make_unique<BreakSource>(formats_, s, rate_, &fx_, plan, anchors);
+        breakBuffered_ = std::make_unique<juce::BufferingAudioSource>(breakSource_.get(), readAhead_, false, int(rate_ * 4), all, true);
+        breakTransport_.setSource(breakBuffered_.get(), 0, nullptr, rate_, all);
         breakTransport_.prepareToPlay(block_, rate_);
         breakTransport_.setPosition(0);
     }
@@ -588,7 +701,10 @@ void AudioEngine::prepareToPlay(int block, double rate) {
         if (dryResampler_) dryResampler_->prepareToPlay(block, rate);
     }
     inBuf_.setSize(6, juce::jmax(block, 8192));
-    playBuf_.setSize(6, juce::jmax(block, 8192));
+    playBuf_.setSize(6 + 2 * PluginChain::kMaxBuses, juce::jmax(block, 8192));
+    hwIn_.setSize(kMaxHw, juce::jmax(block, 8192));
+    hwOut_.setSize(kMaxHw, juce::jmax(block, 8192));
+    tapBuf_.setSize(2, juce::jmax(block, 8192));
     updateRouting();
     chain_.prepare(rate, block);
     juce::ignoreUnused(rateChanged);   // the UI reloads the session when the device rate changes
@@ -619,11 +735,23 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
     }
     const int nIn = numIn_ < 0 ? bufCh : juce::jmin(numIn_.load(), bufCh);
     const int nOut = numOut_ < 0 ? bufCh : juce::jmin(numOut_.load(), bufCh);
-    const bool rec = recording_, capture = captureOn_;
+    const bool rec = recording_, capture = captureOn_, print = printOn_;
     const int latState = latState_;
 
+    // 0. External Gear inserts: this block's inputs for their returns, silent buffers for their sends.
+    const bool gear = chain_.builtinCount() > 0;
+    ++gearSerial_;
+    gearN_ = gear ? n : 0;
+    hwOutUsed_ = false;
+    if (gear) {
+        hwInCh_ = juce::jmin(nIn, hwIn_.getNumChannels());
+        hwOutCh_ = juce::jmin(nOut, hwOut_.getNumChannels());
+        for (int ch = 0; ch < hwInCh_; ++ch) hwIn_.copyFrom(ch, 0, *info.buffer, ch, info.startSample, n);
+        for (int ch = 0; ch < hwOutCh_; ++ch) hwOut_.clear(ch, 0, n);
+    }
+
     // 1. The inputs arrive in the device's buffer: take the armed ones out first.
-    const bool live = rec || capture || armed_ || latState;
+    const bool live = (rec && !print) || capture || armed_ || latState;
     const int inCh = latState ? 1 : inChannels_.load();
     const int inFirst = latState ? latInIdx_.load() : inIdx_.load();
     if (live) {
@@ -653,9 +781,11 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
     }
 
     // 2. The programme, rendered on its own (so no input can leak to an output).
-    const int P = juce::jlimit(2, 6, playChannels_.load());
+    const int playCh = juce::jlimit(2, 6, playChannels_.load());
+    const int P = juce::jmin(playBuf_.getNumChannels(), playCh + (playCh == 2 ? 2 * busCount_.load() : 0));   // with the print buses
     juce::AudioBuffer<float> work(playBuf_.getArrayOfWritePointers(), P, n);
     work.clear();
+    if (print) tapBuf_.clear(0, n);
     blockPlaying_ = false;
     renderBlock(juce::AudioSourceChannelInfo(&work, 0, n));
 
@@ -663,9 +793,12 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
     info.clearActiveBufferRegion();
     const int mon = monIdx_;
     const int dest = latState ? (latOutIdx_ >= 0 ? latOutIdx_.load() : mon) : capture ? sendIdx_.load() : mon;
-    const int width = capture && !latState ? juce::jmin(P, recChannels_.load()) : P;
+    const int width = capture && !latState ? juce::jmin(playCh, recChannels_.load()) : playCh;
     if (dest >= 0)
         for (int ch = 0; ch < width && dest + ch < nOut; ++ch) info.buffer->copyFrom(dest + ch, info.startSample, work, ch, 0, n);
+    // External Gear sends (never during a latency test: its click must be the only thing out).
+    if (gear && hwOutUsed_ && !latState)
+        for (int ch = 0; ch < hwOutCh_ && ch < nOut; ++ch) info.buffer->addFrom(ch, info.startSample, hwOut_, ch, 0, n);
     // Input monitoring, never onto outputs that feed the gear.
     bool monitor = inputMonitoring_ && live && !latState && mon >= 0;
     if (capture) monitor = monitor && (dest < 0 || dest + width <= mon || mon + 2 <= dest);
@@ -694,13 +827,14 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
         if (write) {
             const juce::ScopedTryLock sl(recLock_);
             if (sl.isLocked() && recWriter_) {
+                // A print is taken inside the chain, straight after its insert; everything else from the inputs.
                 const float* ch[6];
-                for (int c = 0; c < 6; ++c) ch[c] = inBuf_.getReadPointer(c);
+                for (int c = 0; c < 6; ++c) ch[c] = print ? tapBuf_.getReadPointer(juce::jmin(c, 1)) : inBuf_.getReadPointer(c);
                 recWriter_->write(ch, n);
                 recSamples_ += n;
             }
         }
-        if (capture && !capLevelOnly_ && capStarted_ && !capDone_) {
+        if (((capture && !capLevelOnly_) || print) && capStarted_ && !capDone_) {
             // After the range (or the end of the programme): the post-roll, then done.
             if (!blockPlaying_ || blockEnd_ - kTransportLead >= capEnd_) {
                 capTail_ += n;
@@ -751,7 +885,7 @@ void AudioEngine::renderBlock(const juce::AudioSourceChannelInfo& info) {
             // Break audition: master chain, then each unit's own fade, as the render does it.
             const juce::int64 p0 = breakTransport_.getNextReadPosition();
             breakTransport_.getNextAudioBlock(info);
-            chain_.process(*info.buffer, info.startSample, info.numSamples);
+            runChain(*info.buffer, info.startSample, info.numSamples);
             for (int i = 0; i < info.numSamples; ++i) {
                 const float g = float(breakPlan_.at(double(p0 + i) / rate_).second);
                 for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch) info.buffer->getWritePointer(ch, info.startSample)[i] *= g;
@@ -771,7 +905,7 @@ void AudioEngine::renderBlock(const juce::AudioSourceChannelInfo& info) {
     transport_.getNextAudioBlock(info);
     blockPlaying_ = playing;
     blockEnd_ = transport_.getNextReadPosition();
-    if (captureOn_ && !capLevelOnly_ && playing) {
+    if (((captureOn_ && !capLevelOnly_) || printOn_) && playing) {
         // Capturing a range: the programme is silent after its Out point, so the post-roll
         // records the gear's tail and not the music that follows.
         const juce::int64 start = blockEnd_ - info.numSamples - kTransportLead;
@@ -862,7 +996,7 @@ void AudioEngine::processCompare(const juce::AudioSourceChannelInfo& info, juce:
     const int nch = juce::jmin(info.buffer->getNumChannels(), surround_ ? 6 : 2, dryBuf_.getNumChannels());
     const bool fits = dryBuf_.getNumSamples() >= n && nch > 0;
     if (!fits) {   // a block bigger than prepared: play processed, skip the compare this once
-        if (!surround_) chain_.process(*info.buffer, info.startSample, n);
+        if (!surround_) runChain(*info.buffer, info.startSample, n);
         return;
     }
     // 1. The unprocessed side, before the master chain.
@@ -888,13 +1022,18 @@ void AudioEngine::processCompare(const juce::AudioSourceChannelInfo& info, juce:
             haveDry = true;
         }
     }
-    if (!haveDry)
+    if (!haveDry) {
         for (int ch = 0; ch < nch; ++ch) dryBuf_.copyFrom(ch, 0, *info.buffer, ch, info.startSample, n);
+        // (prints are part of what you hear unprocessed, as they are)
+        if (!surround_)
+            for (int k = 0; k < busCount_ && info.buffer->getNumChannels() >= 4 + 2 * k; ++k)
+                for (int ch = 0; ch < juce::jmin(2, nch); ++ch) dryBuf_.addFrom(ch, 0, *info.buffer, 2 + 2 * k + ch, info.startSample, n);
+    }
 
     // 2. The processed side. 5.1: the master chain is stereo, so it stays out of the path.
     int latency = 0;
     if (!surround_) {
-        chain_.process(*info.buffer, info.startSample, n);
+        runChain(*info.buffer, info.startSample, n);
         latency = chain_.lastLatency();
     }
 

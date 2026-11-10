@@ -2,6 +2,7 @@
 // the AU/VST3 insert chain, and lock-free hand-off of audio to the meters.
 #pragma once
 
+#include "ExternalGear.h"
 #include "PluginChain.h"
 #include "Products.h"
 #include "ProgramRenderer.h"
@@ -17,10 +18,15 @@ namespace lathe {
 // Adapts ProgramRenderer to JUCE's positionable source interface.
 class ProgramSource : public juce::PositionableAudioSource {
 public:
-    ProgramSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx, int channels = 2) : r_(fm) {
+    // With `anchors`, prints made through those External Gear inserts come out on stereo pairs of
+    // their own after the programme's channels (see ProgramRenderer::setPrintBuses).
+    ProgramSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx, int channels = 2, const juce::Array<int>& anchors = {})
+        : r_(fm) {
         r_.setRegionFx(fx);
+        if (channels == 2) r_.setPrintBuses(anchors);
         r_.setSession(s, rate);
-        dbl_.setSize(channels, 8192);
+        buses_ = r_.printBuses();
+        dbl_.setSize(channels + 2 * buses_, 8192);
     }
     void prepareToPlay(int, double) override {}
     void releaseResources() override {}
@@ -32,7 +38,7 @@ public:
         for (int ch = 0; ch < info.buffer->getNumChannels(); ++ch) {
             auto* d = info.buffer->getWritePointer(ch, info.startSample);
             if (have > 2 && ch >= have) { juce::FloatVectorOperations::clear(d, info.numSamples); continue; }
-            auto* s = dbl_.getReadPointer(have > 2 ? ch : juce::jmin(ch, 1));
+            auto* s = dbl_.getReadPointer(have > 2 ? ch : juce::jmin(ch, 1));   // (with print buses `have` is 4 or more: channel for channel)
             for (int i = 0; i < info.numSamples; ++i) d[i] = float(s[i]);
         }
     }
@@ -43,13 +49,14 @@ public:
 private:
     ProgramRenderer r_;
     juce::AudioBuffer<double> dbl_;
+    int buses_ = 0;
 };
 
 // Break audition source: the end of one unit, the flip gap, then the top of the next, as
 // one continuous stream (so the read-ahead buffer makes the jump seamless).
 class BreakSource : public juce::PositionableAudioSource {
 public:
-    BreakSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx, BreakPlan plan);
+    BreakSource(juce::AudioFormatManager& fm, const Session& s, double rate, RegionFxBank* fx, BreakPlan plan, const juce::Array<int>& anchors = {});
     void prepareToPlay(int, double) override {}
     void releaseResources() override {}
     void getNextAudioBlock(const juce::AudioSourceChannelInfo& info) override;
@@ -77,7 +84,7 @@ private:
     juce::AudioBuffer<float> buf_;
 };
 
-class AudioEngine : public juce::AudioSource {
+class AudioEngine : public juce::AudioSource, public GearIo {
 public:
     AudioEngine();
     ~AudioEngine() override;
@@ -143,7 +150,7 @@ public:
     // capturing measure them too.
     void setArmed(bool on) { armed_ = on; }
     bool isArmed() const { return armed_; }
-    bool inputsLive() const { return armed_ || recording_ || captureOn_; }
+    bool inputsLive() const { return armed_ || (recording_ && !printOn_) || captureOn_; }
     // Which inputs are armed: first channel and how many (1, 2 or 6).
     void setInputSelection(int firstChannel, int channels);
     int inputSelection() const { return inFirst_; }
@@ -198,7 +205,7 @@ public:
     bool startCapture(const CaptureRequest& rq, const Session& s, juce::String& error);
     void stopCapture();                                          // keeps what was recorded
     bool captureActive() const { return captureOn_; }            // routed to the gear (capturing or checking levels)
-    bool captureRecording() const { return captureOn_ && !capLevelOnly_; }
+    bool captureRecording() const { return (captureOn_ && !capLevelOnly_) || printOn_; }
     bool captureComplete() const { return capDone_; }            // the range and its post-roll are in the file
     double captureProgress() const;                              // 0..1 through the range
     // Samples the master chain delays playback by (0 for a 5.1 programme, which bypasses it). What
@@ -267,6 +274,42 @@ public:
     // While exporting, the chain is used offline, so playback is suspended.
     void suspendForOffline(bool suspend);
 
+    // ---- External Gear ----
+    // What the insert windows ask of the main window (print, switch, A/B). Set once.
+    std::shared_ptr<GearActions> gearActions = std::make_shared<GearActions>();
+    // Adds an External Gear insert to the master chain, on the first free output pair that isn't
+    // the monitor pair. Returns what is wrong, or nothing.
+    juce::String addExternalGear();
+    // GearIo
+    int gearBlock() const override { return gearSerial_; }
+    int gearBlockSize() const override { return gearN_; }
+    const float* gearInput(int channel) const override;
+    float* gearOutput(int channel) override;
+    juce::StringArray gearOutputPairs() const override { return outputPairNames(); }
+    juce::StringArray gearInputPairs() const override { return inputPairNames(); }
+    juce::String gearUse(int firstOutput, int firstInput) override;
+    bool gearSendIsMonitor(int firstOutput) const override;
+    void gearPing(int firstInput, int firstOutput) override { startLatencyTest(firstInput, firstOutput); }
+    int gearPingResult() const override { return latencyTestResult(); }
+    bool gearSplitDevices() const override { return splitDevices(); }
+    int gearReportedRoundTrip() const override { return reportedRoundTrip(); }
+    double gearRate() const override { return rate_; }
+
+    // ---- Print: what leaves an External Gear insert, recorded for a range ----
+    struct PrintRequest {
+        juce::File file;
+        int gear = 0;               // the insert's id
+        int bits = 24;
+        double from = 0, to = 0;    // timeline seconds
+        double preRoll = 2.0, postRoll = 2.0;
+    };
+    // Like a capture, but the programme plays to your monitors as usual and the recording is taken
+    // inside the chain, straight after that insert. The file is late by latencyThrough(gear).
+    bool startPrint(const PrintRequest& rq, const Session& s, juce::String& error);
+    bool printActive() const { return printOn_; }
+    int printGear() const { return printOn_ ? printGear_.load() : 0; }
+    // stopCapture() ends a print too; captureComplete() and captureProgress() report on it.
+
     // AudioSource
     void prepareToPlay(int block, double rate) override;
     void releaseResources() override;
@@ -330,6 +373,19 @@ private:
     std::atomic<float> inMax_{0.0f};
     juce::AudioBuffer<float> playBuf_;
     MeterTap inTap_;
+    // External Gear: this block's inputs and the sends, by buffer channel; maps from the
+    // interface's channel numbers.
+    static constexpr int kMaxHw = 64;
+    juce::AudioBuffer<float> hwIn_, hwOut_, tapBuf_;
+    std::array<std::atomic<int>, kMaxHw> inMap_, outMap_;
+    int gearSerial_ = 0, gearN_ = 0, hwInCh_ = 0, hwOutCh_ = 0;   // audio thread
+    bool hwOutUsed_ = false;
+    std::atomic<bool> printOn_{false};
+    std::atomic<int> printGear_{0};
+    // print buses of the loaded session
+    std::array<std::atomic<int>, PluginChain::kMaxBuses> busAnchor_;
+    std::atomic<int> busCount_{0};
+    int runChain(juce::AudioBuffer<float>& b, int start, int n);   // the master chain with the session's print buses
     // capture
     std::atomic<bool> captureOn_{false}, capLevelOnly_{false}, capDone_{false};
     std::atomic<juce::int64> capFrom_{0}, capEnd_{0}, capPost_{0};

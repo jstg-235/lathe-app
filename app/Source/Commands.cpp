@@ -34,6 +34,7 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::deleteClose, "Delete (Close Gap)", "Edit", "Delete the selected region or marker; later material moves up", "delete;backspace"},
         {cmd::deleteLeave, "Delete (Leave Gap)", "Edit", "Delete the selected region; leave silence in its place", "shift + delete;shift + backspace"},
         {cmd::muteRegion, "Mute / Unmute Region", "Edit", "Silence the selected region without deleting it", "U"},
+        {cmd::renameRegion, "Rename Region / Audio File...", "Edit", "Rename the selected region, and its audio file on disk if you choose (the session follows the file)", "control + N"},
         {cmd::nudgeLeft, "Nudge Region Left", "Edit", "Move the selected region one CD frame (1/75 s) earlier", "option + cursor left"},
         {cmd::nudgeRight, "Nudge Region Right", "Edit", "Move the selected region one CD frame later", "option + cursor right"},
         {cmd::nudgeLeftBig, "Nudge Region Left 100 ms", "Edit", "Move the selected region 100 ms earlier", "option + shift + cursor left"},

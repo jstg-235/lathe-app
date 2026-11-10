@@ -170,7 +170,18 @@ MainComponent::MainComponent() {
     chainAdd_.onClick = [this] { showPluginMenu(); };
     chainRemove_.onClick = [this] {
         int i = chainList_.getSelectedRow();
-        if (i >= 0) { engine_.chain().remove(i); chainList_.updateContent(); sessionChanged(); }
+        if (i < 0) return;
+        auto* gear = engine_.chain().builtinAt(i);
+        const int prints = gear ? printCount(gear->anchorId()) : 0;
+        if (gear) gearHear(gear->anchorId(), 0);
+        engine_.chain().remove(i);
+        chainList_.updateContent();
+        sessionChanged();
+        if (prints > 0)
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "External Gear removed",
+                                                   "There " + juce::String(prints == 1 ? "is a print" : "are prints") +
+                                                       " made through that insert. With it gone, they play through the whole master chain, including the "
+                                                       "plugins that were above it (so those are applied twice). Undo brings the insert back.");
     };
     chainBypass_.onClick = [this] {
         int i = chainList_.getSelectedRow();
@@ -240,6 +251,26 @@ MainComponent::MainComponent() {
         if (saved.isNotEmpty()) io_.fromVar(juce::JSON::parse(saved));
         else io_.bits = props_.getUserSettings()->getIntValue("recBits", 24) == 32 ? 32 : 24;
         applyIo();
+    }
+    {
+        // What an External Gear insert's window asks for.
+        auto& a = *engine_.gearActions;
+        a.print = [this](int gear) { beginPrint(gear); };
+        a.printStatus = [this](int gear) { return printStatus(gear); };
+        a.printing = [this](int gear) { return print_.printing && print_.gear == gear; };
+        a.printCount = [this](int gear) { return printCount(gear); };
+        a.usingPrints = [this](int gear) {
+            for (auto& r : session_.regions)
+                if (r.afterGear == gear && !r.mute) return true;
+            return false;
+        };
+        a.use = [this](int gear, bool usePrint) {
+            gearHear(gear, 0);
+            if (session_.usePrints(gear, usePrint) > 0) { sessionChanged(); timeline_.repaint(); }
+        };
+        a.hear = [this](int gear, int which) { gearHear(gear, which); };
+        a.hearing = [this](int gear) { return gearAb_ == gear ? (engine_.chain().hearingPrint() ? 2 : 1) : 0; };
+        a.changed = [this] { sessionChanged(); };
     }
     rec_.firstInput = props_.getUserSettings()->getIntValue("recInput", io_.defaultInput);
     rec_.bits = io_.bits;
@@ -466,6 +497,7 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
         case cmd::followProjectRate: info.setTicked(followRate_); break;
         case cmd::repeatPlay: info.setTicked(repeat_); break;
         case cmd::armInputs: info.setTicked(armInputs_); break;
+        case cmd::renameRegion: info.setActive(activeTimeline().selectedRegion() != 0); break;
         case cmd::lockAllMarks: info.setTicked(session_.lockMarks); break;
         case cmd::gainOverlay: info.setTicked(activeTimeline().gainOverlay()); break;
         case cmd::gainBypass: info.setTicked(activeSession().gainBypass); break;
@@ -794,11 +826,13 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::restoreRegion: showRestore(targetRegion()); break;
         case cmd::spectralEditor: showSpectral(targetRegion()); break;
         case cmd::record:
-            if (cap_.capturing) finishCapture();
+            if (print_.printing) finishPrint();
+            else if (cap_.capturing) finishCapture();
             else if (engine_.isRecording()) finishRecording();
             else showRecordDialog();
             break;
         case cmd::capture: showCapture(); break;
+        case cmd::renameRegion: renameRegion(); break;
         case cmd::armInputs:
             armInputs_ = !armInputs_;
             commands_.commandStatusChanged();
@@ -878,7 +912,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
                 m.addSubMenu("Source / Destination", sd);
             }
             m.addSeparator();
-            add({cmd::splitAtPlayhead, cmd::deleteClose, cmd::deleteLeave, cmd::muteRegion, cmd::selectRegionRange, cmd::clearSelection});
+            add({cmd::splitAtPlayhead, cmd::deleteClose, cmd::deleteLeave, cmd::muteRegion, cmd::renameRegion, cmd::selectRegionRange, cmd::clearSelection});
             m.addSeparator();
             add({cmd::textView, cmd::segmentGain});
             m.addSeparator();
@@ -1596,6 +1630,7 @@ void MainComponent::toggleCompareUnprocessed() {
     // (A / B, or B / C with Level Match); End (Option-W) goes back to normal playback.
     if (!compare_) {
         endCaptureCheck();
+        gearHear(gearAb_, 0);
         compare_ = true;
         engine_.setHearUnprocessed(true);
     } else {
@@ -1931,6 +1966,7 @@ void MainComponent::beginCapture() {
     if (cap_.levelCheck) captureLevelCheck(false);
     endCaptureCheck();
     endCompare();
+    gearHear(gearAb_, 0);
     auto plan = planCapture(session_, timeline_.selection());
     if (!plan.valid()) return;
     const auto folder = recordingsFolder();
@@ -2019,6 +2055,7 @@ void MainComponent::finishCapture() {
 void MainComponent::captureHear(int which) {
     if (which == 0) { endCaptureCheck(); return; }
     if (cap_.capturing || cap_.levelCheck || !cap_.haveTake || !session_.findRegion(cap_.regionId)) return;
+    gearHear(gearAb_, 0);
     if (cap_.hearing == 0) {
         // The engine plays the session as it was sent (through the master plugins) with the
         // capture alongside, in step and untouched; switching between them is instant.
@@ -2105,6 +2142,239 @@ void MainComponent::captureNullTest() {
                    t << "Patch and alignment are right. What is left over is what the gear (and its converters) did to the sound.\n";
                showText("Null test", t);
            });
+}
+
+// ---------------------------------------------------------------- rename
+
+void MainComponent::renameRegion() {
+    const bool onSource = sourceActive_;
+    const int id = activeTimeline().selectedRegion();
+    auto* reg = activeSession().findRegion(id);
+    if (!reg) return;
+    if (engine_.isRecording() || cap_.capturing || print_.printing) return;
+    const auto file = reg->file;
+    int uses = 0;
+    for (auto& r : session_.regions) uses += r.file == file ? 1 : 0;
+    for (auto& r : srcSession_.regions) uses += r.file == file ? 1 : 0;
+    auto* w = new juce::AlertWindow("Rename", "The name shown on the region:", juce::MessageBoxIconType::NoIcon, this);
+    w->addTextEditor("name", reg->name);
+    auto tick = std::make_shared<juce::ToggleButton>("Rename the audio file on disk too  (" + file.getFileName() + ")");
+    tick->setSize(440, 24);
+    tick->setEnabled(file.existsAsFile());
+    w->addCustomComponent(tick.get());
+    w->addTextBlock(uses > 1 ? juce::String(uses) + " regions use this file; they all follow it. Renaming the file can't be undone with Undo (rename it back instead)."
+                             : juce::String("Renaming the file can't be undone with Undo (rename it back instead)."));
+    w->addButton("Rename", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    w->enterModalState(true, juce::ModalCallbackFunction::create([this, w, tick, id, onSource, file](int result) {
+        if (result != 1) return;
+        const auto name = w->getTextEditorContents("name").trim();
+        auto& ses = onSource ? srcSession_ : session_;
+        auto* r = ses.findRegion(id);
+        if (!r || name.isEmpty()) return;
+        if (tick->getToggleState()) {
+            // The engine has the file open: let go of it, rename, then load the session again.
+            engine_.stop();
+            endCaptureCheck();
+            gearHear(gearAb_, 0);
+            juce::File now;
+            auto err = renameAudioFile(session_, file, name, now);
+            if (err.isNotEmpty()) {
+                juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Rename", err);
+                return;
+            }
+            if (auto* again = ses.findRegion(id)) again->name = now.getFileNameWithoutExtension();
+            // Earlier undo steps still name the old file: point them at the new one, so Undo keeps working.
+            const auto was = juce::JSON::toString(juce::var(file.getFullPathName())), is = juce::JSON::toString(juce::var(now.getFullPathName()));
+            for (auto* list : {&undo_, &redo_})
+                for (auto& st : *list) st = st.replace(was, is);
+            lastState_ = lastState_.replace(was, is);
+            if (cap_.file == file) cap_.file = now;
+            if (print_.file == file) print_.file = now;
+        } else {
+            r->name = name;
+        }
+        sessionChanged();
+        timeline_.repaint();
+        sourceView_.timeline().repaint();
+    }), true);
+}
+
+// ---------------------------------------------------------------- external gear, print
+
+void MainComponent::addExternalGear() {
+    if (session_.programmeChannels() == 6) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "External Gear",
+                                               "External Gear is stereo, and a 5.1 programme doesn't use the master chain.");
+        return;
+    }
+    auto err = engine_.addExternalGear();
+    if (err.isNotEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "External Gear", err);
+        return;
+    }
+    chainList_.updateContent();
+    chainList_.selectRow(engine_.chain().size() - 1);
+    engine_.chain().showEditor(engine_.chain().size() - 1);
+    sessionChanged();
+}
+
+int MainComponent::printCount(int gear) const {
+    int n = 0;
+    for (auto& r : session_.regions) n += r.afterGear == gear && gear != 0 ? 1 : 0;
+    return n;
+}
+
+juce::String MainComponent::printStatus(int gear) const {
+    if (print_.printing && print_.gear == gear) {
+        const double p = engine_.captureProgress();
+        return p >= 1.0 ? juce::String("Printing: recording the tail...") : "Printing in real time: " + juce::String(int(p * 100)) + " %. Stop keeps what is recorded.";
+    }
+    auto& chain = const_cast<AudioEngine&>(engine_).chain();
+    if (gearAb_ == gear) {
+        juce::String t = chain.hearingPrint() ? "Hearing the print." : "Hearing the live gear.";
+        if (chain.compareMeasured()) {
+            const double d = -chain.compareDifferenceDb();   // print against live
+            t << " The print is " << juce::String(std::abs(d), 1) << " LU " << (d >= 0 ? "louder" : "quieter") << " than the live gear; the louder side is turned down to match.";
+        } else {
+            t << " Play a few seconds over the print to measure the level difference.";
+        }
+        return t;
+    }
+    if (print_.gear == gear && print_.message.isNotEmpty()) return print_.message;
+    const int n = printCount(gear);
+    if (n == 0)
+        return "Print plays the In-Out (or the whole programme) through the gear in real time and records the result onto a new lane, so exports no "
+               "longer need the hardware. Until then, exports are refused rather than leaving the gear out.";
+    bool usingPrints = false;
+    for (auto& r : session_.regions) usingPrints |= r.afterGear == gear && !r.mute;
+    const bool stillLive = needsHardware(session_, chain.lastLiveHardwareSlot(), [&chain](int a) { return chain.slotOfAnchor(a); });
+    return juce::String(n) + (n == 1 ? " print" : " prints") + " through this insert. " +
+           (usingPrints ? "The prints are playing (the material under them is muted)." : "The live gear is playing (the prints are muted).") +
+           (stillLive ? " Some material still passes through hardware, so exports are refused until it is printed too." : " Nothing needs the hardware now: exports run at full speed.");
+}
+
+void MainComponent::beginPrint(int gear) {
+    if (print_.printing) { finishPrint(); return; }   // the button is Stop while printing
+    if (cap_.capturing || cap_.levelCheck || engine_.isRecording()) return;
+    endCaptureCheck();
+    endCompare();
+    gearHear(gearAb_, 0);
+    auto& chain = engine_.chain();
+    const int slot = chain.slotOfAnchor(gear);
+    if (slot < 0) return;
+    print_.gear = gear;
+    print_.message = {};
+    if (chain.isBypassed(slot)) { print_.message = "The insert is bypassed. Switch it in to print through it."; return; }
+    auto plan = planCapture(session_, timeline_.selection());
+    plan.sources = sourcesThrough(session_, plan, slot, [&chain](int a) { return chain.slotOfAnchor(a); });
+    if (plan.sources.isEmpty()) {
+        print_.message = plan.whole ? "Nothing passes through this insert: it is all printed already." : "Nothing between In and Out passes through this insert (it may be printed already).";
+        return;
+    }
+    plan.channels = 2;
+    plan.underLane = 0;
+    for (int id : plan.sources)
+        if (auto* r = session_.findRegion(id)) plan.underLane = juce::jmax(plan.underLane, r->lane);
+    const auto folder = recordingsFolder();
+    folder.createDirectory();
+    if (!folder.isDirectory()) { print_.message = "Couldn't create " + folder.getFullPathName(); return; }
+    const auto need = recordingBytes(plan.range.getLength() + 2.0 + io_.capturePostRoll + 3.0, engine_.deviceRate(), 2, io_.bits);
+    const auto freeBytes = folder.getBytesFreeOnVolume();
+    if (freeBytes > 0 && freeBytes < need + (juce::int64(64) << 20)) {
+        print_.message = "Not enough room: the print needs " + byteSize(need) + " and " + byteSize(freeBytes) + " is free in " + folder.getFullPathName() + ".";
+        return;
+    }
+    print_.file = folder.getNonexistentChildFile(recordingName(session_.file, "Print", juce::Time::getCurrentTime()), ".wav", false);
+    print_.plan = plan;
+    AudioEngine::PrintRequest rq;
+    rq.file = print_.file;
+    rq.gear = gear;
+    rq.bits = io_.bits;
+    rq.from = plan.range.getStart();
+    rq.to = plan.range.getEnd();
+    rq.preRoll = 2.0;
+    rq.postRoll = io_.capturePostRoll;
+    juce::String err;
+    if (!engine_.startPrint(rq, session_, err)) {
+        engine_.loadSession(session_);
+        print_.message = err;
+        return;
+    }
+    print_.printing = true;
+    commands_.commandStatusChanged();
+}
+
+void MainComponent::finishPrint() {
+    if (!print_.printing) return;
+    print_.printing = false;
+    const bool complete = engine_.captureComplete();
+    CaptureTake take;
+    take.file = print_.file;
+    take.startSample = engine_.recordStartSample();
+    take.roundTrip = engine_.chain().latencyThrough(print_.gear);   // what left the insert was this late
+    engine_.stopCapture();
+    lastStopDest_ = engine_.positionSeconds();
+    wasPlaying_ = false;
+    if (std::unique_ptr<juce::AudioFormatReader> r{engine_.formats().createReaderFor(print_.file)}) {
+        take.rate = r->sampleRate;
+        take.length = r->lengthInSamples;
+    }
+    juce::Array<int> muted;
+    const int id = placeCapture(session_, print_.plan, take, true, print_.file.getFileNameWithoutExtension(), &muted);
+    if (id == 0) {
+        engine_.loadSession(session_);
+        print_.message = "Stopped before the range began, so there is nothing to put on the timeline.";
+        commands_.commandStatusChanged();
+        return;
+    }
+    double got = 0;
+    if (auto* reg = session_.findRegion(id)) {
+        reg->afterGear = print_.gear;
+        reg->printOf = muted;
+        got = reg->length();
+    }
+    sessionChanged();
+    timeline_.resized();
+    timeline_.selectRegion(id);
+    engine_.setPositionSeconds(print_.plan.range.getStart());
+    timeline_.setPlayhead(print_.plan.range.getStart(), false);
+    const double want = print_.plan.range.getLength();
+    print_.message = (complete || got >= want - 0.01 ? "Printed " + msfString(got) : "Stopped early: kept the first " + msfString(got) + " of " + msfString(want)) +
+                     " onto lane " + juce::String(print_.plan.underLane + 2) + ". The print is playing; Use live gear switches back, and Undo removes it.";
+    commands_.commandStatusChanged();
+}
+
+void MainComponent::gearHear(int gear, int which) {
+    auto& chain = engine_.chain();
+    if (which == 0 || gear == 0) {
+        if (gearAb_ == 0) return;
+        gearAb_ = 0;
+        chain.setCompareAt(0);
+        chain.setHearPrint(false);
+        engine_.loadSession(session_);
+        return;
+    }
+    if (print_.printing || cap_.capturing || cap_.levelCheck || printCount(gear) == 0) return;
+    if (gearAb_ != gear) {
+        // Both at once: the material goes through the gear live while its print runs beside it,
+        // in step. At the insert you hear one or the other, level-matched.
+        endCompare();
+        endCaptureCheck();
+        if (gearAb_ != 0) gearHear(gearAb_, 0);
+        Session both = session_;
+        both.source = nullptr;
+        both.usePrints(gear, true);
+        for (auto& r : session_.regions)
+            if (r.afterGear == gear)
+                for (int src : r.printOf)
+                    if (auto* x = both.findRegion(src)) x->mute = false;
+        engine_.loadSession(both);
+        chain.setCompareLevelMatch(true);
+        chain.setCompareAt(gear);
+        gearAb_ = gear;
+    }
+    chain.setHearPrint(which == 2);
 }
 
 // ---------------------------------------------------------------- control surfaces
@@ -2383,6 +2653,11 @@ void MainComponent::sessionChanged(bool undoable) {
     if (analysis_ && !analysisStale_) { analysisStale_ = true; timeline_.setAnalysisStale(true); }
     applyFollowRate();
     engine_.loadSession(session_);
+    if (gearAb_ != 0) {   // (the engine was playing the live gear and its print side by side)
+        gearAb_ = 0;
+        engine_.chain().setCompareAt(0);
+        engine_.chain().setHearPrint(false);
+    }
     if (cap_.hearing != 0) {   // (the engine was playing the session as sent, against the capture)
         cap_.hearing = 0;
         engine_.setHearUnprocessed(false);
@@ -2666,6 +2941,7 @@ void MainComponent::locateDest(double t) {
 }
 
 void MainComponent::stopAll() {
+    if (print_.printing) { finishPrint(); return; }    // keeps what was recorded
     if (cap_.capturing) { finishCapture(); return; }   // keeps what was recorded
     if (cap_.levelCheck) captureLevelCheck(false);
     lastStopDest_ = engine_.positionSeconds();
@@ -3277,12 +3553,15 @@ void MainComponent::showPluginMenu() {
     auto& ch = engine_.chain();
     juce::PopupMenu m;
     auto types = ch.host().activeTypes();
+    m.addItem(-2, "External Gear (hardware insert: out to your gear and back)");
+    m.addSeparator();
     if (types.isEmpty()) m.addItem(1, ch.known().getNumTypes() ? "Every plugin is deactivated" : "No plugins found yet; scan first", false);
     juce::KnownPluginList::addToMenu(m, types, juce::KnownPluginList::sortByManufacturer, {});
     m.addSeparator();
     m.addItem(-1, "Plugin Manager (scan, activate / deactivate)...");
     m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&pluginsBtn_), [this, types](int r) {
         if (r == -1) { showPluginManager(); return; }
+        if (r == -2) { addExternalGear(); return; }
         int idx = juce::KnownPluginList::getIndexChosenByMenu(types, r);
         if (idx < 0) return;
         juce::String err;
@@ -3557,7 +3836,10 @@ void MainComponent::timerCallback() {
         timeDisplay_.setColour(juce::Label::textColourId, colours::wave);
     }
     recordBtn_.setToggleState(engine_.isRecording(), juce::dontSendNotification);
-    if (cap_.capturing) {
+    if (print_.printing) {
+        timeDisplay_.setColour(juce::Label::textColourId, colours::error);
+        if (engine_.captureComplete() || !engine_.printActive()) finishPrint();
+    } else if (cap_.capturing) {
         timeDisplay_.setColour(juce::Label::textColourId, colours::error);
         if (engine_.captureComplete() || !engine_.captureActive()) finishCapture();
     } else if (cap_.levelCheck) {

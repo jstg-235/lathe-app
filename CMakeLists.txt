@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 # Must come before project(): CMake fixes the deployment target when the project starts.
 # 10.15 is the floor because the DDP code uses std::filesystem.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS")
-project(Lathe VERSION 0.12.0 LANGUAGES C CXX)
+project(Lathe VERSION 0.13.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -94,7 +94,8 @@ target_sources(Lathe PRIVATE
     app/Source/Paperwork.cpp
     app/Source/DeliveryPanels.cpp
     app/Source/Capture.cpp
-    app/Source/IoPanels.cpp)
+    app/Source/IoPanels.cpp
+    app/Source/ExternalGear.cpp)
 
 target_include_directories(Lathe PRIVATE ${r8b_SOURCE_DIR})
 
@@ -135,7 +136,7 @@ if(LATHE_BUILD_TESTS)
     target_sources(lathe_batch_tests PRIVATE tests/batch_tests.cpp app/Source/Exporter.cpp app/Source/AudioEngine.cpp
         app/Source/PluginChain.cpp app/Source/PluginScan.cpp app/Source/RegionFx.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp
         app/Source/DdpFormat.cpp app/Source/ControlSurface.cpp app/Source/Commands.cpp app/Source/Restore.cpp
-        app/Source/Products.cpp app/Source/Paperwork.cpp app/Source/Capture.cpp)
+        app/Source/Products.cpp app/Source/Paperwork.cpp app/Source/Capture.cpp app/Source/ExternalGear.cpp)
     target_include_directories(lathe_batch_tests PRIVATE ${r8b_SOURCE_DIR})
     target_compile_definitions(lathe_batch_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1
         JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)

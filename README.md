@@ -151,6 +151,39 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
 - While capturing, Lathe plays nothing on your output pair unless input monitoring is on, and it
   never plays the return back onto the outputs that feed the gear.
 
+## External Gear insert, Print and Rename (v0.13)
+
+- **External Gear** is a hardware insert for the master chain (Add under the plugin list: it is at the top of the menu). What
+  reaches it goes out on an output pair to your gear; what comes back on an input pair carries on
+  down the chain. It can sit anywhere in the chain, and there can be several, each on its own
+  sockets. Stereo.
+  - **Controls**: send level, return level, dry / wet, polarity, send and return meters with clip
+    lights. The chain's Bypass button bypasses it and keeps its delay, so switching doesn't jump.
+  - **Ping** measures the round trip with one click. The insert reports it as its delay, so the
+    rest of the chain, Compare Unprocessed, the dry / wet mix and the meters stay lined up. It is
+    saved with the insert.
+  - **Safety**: the pair you monitor on is refused as a send (it would feed back) and nothing is
+    ever sent to it; warnings for a clipping return, a silent return, and inputs and outputs on
+    different interfaces.
+- **Exports never leave the gear out.** Hardware can't be rendered faster than real time, so while
+  anything still has to pass through a switched-in External Gear insert, exports and Analyse are
+  refused with a message pointing to Print (or bypass the insert to export without it).
+- **Print** (in the insert's window) plays the In-Out, or the whole programme, through the gear in
+  real time and records what leaves the insert onto a new lane under the original, in sync to the
+  sample. The printed stretch replaces the live path there:
+  - the print joins the master chain *after* the insert, so the plugins above it and the gear are
+    not applied twice, and the plugins below it still are;
+  - unprinted material keeps going through the gear live, so a part-printed session sounds the same
+    across the joins;
+  - once everything is printed, exports run at full speed from the prints.
+- **Switching back**: Use live gear / Use the print flips between the two (nothing is deleted),
+  and Undo removes a print. **A/B** runs the live gear and its print side by side, in step, and
+  switches between them at the insert, level-matched.
+- **Rename Region / Audio File** (Edit menu, Ctrl-N): renames the selected region, and with the box
+  ticked the audio file on disk too. Every region using the file follows it, and earlier undo steps
+  keep working.
+- The printed key command guide now shows Control and Command correctly.
+
 ## Stability by design
 
 - Audio is streamed from disk on a background thread; the audio callback never touches the disk.

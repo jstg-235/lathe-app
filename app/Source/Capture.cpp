@@ -88,7 +88,7 @@ CapturePlan planCapture(const Session& s, juce::Range<double> selection) {
     return p;
 }
 
-int placeCapture(Session& s, const CapturePlan& plan, const CaptureTake& take, bool muteSources, const juce::String& name) {
+int placeCapture(Session& s, const CapturePlan& plan, const CaptureTake& take, bool muteSources, const juce::String& name, juce::Array<int>* muted) {
     if (take.length <= 0 || take.rate <= 0) return 0;
     // File sample i holds what was played at timeline sample startSample + i - roundTrip.
     const juce::int64 a = juce::int64(std::llround(plan.range.getStart() * take.rate));
@@ -106,7 +106,10 @@ int placeCapture(Session& s, const CapturePlan& plan, const CaptureTake& take, b
             if (int right = s.split(id, t0)) inside = right;
             s.split(inside, t1);
             if (auto* r = s.findRegion(inside))
-                if (r->start < t1 - 1.0e-6 && r->end() > t0 + 1.0e-6) r->mute = true;
+                if (r->start < t1 - 1.0e-6 && r->end() > t0 + 1.0e-6) {
+                    r->mute = true;
+                    if (muted) muted->add(r->id);
+                }
         }
     }
     const int lane = plan.underLane + 1;
@@ -122,6 +125,56 @@ int placeCapture(Session& s, const CapturePlan& plan, const CaptureTake& take, b
     return reg.id;
 }
 
+juce::String renameAudioFile(Session& s, const juce::File& from, const juce::String& newName, juce::File& renamed) {
+    if (!from.existsAsFile()) return "Lathe can't find " + from.getFileName() + " to rename it (File > Locate Missing Audio).";
+    const auto ext = from.getFileExtension();
+    auto base = newName.trim();
+    if (ext.isNotEmpty() && base.endsWithIgnoreCase(ext)) base = base.dropLastCharacters(ext.length());
+    base = juce::File::createLegalFileName(base).trim();
+    while (base.endsWithChar('.')) base = base.dropLastCharacters(1);
+    if (base.isEmpty()) return "Type a name for the file.";
+    const auto to = from.getSiblingFile(base + ext);
+    if (to == from) { renamed = from; return {}; }
+    const bool caseOnly = to.getFullPathName().equalsIgnoreCase(from.getFullPathName());
+    if (to.exists() && !caseOnly) return "There is already a file called " + to.getFileName() + " in that folder.";
+    if (!from.moveFileTo(to)) return "The file couldn't be renamed (is the folder read-only?).";
+    const auto oldBase = from.getFileNameWithoutExtension();
+    auto apply = [&](Session& x) {
+        for (auto& r : x.regions)
+            if (r.file == from && r.name == oldBase) r.name = base;
+        x.relinkAudio(from, to);
+    };
+    apply(s);
+    if (s.source) apply(*s.source);
+    renamed = to;
+    return {};
+}
+
+bool needsHardware(const Session& s, int lastLiveHardwareSlot, const std::function<int(int)>& slotOfAnchor) {
+    if (lastLiveHardwareSlot < 0 || s.programmeChannels() == 6) return false;
+    for (auto& r : s.regions) {
+        if (r.mute) continue;
+        const int enters = r.afterGear != 0 ? slotOfAnchor(r.afterGear) : -1;   // joins after this slot
+        if (enters < lastLiveHardwareSlot) return true;
+    }
+    return false;
+}
+
+juce::String hardwareExportMessage() {
+    return "The master chain has External Gear switched in, and hardware can't be rendered faster than real time, so this would leave the gear out. "
+           "Print the programme through it first (open the External Gear insert and press Print), or bypass the insert.";
+}
+
+juce::Array<int> sourcesThrough(const Session& s, const CapturePlan& plan, int gearSlot, const std::function<int(int)>& slotOfAnchor) {
+    juce::Array<int> out;
+    for (int id : plan.sources)
+        if (auto* r = s.findRegion(id)) {
+            const int enters = r->afterGear != 0 ? slotOfAnchor(r->afterGear) : -1;
+            if (enters < gearSlot) out.add(id);
+        }
+    return out;
+}
+
 Session captureAlone(const Session& s, int regionId) {
     Session alt;
     alt.projectRate = s.effectiveRate();
@@ -132,6 +185,8 @@ Session captureAlone(const Session& s, int regionId) {
         c.lane = 0;
         c.mute = false;
         c.fxState = {};
+        c.afterGear = 0;
+        c.printOf.clear();
         alt.regions.add(c);
     }
     return alt;

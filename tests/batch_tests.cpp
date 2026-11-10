@@ -615,6 +615,35 @@ int main() {
         CHECK(alone.regions.size() == 1 && alone.regions[0].lane == 0 && alone.regions[0].start == e1.findRegion(eid)->start);
     }
 
+    // ---- Renaming an audio file on disk: the session follows ----
+    {
+        auto folder = dir.getChildFile("rename");
+        folder.createDirectory();
+        auto a = noiseFile(folder, "Album Capture 2026-11-10 161105.wav", 44100, 1.0, 5);
+        auto other = noiseFile(folder, "Taken.wav", 44100, 1.0, 6);
+        Session s;
+        std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(a));
+        const int id = s.append(s.makeRegion(a, r->sampleRate, r->lengthInSamples), 0.0);
+        r.reset();
+        s.split(id, 2.5);
+        s.references.add({a, "ref", -1000, 0});
+        Session srcSide;
+        srcSide.regions.add(s.regions[0]);
+        s.source = &srcSide;
+        juce::File now;
+        CHECK(renameAudioFile(s, a, "  ", now).isNotEmpty());                       // no name
+        CHECK(renameAudioFile(s, a, "Taken", now).isNotEmpty() && a.existsAsFile());  // never over another file
+        CHECK(renameAudioFile(s, folder.getChildFile("nope.wav"), "x", now).isNotEmpty());
+        CHECK(renameAudioFile(s, a, "Track 3: through the Fairchild.wav", now).isEmpty());
+        CHECK(now.existsAsFile() && !a.existsAsFile() && now.getParentDirectory() == folder && now.getFileExtension() == ".wav");
+        CHECK(now.getFileNameWithoutExtension().startsWith("Track 3") && !now.getFileName().containsChar(':'));   // made legal, the extension not doubled
+        bool all = true;
+        for (auto& reg : s.regions) all &= reg.file == now && reg.name == now.getFileNameWithoutExtension();
+        CHECK(all && s.regions.size() == 2 && s.references[0].file == now && srcSide.regions[0].file == now);
+        CHECK(s.missingAudio().isEmpty());
+        s.source = nullptr;
+    }
+
     // ---- Inputs, routing and Capture through a simulated loop (the engine's own blocks) ----
     {
         const int N = 512;
@@ -1011,6 +1040,357 @@ int main() {
             }
         }
         engine.stop();
+        engine.loadSession(Session());
+        engine.releaseResources();
+    }
+
+    // ---- External Gear insert and Print, through a simulated loop on outputs / inputs 3-4 ----
+    {
+        const int N = 512, trip = N + 233;
+        engine.prepareToPlay(N, 44100);
+        engine.chain().prepare(44100, N);
+        juce::StringArray problems;
+        engine.chain().setState({}, problems);
+        auto src = noiseFile(dir, "gear.wav", 44100, 8.0, 91);
+        std::unique_ptr<juce::AudioFormatReader> sr(fm.createReaderFor(src));
+        juce::AudioBuffer<float> noise(2, int(sr->lengthInSamples));
+        sr->read(&noise, 0, noise.getNumSamples(), 0, true, true);
+        Session s;
+        const int rid = s.append(s.makeRegion(src, sr->sampleRate, sr->lengthInSamples), 0.0);
+        const juce::int64 regionStart = juce::int64(std::llround(s.findRegion(rid)->start * 44100));
+        // Master chain: a plugin (-6 dB, 300 samples), the gear, a plugin (x3, 100 samples).
+        engine.chain().addInstance(std::make_unique<GainDelayPlugin>(0.5f, 300));
+        CHECK(engine.addExternalGear().isEmpty());
+        auto* gear = dynamic_cast<ExternalGear*>(engine.chain().pluginAt(1));
+        CHECK(gear != nullptr && engine.chain().builtinAt(1) != nullptr && engine.chain().builtinCount() == 1);
+        engine.chain().addInstance(std::make_unique<GainDelayPlugin>(3.0f, 100));
+        if (gear) {
+            const int id = gear->anchorId();
+            CHECK(id != 0 && engine.chain().slotOfAnchor(id) == 1 && engine.chain().lastLiveHardwareSlot() == 1);
+            CHECK(gear->sendOutput() == 2);                          // the first pair that isn't the monitor pair
+            CHECK(gear->setRoute(0, 2).isNotEmpty() && gear->sendOutput() == 2);   // the monitor pair is refused
+            CHECK(gear->setRoute(2, 2).isEmpty() && gear->returnInput() == 2);
+            gear->setPing(trip);
+            CHECK(gear->getLatencySamples() == trip && engine.chain().latencySamples() == 300 + trip + 100);
+            CHECK(engine.chain().latencyThrough(id) == 300 + trip);
+            engine.loadSession(s);
+
+            // Plays `ses` from `from` through the loop (the gear returns what it was sent, `trip`
+            // samples later, times gearGain). Returns what reaches the monitor pair.
+            struct Played { juce::AudioBuffer<float> out; std::vector<float> sent; bool monitorClean = true; };
+            auto play = [&](double from, int blocks, float gearGain, const std::function<bool()>& done = {}) {
+                Played p;
+                p.out.setSize(2, blocks * N);
+                p.out.clear();
+                engine.stop();
+                if (!engine.printActive()) { engine.setPositionSeconds(from); engine.play(); }
+                juce::AudioBuffer<float> io(4, N);
+                for (int b = 0; b < blocks; ++b) {
+                    if (done && done()) { p.out.setSize(2, b * N, true); break; }
+                    CHECK(engine.waitForReadAhead(5000));
+                    io.clear();
+                    for (int i = 0; i < N; ++i) {
+                        const int k = b * N + i - trip;
+                        const float v = k >= 0 ? p.sent[size_t(k)] * gearGain : 0.0f;
+                        io.setSample(2, i, v);
+                        io.setSample(3, i, v);
+                    }
+                    engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+                    for (int i = 0; i < N; ++i) p.sent.push_back(io.getSample(2, i));
+                    for (int ch = 0; ch < 2; ++ch) p.out.copyFrom(ch, b * N, io, ch, 0, N);
+                }
+                engine.stop();
+                return p;
+            };
+            // What the monitors should carry `late` samples after a start at 3 s: the programme times `gain`.
+            auto worstAgainst = [&](const juce::AudioBuffer<float>& out, int late, float gain, int fromSample, int toSample) {
+                const juce::int64 p0 = juce::int64(3.0 * 44100);
+                double w = 0;
+                for (int k = fromSample; k < juce::jmin(toSample, out.getNumSamples()); ++k) {
+                    const juce::int64 n = p0 + k - late - regionStart;
+                    const float want = n >= 0 && n < noise.getNumSamples() ? noise.getSample(0, int(n)) * gain : 0.0f;
+                    w = juce::jmax(w, double(std::abs(out.getSample(0, k) - want)));
+                }
+                return w;
+            };
+            const int total = 300 + trip + 100;
+            // In the chain: the send leaves on 3-4 (never on the monitor pair), the return carries on
+            // down the chain, and everything is late by exactly the reported latency.
+            {
+                auto p = play(3.0, 60, 1.0f);
+                const double w = worstAgainst(p.out, total, 1.5f, 4000, 60 * N);
+                std::printf("external gear in the chain: worst sample error %.3g (latency %d reported)\n", w, engine.chain().lastLatency());
+                CHECK(w < 1e-6 && engine.chain().lastLatency() == total);
+                // the send is the signal after the first plugin: -6 dB, 300 late
+                double ws = 0;
+                for (int k = 2000; k < 20000; ++k) {
+                    const juce::int64 n = juce::int64(3.0 * 44100) + k - 300 - regionStart;
+                    ws = juce::jmax(ws, double(std::abs(p.sent[size_t(k)] - noise.getSample(0, int(n)) * 0.5f)));
+                }
+                CHECK(ws < 1e-7);
+                CHECK(!gear->sendBlocked() && !gear->returnSilent() && !gear->returnClipped());
+            }
+            // Bypassed: the signal passes, just as late, so switching doesn't jump.
+            {
+                engine.chain().setBypassed(1, true);
+                CHECK(engine.chain().latencySamples() == total && engine.chain().lastLiveHardwareSlot() == -1);
+                auto p = play(3.0, 40, 0.0f);   // (nothing comes back: it isn't needed)
+                CHECK(worstAgainst(p.out, total, 1.5f, 4000, 40 * N) < 1e-6);
+                engine.chain().setBypassed(1, false);
+            }
+            // Dry / wet lines up (half and half through a cable is the signal again); polarity flips the return.
+            {
+                gear->setMix(0.5);
+                auto p = play(3.0, 40, 1.0f);
+                CHECK(worstAgainst(p.out, total, 1.5f, 4000, 40 * N) < 1e-6);
+                gear->setInverted(true);
+                auto q = play(3.0, 40, 1.0f);
+                CHECK(q.out.getMagnitude(0, 4000, 30 * N) < 1e-6f);   // dry and inverted wet cancel
+                gear->setInverted(false);
+                gear->setMix(1.0);
+                // Send and return levels.
+                gear->setSendDb(-6.0206);
+                gear->setReturnDb(6.0206);
+                auto r = play(3.0, 40, 1.0f);
+                CHECK(worstAgainst(r.out, total, 1.5f, 4000, 40 * N) < 1e-5);
+                gear->setSendDb(0.0);
+                gear->setReturnDb(0.0);
+            }
+            // Warnings: nothing coming back, and a return that clips.
+            {
+                play(3.0, 120, 0.0f);
+                CHECK(gear->returnSilent());
+                gear->clearLights();
+                play(3.0, 30, 60.0f);
+                CHECK(gear->returnClipped() && !gear->returnSilent());
+                gear->clearLights();
+            }
+            // Saved with the chain and brought back: the same insert, route, ping and settings.
+            {
+                gear->setSendDb(-3.0);
+                auto state = engine.chain().getState();
+                auto before = id;
+                engine.chain().setState(state, problems);
+                CHECK(engine.chain().size() == 1);   // (the two test plugins aren't installed plugins, so only the insert comes back)
+                problems.clear();
+                auto* g2 = dynamic_cast<ExternalGear*>(engine.chain().pluginAt(0));
+                CHECK(g2 && g2->anchorId() == before && g2->sendOutput() == 2 && g2->returnInput() == 2 && g2->ping() == trip && std::abs(g2->sendDb() + 3.0) < 1e-9);
+                // Rebuild the chain as it was for the rest of the test.
+                engine.chain().setState({}, problems);
+                engine.chain().addInstance(std::make_unique<GainDelayPlugin>(0.5f, 300));
+                CHECK(engine.addExternalGear().isEmpty());
+                gear = dynamic_cast<ExternalGear*>(engine.chain().pluginAt(1));
+                juce::MemoryBlock gs;
+                if (g2) { g2->setSendDb(0.0); }
+                engine.chain().addInstance(std::make_unique<GainDelayPlugin>(3.0f, 100));
+                CHECK(gear != nullptr);
+            }
+        }
+        if (gear) {
+            CHECK(gear->setRoute(2, 2).isEmpty());
+            gear->setPing(trip);
+            const int id = gear->anchorId();
+            const int total = 300 + trip + 100;
+            Exporter ex(engine);
+            ExportSettings es;
+            // An export never leaves the gear out silently: with live hardware it is refused.
+            auto refused = dir.getChildFile("refused.wav");
+            auto msg = ex.exportProgramWav(s, refused, 32, es, [](double) { return true; });
+            CHECK(msg == hardwareExportMessage());
+            CHECK(needsHardware(s, engine.chain().lastLiveHardwareSlot(), [&](int a) { return engine.chain().slotOfAnchor(a); }));
+
+            // Print the whole programme through the insert.
+            auto runPrint = [&](const Session& from, juce::Range<double> selection, const juce::String& name) {
+                auto plan = planCapture(from, selection);
+                plan.sources = sourcesThrough(from, plan, engine.chain().slotOfAnchor(id), [&](int a) { return engine.chain().slotOfAnchor(a); });
+                plan.channels = 2;
+                AudioEngine::PrintRequest rq;
+                rq.file = dir.getChildFile(name + ".wav");
+                rq.gear = id;
+                rq.bits = 32;
+                rq.from = plan.range.getStart();
+                rq.to = plan.range.getEnd();
+                rq.preRoll = 2.0;
+                rq.postRoll = 0.25;
+                juce::String err;
+                CHECK(engine.startPrint(rq, from, err));
+                CHECK(engine.printActive() && engine.captureRecording() && !engine.inputsLive());
+                juce::AudioBuffer<float> io(4, N);
+                std::vector<float> sent;
+                const int maxBlocks = int((plan.range.getLength() + 5.0) * 44100 / N) + 50;
+                for (int b = 0; b < maxBlocks && !engine.captureComplete(); ++b) {
+                    CHECK(engine.waitForReadAhead(5000));
+                    io.clear();
+                    for (int i = 0; i < N; ++i) {
+                        const int k = b * N + i - trip;
+                        const float v = k >= 0 ? sent[size_t(k)] : 0.0f;
+                        io.setSample(2, i, v);
+                        io.setSample(3, i, v);
+                    }
+                    engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+                    for (int i = 0; i < N; ++i) sent.push_back(io.getSample(2, i));
+                }
+                CHECK(engine.captureComplete());
+                CaptureTake take;
+                take.file = rq.file;
+                take.startSample = engine.recordStartSample();
+                take.roundTrip = engine.chain().latencyThrough(id);
+                engine.stopCapture();
+                CHECK(!engine.printActive());
+                juce::AudioBuffer<float> file;
+                if (std::unique_ptr<juce::AudioFormatReader> r{fm.createReaderFor(rq.file)}) {
+                    take.rate = r->sampleRate;
+                    take.length = r->lengthInSamples;
+                    file.setSize(2, int(r->lengthInSamples));
+                    r->read(&file, 0, int(r->lengthInSamples), 0, true, true);
+                }
+                Session after = from;
+                juce::Array<int> muted;
+                const int pid = placeCapture(after, plan, take, true, name, &muted);
+                CHECK(pid != 0 && !muted.isEmpty());
+                if (auto* r = after.findRegion(pid)) {
+                    r->afterGear = id;
+                    r->printOf = muted;
+                    // The print holds the programme as it left the insert (after the first plugin), in place.
+                    const juce::int64 t0 = juce::int64(std::llround(r->start * 44100));
+                    double w = 0;
+                    for (juce::int64 k = 2; k < r->srcOut - r->srcIn - 2; ++k) {
+                        const juce::int64 n = t0 + k - regionStart;
+                        const float want = n >= 0 && n < noise.getNumSamples() ? noise.getSample(0, int(n)) * 0.5f : 0.0f;
+                        w = juce::jmax(w, double(std::abs(file.getSample(0, int(r->srcIn + k)) - want)));
+                    }
+                    std::printf("print %s: worst sample error %.3g against what left the insert\n", name.toRawUTF8(), w);
+                    CHECK(w < 1e-7);
+                }
+                engine.loadSession(from);
+                return std::make_pair(after, pid);
+            };
+            // First a stretch of it: the rest still needs the hardware, so exports stay refused.
+            auto [part, partId] = runPrint(s, {3.0, 5.0}, "print-part");
+            CHECK(part.printAnchors().size() == 1 && part.printAnchors()[0] == id);
+            CHECK(needsHardware(part, engine.chain().lastLiveHardwareSlot(), [&](int a) { return engine.chain().slotOfAnchor(a); }));
+            CHECK(ex.exportProgramWav(part, refused, 32, es, [](double) { return true; }) == hardwareExportMessage());
+            // Playing it: the printed stretch skips the plugin above the insert (nothing is applied
+            // twice) and still passes the one below it; the rest goes through the gear live. One
+            // continuous signal, the same as the live chain.
+            {
+                engine.loadSession(part);
+                juce::AudioBuffer<float> io(4, N);
+                std::vector<float> sent;
+                engine.setPositionSeconds(3.0);
+                engine.play();
+                const int blocks = int(3.0 * 44100 / N);   // through the end of the print and beyond it
+                juce::AudioBuffer<float> out(2, blocks * N);
+                for (int b = 0; b < blocks; ++b) {
+                    CHECK(engine.waitForReadAhead(5000));
+                    io.clear();
+                    for (int i = 0; i < N; ++i) {
+                        const int k = b * N + i - trip;
+                        const float v = k >= 0 ? sent[size_t(k)] : 0.0f;
+                        io.setSample(2, i, v);
+                        io.setSample(3, i, v);
+                    }
+                    engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+                    for (int i = 0; i < N; ++i) sent.push_back(io.getSample(2, i));
+                    out.copyFrom(0, b * N, io, 0, 0, N);
+                    out.copyFrom(1, b * N, io, 1, 0, N);
+                }
+                engine.stop();
+                const juce::int64 p0 = juce::int64(3.0 * 44100);
+                double w = 0;
+                for (int k = 4000; k < blocks * N; ++k) {
+                    const juce::int64 n = p0 + k - total - regionStart;
+                    w = juce::jmax(w, double(std::abs(out.getSample(0, k) - noise.getSample(0, int(n)) * 1.5f)));
+                }
+                std::printf("print and live gear together: worst sample error %.3g across the join\n", w);
+                CHECK(w < 1e-6);
+                // During the printed stretch nothing is sent to the gear (it is all printed there).
+                double sentInPrint = 0;
+                for (int k = 6000; k < int(1.5 * 44100); ++k) sentInPrint = juce::jmax(sentInPrint, double(std::abs(sent[size_t(k)])));
+                CHECK(sentInPrint == 0.0);
+                // Live against print at the insert: both run in step, so they null.
+                Session both = part;
+                both.usePrints(id, true);
+                for (int srcId : part.findRegion(partId)->printOf) both.findRegion(srcId)->mute = false;
+                engine.loadSession(both);
+                engine.chain().setCompareAt(id);
+                juce::AudioBuffer<float> heard[2];
+                for (int side = 0; side < 2; ++side) {
+                    engine.chain().setHearPrint(side == 1);
+                    engine.stop();
+                    engine.setPositionSeconds(3.0);
+                    engine.play();
+                    sent.clear();
+                    heard[side].setSize(2, 60 * N);
+                    for (int b = 0; b < 60; ++b) {
+                        CHECK(engine.waitForReadAhead(5000));
+                        io.clear();
+                        for (int i = 0; i < N; ++i) {
+                            const int k = b * N + i - trip;
+                            const float v = k >= 0 ? sent[size_t(k)] : 0.0f;
+                            io.setSample(2, i, v);
+                            io.setSample(3, i, v);
+                        }
+                        engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+                        for (int i = 0; i < N; ++i) sent.push_back(io.getSample(2, i));
+                        heard[side].copyFrom(0, b * N, io, 0, 0, N);
+                    }
+                    engine.stop();
+                }
+                double err = 0, ref = 0;
+                for (int k = 20 * N; k < 60 * N; ++k) {
+                    const double d = heard[0].getSample(0, k) - heard[1].getSample(0, k);
+                    err += d * d;
+                    ref += double(heard[0].getSample(0, k)) * heard[0].getSample(0, k);
+                }
+                const double nullDb = 10.0 * std::log10(juce::jmax(1e-30, err / juce::jmax(1e-30, ref)));
+                std::printf("live gear against its print nulls to %.1f dB\n", nullDb);
+                CHECK(ref > 0 && nullDb < -100.0);
+                engine.chain().setCompareAt(0);
+                engine.chain().setHearPrint(false);
+                engine.loadSession(s);
+            }
+            // Switching back and forth: the print off and its sources back, and again.
+            {
+                Session t = part;
+                CHECK(t.usePrints(id, false) == 1 && t.findRegion(partId)->mute && t.printAnchors().isEmpty());
+                double heard = 0;
+                for (auto& r : t.regions) heard += r.mute ? 0.0 : r.length();
+                CHECK(std::abs(heard - 8.0) < 1e-6);
+                CHECK(t.usePrints(id, true) == 1 && !t.findRegion(partId)->mute);
+                // ... and it survives a save.
+                auto f = dir.getChildFile("prints.lathe");
+                juce::String e;
+                CHECK(t.save(f, e));
+                Session back;
+                CHECK(back.load(f, e));
+                CHECK(back.findRegion(partId) && back.findRegion(partId)->afterGear == id && back.findRegion(partId)->printOf == t.findRegion(partId)->printOf);
+            }
+            // The whole programme printed: nothing needs the hardware, and the export (at full
+            // speed, no loop) is the live result: the print through the plugin below the insert only.
+            auto [whole, wholeId] = runPrint(s, {}, "print-whole");
+            juce::ignoreUnused(wholeId);
+            CHECK(!needsHardware(whole, engine.chain().lastLiveHardwareSlot(), [&](int a) { return engine.chain().slotOfAnchor(a); }));
+            auto outFile = dir.getChildFile("printed.wav");
+            CHECK(ex.exportProgramWav(whole, outFile, 32, es, [](double) { return true; }).isEmpty());
+            if (std::unique_ptr<juce::AudioFormatReader> r{fm.createReaderFor(outFile)}) {
+                juce::AudioBuffer<float> got(2, int(r->lengthInSamples));
+                r->read(&got, 0, got.getNumSamples(), 0, true, true);
+                double w = 0;
+                for (int k = int(regionStart) + 10; k < int(regionStart) + noise.getNumSamples() - 10; ++k)
+                    w = juce::jmax(w, double(std::abs(got.getSample(0, k) - noise.getSample(0, k - int(regionStart)) * 1.5f)));
+                std::printf("export from the print (no hardware): worst sample error %.3g\n", w);
+                CHECK(w < 1e-6);
+            } else {
+                CHECK(false);
+            }
+            // With the insert bypassed instead, the unprinted session exports too (without the gear, as asked).
+            engine.chain().setBypassed(1, true);
+            CHECK(ex.exportProgramWav(s, outFile, 32, es, [](double) { return true; }).isEmpty());
+            engine.chain().setBypassed(1, false);
+        }
+        engine.stop();
+        engine.chain().setState({}, problems);
         engine.loadSession(Session());
         engine.releaseResources();
     }

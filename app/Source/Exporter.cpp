@@ -1,5 +1,7 @@
 #include "Exporter.h"
 
+#include "Capture.h"
+
 #include "../../core/util/FlacTags.h"
 #include "../../core/util/Hash.h"
 
@@ -20,6 +22,14 @@ public:
         lock_ = std::make_unique<juce::ScopedLock>(engine_.chain().lock());
         fxLock_ = std::make_unique<juce::ScopedLock>(engine_.regionFx().lock());   // region chains belong to the export now
         if (es.runPlugins) renderer_.setRegionFx(&engine_.regionFx());
+        if (es.runPlugins) {
+            // Prints made through External Gear join the chain after their insert. Material that
+            // would still need the hardware can't be rendered: refuse, never leave the gear out.
+            auto& chain = engine_.chain();
+            anchors_ = s.printAnchors();
+            renderer_.setPrintBuses(anchors_);
+            blocked_ = needsHardware(s, chain.lastLiveHardwareSlot(), [&chain](int a) { return chain.slotOfAnchor(a); });
+        }
         renderer_.setSession(s, projRate_, true);
         if (startSec > 0) renderer_.seek(juce::int64(std::llround(startSec * projRate_)));
         if (runPlugins_) {
@@ -29,7 +39,7 @@ public:
         }
         if (std::abs(projRate_ - outRate_) > 0.5)
             for (int ch = 0; ch < 2; ++ch) rs_[ch] = std::make_unique<r8b::CDSPResampler24>(projRate_, outRate_, kBlock);
-        buf_.setSize(2, kBlock);
+        buf_.setSize(2 + 2 * anchors_.size(), kBlock);
     }
 
     ~MasterStream() {
@@ -42,9 +52,10 @@ public:
 
     // Fills n frames per channel of output-rate audio, 64-bit float.
     bool pull(double* l, double* r, int n, juce::String& err) {
+        if (blocked_) { err = hardwareExportMessage(); return false; }
         while (int(pend_[0].size()) - pendPos_ < n) {
             if (!renderer_.render(buf_, 0, kBlock)) { err = renderer_.lastError(); return false; }
-            if (runPlugins_) engine_.chain().process(buf_, 0, kBlock);
+            if (runPlugins_) engine_.chain().process(buf_, 0, kBlock, anchors_.getRawDataPointer(), anchors_.size());
             int skip = juce::jmin(latency_, kBlock);   // plugin delay compensation
             latency_ -= skip;
             int n0 = kBlock - skip;
@@ -75,6 +86,8 @@ private:
     AudioEngine& engine_;
     ProgramRenderer renderer_;
     bool runPlugins_;
+    juce::Array<int> anchors_;
+    bool blocked_ = false;
     double projRate_ = 44100, outRate_ = 44100;
     int latency_ = 0;
     std::unique_ptr<juce::ScopedLock> lock_, fxLock_;

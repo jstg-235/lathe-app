@@ -48,6 +48,10 @@ struct Region {
     bool fadeInManual = false, fadeOutManual = false;
     juce::Array<GainPoint> envelope;     // empty = flat
     juce::String fxState;                // region effects chain (base64), empty = none
+    // A print made through an External Gear insert: it already holds the master plugins up to and
+    // including that insert, so it joins the master chain after it. 0 = ordinary material.
+    int afterGear = 0;
+    juce::Array<int> printOf;            // the regions muted in its favour (to switch back to the live gear)
 
     double length() const { return double(srcOut - srcIn) / fileRate; }
     double end() const { return start + length(); }
@@ -199,6 +203,12 @@ public:
     void insertLane(int at);
     // The programme's channel count: 6 when a 5.1 lane has audio, otherwise 2.
     int programmeChannels() const;
+    // The External Gear inserts that unmuted prints enter the master chain after (at most three;
+    // none for a 5.1 programme, which doesn't use the master chain).
+    juce::Array<int> printAnchors() const;
+    // Switches every print made through that insert on (its sources muted) or off (the sources
+    // back, the print muted). Returns how many prints there are.
+    int usePrints(int gear, bool usePrint);
     // The source timeline (the material edits are taken from) is a session of its own, saved
     // inside this one. `source` points at the live one; `sourceDoc` is what was last read from file.
     Session* source = nullptr;

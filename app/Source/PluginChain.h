@@ -4,8 +4,13 @@
 // hidden from menus and never loaded: a session that uses one keeps its settings, unloaded.
 #pragma once
 
+#include "../../core/dsp/Meters.h"
+
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
+
+#include <array>
+#include <vector>
 
 namespace lathe {
 
@@ -36,8 +41,21 @@ private:
     juce::StringArray deactivated_;
 };
 
+// A built-in insert (not a scanned plugin), such as External Gear. Prints made through one join
+// the chain after it, so the chain needs to know which slot it is.
+class BuiltinInsert {
+public:
+    virtual ~BuiltinInsert() = default;
+    virtual int anchorId() const = 0;                                    // unique per insert, saved with it
+    virtual void processBypassed(juce::AudioBuffer<float>& b) = 0;       // bypassed: the signal passes, as late as when it is in
+    virtual bool needsHardware() const = 0;                              // can't be rendered offline
+};
+// The format name built-in inserts are saved under.
+inline const char* const kBuiltinFormat = "Lathe";
+
 class PluginChain {
 public:
+    static constexpr int kMaxBuses = 3;
     explicit PluginChain(PluginHost& host, juce::String label = {});
     ~PluginChain();
 
@@ -54,7 +72,20 @@ public:
         std::unique_ptr<juce::XmlElement> dormant;           // its saved slot, kept so nothing is lost
         bool bypassed = false;
         std::unique_ptr<juce::DocumentWindow> window;
+        BuiltinInsert* builtin = nullptr;                    // the plugin, when it is a built-in insert
     };
+    // Makes built-in inserts (set by the owner of a chain that may hold them: the master chain).
+    std::function<std::unique_ptr<juce::AudioPluginInstance>(const juce::PluginDescription&)> builtinFactory;
+    // The built-in insert in a slot, or nullptr.
+    BuiltinInsert* builtinAt(int i) const { return slots_[i] ? slots_[i]->builtin : nullptr; }
+    juce::AudioPluginInstance* pluginAt(int i) const { return slots_[i] ? slots_[i]->plugin.get() : nullptr; }
+    int slotOfAnchor(int anchor) const;         // -1 = not in this chain
+    int builtinCount() const { return builtins_; }   // (safe on the audio thread)
+    // Slot of the last hardware insert that is switched in, or -1: material entering the chain
+    // before it can't be rendered offline.
+    int lastLiveHardwareSlot() const;
+    // Latency of the slots up to and including that insert (a print made through it is this late).
+    int latencyThrough(int anchor) const;
 
     int size() const { return slots_.size(); }
     juce::String nameAt(int i) const;
@@ -72,8 +103,25 @@ public:
     // Real-time side. process() never blocks: if the chain is being edited it passes audio through.
     void prepare(double rate, int block, bool doublePrecision = false);
     void release();
-    void process(juce::AudioBuffer<float>& b, int start, int n);
-    void process(juce::AudioBuffer<double>& b, int start, int n);   // offline master path
+    // Print buses: bus k (channels 2 + 2k and 3 + 2k of `b`) holds prints made through the insert
+    // anchors[k]; it joins the chain after that insert, delayed to line up with what passes through
+    // it. A bus whose insert isn't in the chain joins at the input.
+    void process(juce::AudioBuffer<float>& b, int start, int n, const int* anchors = nullptr, int numBuses = 0);
+    void process(juce::AudioBuffer<double>& b, int start, int n, const int* anchors = nullptr, int numBuses = 0);   // offline master path
+    // Tap: what leaves that insert (before any print joins) is copied to `dest` (two channels, the
+    // block's samples from 0), for printing. Anchor 0 = off. Real-time path only.
+    void setTap(int anchor, juce::AudioBuffer<float>* dest) { tapDest_ = dest; tapAnchor_ = anchor; }
+    // Live against print: at that insert, hear what passes through it or its print bus instead of
+    // their sum; switching crossfades in 10 ms. With level match the louder side is turned down
+    // (measured as it plays). Anchor 0 = off.
+    void setCompareAt(int anchor) { abAnchor_ = anchor; abReset_ = true; }
+    int compareAt() const { return abAnchor_; }
+    void setHearPrint(bool b) { abHearPrint_ = b; }
+    bool hearingPrint() const { return abHearPrint_; }
+    void setCompareLevelMatch(bool b) { abMatch_ = b; }
+    bool compareLevelMatch() const { return abMatch_; }
+    bool compareMeasured() const { return abReady_; }
+    double compareDifferenceDb() const { return abDiff_; }   // live minus print, LU
     int countDoublePrecision() const;
     int latencySamples() const;
     // The latency of the last real-time process() call (audio thread; safe to read anywhere).
@@ -97,7 +145,25 @@ private:
     double rate_ = 44100;
     int block_ = 512;
     bool prepared_ = false, preparedDouble_ = false;
-    std::atomic<int> lastLatency_{0};
+    std::atomic<int> lastLatency_{0}, builtins_{0};
+    void countBuiltins();
+    // print buses: a delay line per bus and channel, for each precision
+    static constexpr int kRing = 1 << 17;
+    std::array<std::array<std::vector<float>, 2>, kMaxBuses> ringF_;
+    std::array<std::array<std::vector<double>, 2>, kMaxBuses> ringD_;
+    std::array<int, kMaxBuses> ringPos_{};
+    template <typename T> std::array<std::array<std::vector<T>, 2>, kMaxBuses>& rings();
+    // Bus k's `n` samples delayed by `delay` into out[0], out[1] (scratch of the caller).
+    template <typename T> void delayBus(int bus, const T* l, const T* r, int n, int delay, T* outL, T* outR);
+    template <typename T> void joinAtInput(juce::AudioBuffer<T>& view, const juce::AudioBuffer<T>& b, int at, int k, const int* anchors, int numBuses);
+    std::vector<float> busScratchF_[2];
+    std::vector<double> busScratchD_[2];
+    juce::AudioBuffer<float>* tapDest_ = nullptr;
+    std::atomic<int> tapAnchor_{0}, abAnchor_{0};
+    std::atomic<bool> abHearPrint_{false}, abMatch_{false}, abReady_{false}, abReset_{false};
+    std::atomic<double> abDiff_{0.0};
+    dsp::LoudnessMatch abMeter_;
+    float abMix_ = 0.0f, abGainLive_ = 1.0f, abGainPrint_ = 1.0f;
 };
 
 }  // namespace lathe

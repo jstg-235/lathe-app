@@ -243,6 +243,22 @@ private:
     void endCaptureCheck();
     void captureNullTest();
     int captureRoundTrip() const;
+    // ---- External Gear: print, switch between print and live gear, A/B ----
+    struct PrintRun {
+        bool printing = false;
+        int gear = 0;
+        CapturePlan plan;
+        juce::File file;
+        juce::String message;
+    } print_;
+    int gearAb_ = 0;   // the insert whose live path and print are being compared (0 = none)
+    void renameRegion();
+    void addExternalGear();
+    void beginPrint(int gear);
+    void finishPrint();
+    void gearHear(int gear, int which);
+    juce::String printStatus(int gear) const;
+    int printCount(int gear) const;
     std::unique_ptr<MeterStrip> meters_;
     std::unique_ptr<juce::DocumentWindow> meterWindow_;
     juce::Component::SafePointer<MeterBridge> meterBridge_;

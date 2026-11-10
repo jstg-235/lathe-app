@@ -465,6 +465,27 @@ void Session::insertLane(int at) {
     ++lanes;
 }
 
+juce::Array<int> Session::printAnchors() const {
+    juce::Array<int> a;
+    if (programmeChannels() == 6) return a;
+    for (auto& r : regions)
+        if (!r.mute && r.afterGear != 0 && a.size() < 3) a.addIfNotAlreadyThere(r.afterGear);
+    return a;
+}
+
+int Session::usePrints(int gear, bool usePrint) {
+    int n = 0;
+    for (int i = 0; i < regions.size(); ++i) {
+        if (regions.getReference(i).afterGear != gear) continue;
+        ++n;
+        regions.getReference(i).mute = !usePrint;
+        const auto sources = regions.getReference(i).printOf;
+        for (int id : sources)
+            if (auto* src = findRegion(id)) src->mute = usePrint;
+    }
+    return n;
+}
+
 int Session::programmeChannels() const {
     for (auto& r : regions)
         if (!r.mute && laneFormat(r.lane) == 6) return 6;
@@ -927,7 +948,7 @@ int Session::healSplices() {
                 const auto& b = regions.getReference(j);
                 if (a.lane != b.lane || a.file != b.file || a.srcOut != b.srcIn || a.fileRate != b.fileRate) continue;
                 if (std::abs(a.end() - b.start) > 0.5 / a.fileRate) continue;
-                if (a.gainDb != b.gainDb || a.mute != b.mute || a.invert != b.invert || a.fxState != b.fxState) continue;
+                if (a.gainDb != b.gainDb || a.mute != b.mute || a.invert != b.invert || a.fxState != b.fxState || a.afterGear != b.afterGear) continue;
                 if (!a.envelope.isEmpty() || !b.envelope.isEmpty()) continue;
                 if (a.fadeOut > 0 || a.fadeOutOffset > 0 || b.fadeIn > 0 || b.fadeInOffset > 0) continue;
                 // Nothing else may be crossfading at the joint.
@@ -1254,6 +1275,12 @@ juce::var Session::toVar() const {
         for (auto& p : r.envelope) env.add(juce::Array<juce::var>{p.t, p.db});
         o->setProperty("envelope", env);
         if (r.fxState.isNotEmpty()) o->setProperty("fx", r.fxState);
+        if (r.afterGear != 0) {
+            o->setProperty("afterGear", r.afterGear);
+            juce::Array<juce::var> po;
+            for (int id : r.printOf) po.add(id);
+            o->setProperty("printOf", po);
+        }
         rl.add(o);
     }
     root->setProperty("regions", rl);
@@ -1459,6 +1486,9 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             if (auto* env = o["envelope"].getArray())
                 for (auto& p : *env) r.envelope.add({double(p[0]), double(p[1])});
             r.fxState = o["fx"].toString();
+            r.afterGear = int(o.getProperty("afterGear", 0));
+            if (auto* po = o["printOf"].getArray())
+                for (auto& id : *po) r.printOf.add(int(id));
             nextId = juce::jmax(nextId, r.id + 1);
             regions.add(r);
         }
