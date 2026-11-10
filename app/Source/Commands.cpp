@@ -303,19 +303,39 @@ static juce::String macLabel(const juce::KeyPress& k) {
     return s + key;
 }
 
+// The same label straight from a key description ("control + shift + R"). A KeyPress can't be
+// used for this off the Mac: there Control and Command are one modifier, and every Control key
+// would print as Command.
+static juce::String macLabelFor(const juce::String& description) {
+    auto parts = juce::StringArray::fromTokens(description.trim().toLowerCase(), "+", "");
+    parts.trim();
+    parts.removeEmptyStrings();
+    if (parts.isEmpty()) return {};
+    const auto keyName = parts[parts.size() - 1];
+    parts.remove(parts.size() - 1);
+    const bool ctrl = parts.contains("control") || parts.contains("ctrl"), alt = parts.contains("option") || parts.contains("alt");
+    const bool shift = parts.contains("shift"), cmd = parts.contains("command") || parts.contains("cmd");
+    juce::String s;
+    if (ctrl) s << juce::String::charToString(0x2303);
+    if (alt) s << juce::String::charToString(0x2325);
+    if (shift) s << juce::String::charToString(0x21e7);
+    if (cmd) s << juce::String::charToString(0x2318);
+    return s + macLabel(juce::KeyPress(juce::KeyPress::createFromDescription(keyName).getKeyCode()));
+}
+
 static int guidePreset = 0;   // which preset a guide without live keys shows
 
 static juce::StringArray keysFor(const CommandDef& d, const juce::KeyPressMappingSet* keys) {
     juce::StringArray out;
     if (!keys && guidePreset != 0) {
-        for (auto& s : presetKeys(guidePreset, d)) out.add(macLabel(juce::KeyPress::createFromDescription(s)));
+        for (auto& s : presetKeys(guidePreset, d)) out.add(macLabelFor(s));
         return out;
     }
     if (keys) {
         for (auto& k : keys->getKeyPressesAssignedToCommand(d.id)) out.add(macLabel(k));
     } else {
         for (auto& s : juce::StringArray::fromTokens(d.keys, ";", ""))
-            if (s.trim().isNotEmpty()) out.add(macLabel(juce::KeyPress::createFromDescription(s.trim())));
+            if (s.trim().isNotEmpty()) out.add(macLabelFor(s.trim()));
     }
     return out;
 }

@@ -431,6 +431,16 @@ int main() {
         CHECK(presetKeys(1, *findCommand(cmd::exportDdp)).isEmpty());   // its key went to Zoom to Fit
         CHECK(presetKeys(1, *findCommand(cmd::playAroundEdit)).isEmpty());
         CHECK(presetKeys(1, *findCommand(cmd::analyse)) == juce::StringArray{"command + shift + A"});   // untouched
+        // The printed guide shows Control and Command as different keys, wherever it is generated.
+        {
+            const auto guide = keyGuideHtml(nullptr), legacy = keyGuideHtmlForPreset(1);
+            const auto ctrl = juce::String::charToString(0x2303), cmdKey = juce::String::charToString(0x2318), shift = juce::String::charToString(0x21e7);
+            CHECK(guide.contains("<kbd>" + ctrl + "R</kbd></td><td class='n'>Capture Through Outboard"));
+            CHECK(guide.contains("<kbd>" + ctrl + shift + "R</kbd></td><td class='n'>Arm Inputs"));
+            CHECK(guide.contains("<kbd>" + shift + cmdKey + "R</kbd></td><td class='n'>References"));
+            CHECK(guide.contains("<kbd>" + ctrl + "I</kbd></td><td class='n'>Clear In"));
+            CHECK(legacy.contains("<kbd>" + ctrl + "R</kbd></td><td class='n'>Capture Through Outboard"));
+        }
         if (auto* out = std::getenv("LATHE_KEYGUIDE_OUT")) juce::File(out).replaceWithText(keyGuideHtml(nullptr));
         if (auto* out = std::getenv("LATHE_KEYGUIDE_LEGACY_OUT")) juce::File(out).replaceWithText(keyGuideHtmlForPreset(1));
     }
