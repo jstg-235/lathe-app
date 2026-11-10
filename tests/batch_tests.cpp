@@ -418,6 +418,9 @@ int main() {
 
 
     // ---- Compare Unprocessed (A / B / C): time-aligned, instant, level matched by measurement.
+    // A real device (a Mac has one even on a build machine) would pull audio from the engine at
+    // the same time as the test: close it, so the test owns every block.
+    engine.devices().closeAudioDevice();
     for (int withRegionFx = 0; withRegionFx < 2; ++withRegionFx) {
         auto a = noiseFile(dir, "cmp.wav", 44100, 8.0, 21);
         engine.prepareToPlay(512, 44100);
