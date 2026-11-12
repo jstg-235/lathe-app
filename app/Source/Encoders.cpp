@@ -296,14 +296,56 @@ std::vector<Box> listBoxes(juce::InputStream& in, juce::int64 from, juce::int64 
 }
 }  // namespace
 
+namespace {
+// Adds `delta` to every chunk offset (stco / co64) inside the moov atom held in `moov` (whole atom,
+// header included). Offsets at or after `from` (where moov used to end) are the ones that move.
+void shiftChunkOffsets(juce::MemoryBlock& moov, juce::int64 from, juce::int64 delta) {
+    auto* d = static_cast<uint8_t*>(moov.getData());
+    const auto size = juce::int64(moov.getSize());
+    auto rd32 = [&](juce::int64 p) { return uint32_t(d[p]) << 24 | uint32_t(d[p + 1]) << 16 | uint32_t(d[p + 2]) << 8 | uint32_t(d[p + 3]); };
+    auto wr32 = [&](juce::int64 p, uint32_t v) { d[p] = uint8_t(v >> 24); d[p + 1] = uint8_t(v >> 16); d[p + 2] = uint8_t(v >> 8); d[p + 3] = uint8_t(v); };
+    std::function<void(juce::int64, juce::int64)> walk = [&](juce::int64 a, juce::int64 b) {
+        for (juce::int64 p = a; p + 8 <= b;) {
+            const juce::int64 len = rd32(p);
+            if (len < 8 || p + len > b) return;
+            const juce::String type(reinterpret_cast<const char*>(d + p + 4), 4);
+            if (type == "trak" || type == "mdia" || type == "minf" || type == "stbl") walk(p + 8, p + len);
+            else if (type == "stco" && len >= 16) {
+                const juce::int64 n = rd32(p + 12);
+                for (juce::int64 k = 0; k < n && p + 16 + 4 * k + 4 <= p + len; ++k) {
+                    const auto at = p + 16 + 4 * k;
+                    const juce::int64 v = rd32(at);
+                    if (v >= from) wr32(at, uint32_t(v + delta));
+                }
+            } else if (type == "co64" && len >= 16) {
+                const juce::int64 n = rd32(p + 12);
+                for (juce::int64 k = 0; k < n && p + 16 + 8 * k + 8 <= p + len; ++k) {
+                    const auto at = p + 16 + 8 * k;
+                    const juce::int64 v = juce::int64(uint64_t(rd32(at)) << 32 | rd32(at + 4));
+                    if (v >= from) {
+                        const uint64_t nv = uint64_t(v + delta);
+                        wr32(at, uint32_t(nv >> 32));
+                        wr32(at + 4, uint32_t(nv));
+                    }
+                }
+            }
+            p += len;
+        }
+    };
+    walk(8, size);
+}
+}  // namespace
+
 bool writeM4aTags(const juce::File& m4a, const DeliveryTags& t) {
     juce::MemoryBlock file;
     if (!m4a.loadFileAsData(file)) return false;
     juce::MemoryInputStream in(file, false);
     const auto top = listBoxes(in, 0, juce::int64(file.getSize()));
-    if (top.empty()) return false;
-    const auto& moov = top.back();
-    if (juce::String(moov.type) != "moov" || moov.header != 8) return false;   // tags only when "moov" is the last atom
+    int mi = -1;
+    for (int i = 0; i < int(top.size()); ++i)
+        if (juce::String(top[size_t(i)].type) == "moov") mi = i;
+    if (mi < 0 || top[size_t(mi)].header != 8) return false;
+    const auto moov = top[size_t(mi)];
     // moov's children, without any udta already there.
     juce::MemoryOutputStream body;
     for (auto& c : listBoxes(in, moov.start + moov.header, moov.start + moov.size))
@@ -351,8 +393,31 @@ bool writeM4aTags(const juce::File& m4a, const DeliveryTags& t) {
     auto udta = atom("udta", atom("meta", meta.getMemoryBlock()));
     body.write(udta.getData(), udta.getSize());
     auto newMoov = atom("moov", body.getMemoryBlock());
+    juce::int64 delta = juce::int64(newMoov.getSize()) - moov.size;
+    // Anything after moov moves by delta. A "free" atom straight after it soaks the change up
+    // when it is big enough; otherwise the chunk offsets that point past moov are moved too.
+    juce::int64 resumeAt = moov.start + moov.size;   // where the rest of the file is copied from
+    juce::MemoryBlock pad;
+    const bool after = mi + 1 < int(top.size());
+    if (after && delta != 0) {
+        const auto& next = top[size_t(mi + 1)];
+        if (juce::String(next.type) == "free" && next.size - delta >= 8) {
+            juce::MemoryOutputStream f;
+            put32(f, uint32_t(next.size - delta));
+            f.write("free", 4);
+            for (juce::int64 k = 8; k < next.size - delta; ++k) f.writeByte(0);
+            pad = f.getMemoryBlock();
+            resumeAt = next.start + next.size;
+            delta = 0;
+        } else {
+            shiftChunkOffsets(newMoov, moov.start + moov.size, delta);
+        }
+    }
     juce::MemoryBlock result(file.getData(), size_t(moov.start));
     result.append(newMoov.getData(), newMoov.getSize());
+    if (pad.getSize()) result.append(pad.getData(), pad.getSize());
+    if (resumeAt < juce::int64(file.getSize()))
+        result.append(static_cast<const char*>(file.getData()) + resumeAt, size_t(juce::int64(file.getSize()) - resumeAt));
     auto tmp = m4a.getSiblingFile(m4a.getFileName() + ".tagging");
     if (!tmp.replaceWithData(result.getData(), result.getSize())) return false;
     return tmp.moveFileTo(m4a);

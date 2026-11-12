@@ -40,9 +40,11 @@ juce::String encodeFile(const juce::File& wav, const juce::File& out, DeliveryFo
 // The highest true peak in an audio file the format manager can read (dBTP; -inf when silent or unreadable).
 double fileTruePeakDb(juce::AudioFormatManager& fm, const juce::File& f);
 
-// ---- tags inside an .m4a (the iTunes "ilst" atoms), for files whose "moov" atom comes last ----
+// ---- tags inside an .m4a (the iTunes "ilst" atoms) ----
 // Adds title, artist, album, track number, year, genre, ISRC (as a free-form tag) and cover art.
-// Returns false (and leaves the file as it was) when the file isn't laid out that way.
+// When the index ("moov") comes before the audio, a "free" atom after it takes up the extra size,
+// or the audio's chunk offsets are moved to match. Returns false (file untouched) on a file it
+// can't read.
 bool writeM4aTags(const juce::File& m4a, const DeliveryTags& tags);
 // Reads back the text of one tag (e.g. "\xa9nam" for the title), for checking.
 juce::String readM4aTag(const juce::File& m4a, const char* fourcc);

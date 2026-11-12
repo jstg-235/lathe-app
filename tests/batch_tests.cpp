@@ -1111,43 +1111,83 @@ int main() {
                 o.write(body.getData(), body.getSize());
                 return o.getMemoryBlock();
             };
+            // A tiny file: the audio is 1000 bytes in mdat, and one track whose chunk table (stco)
+            // points at it. Three layouts: index last, index first, index first with a "free" pad.
             juce::MemoryBlock payload(1000, true), mvhd(100, true);
-            auto make = [&](bool moovLast) {
+            for (size_t i = 0; i < payload.getSize(); ++i) payload[i] = char(i * 7 + 3);
+            auto stcoBox = [&](uint32_t offset) {
+                juce::MemoryOutputStream b;
+                b.writeIntBigEndian(0);   // version / flags
+                b.writeIntBigEndian(1);   // one chunk
+                b.writeIntBigEndian(int(offset));
+                return box("stco", b.getMemoryBlock());
+            };
+            enum Layout { MoovLast, MoovFirst, MoovFirstPadded };
+            auto make = [&](Layout l) {
+                const auto ftyp = box("ftyp", juce::MemoryBlock("M4A \0\0\0\0", 8));
+                const auto freeBox = box("free", juce::MemoryBlock(4000, true));
+                // The moov size doesn't depend on the offset value, so lay out once to find it.
+                auto moovFor = [&](uint32_t off) { return box("moov", [&] { juce::MemoryOutputStream m; auto a = box("mvhd", mvhd); m.write(a.getData(), a.getSize());
+                    auto tr = box("trak", box("mdia", box("minf", box("stbl", stcoBox(off))))); m.write(tr.getData(), tr.getSize()); return m.getMemoryBlock(); }()); };
+                const auto moovSize = moovFor(0).getSize();
                 juce::MemoryOutputStream o;
-                auto ftyp = box("ftyp", juce::MemoryBlock("M4A \0\0\0\0", 8));
-                auto mdat = box("mdat", payload);
-                auto moov = box("moov", box("mvhd", mvhd));
                 o.write(ftyp.getData(), ftyp.getSize());
-                if (moovLast) { o.write(mdat.getData(), mdat.getSize()); o.write(moov.getData(), moov.getSize()); }
-                else { o.write(moov.getData(), moov.getSize()); o.write(mdat.getData(), mdat.getSize()); }
+                if (l == MoovLast) {
+                    const auto mdat = box("mdat", payload);
+                    const uint32_t off = uint32_t(ftyp.getSize() + 8);
+                    o.write(mdat.getData(), mdat.getSize());
+                    auto mv = moovFor(off);
+                    o.write(mv.getData(), mv.getSize());
+                } else {
+                    const uint32_t off = uint32_t(ftyp.getSize() + moovSize + (l == MoovFirstPadded ? freeBox.getSize() : 0) + 8);
+                    auto mv = moovFor(off);
+                    o.write(mv.getData(), mv.getSize());
+                    if (l == MoovFirstPadded) o.write(freeBox.getData(), freeBox.getSize());
+                    const auto mdat = box("mdat", payload);
+                    o.write(mdat.getData(), mdat.getSize());
+                }
                 return o.getMemoryBlock();
             };
-            auto f1 = dir.getChildFile("tags.m4a"), f2 = dir.getChildFile("tags-front.m4a");
-            auto d1 = make(true), d2 = make(false);
-            f1.replaceWithData(d1.getData(), d1.getSize());
-            f2.replaceWithData(d2.getData(), d2.getSize());
+            // Where the chunk table points, and whether the audio is really there.
+            auto audioIntact = [&](const juce::File& f) {
+                juce::MemoryBlock d;
+                f.loadFileAsData(d);
+                const auto* b = static_cast<const uint8_t*>(d.getData());
+                for (size_t i = 0; i + 16 <= d.getSize(); ++i)
+                    if (std::memcmp(b + i, "stco", 4) == 0) {
+                        const size_t off = size_t(b[i + 12]) << 24 | size_t(b[i + 13]) << 16 | size_t(b[i + 14]) << 8 | b[i + 15];
+                        return off + payload.getSize() <= d.getSize() && std::memcmp(b + off, payload.getData(), payload.getSize()) == 0;
+                    }
+                return false;
+            };
             DeliveryTags t = items[0].tags;
             t.comment = "Mastered in Lathe";
-            CHECK(writeM4aTags(f1, t));
-            CHECK(readM4aTag(f1, "\xa9nam") == "First Song" && readM4aTag(f1, "\xa9" "alb") == "Delivery Test" && readM4aTag(f1, "aART") == "The Lathe Band");
-            CHECK(readM4aTag(f1, "\xa9" "day") == "2026" && readM4aTag(f1, "\xa9gen") == "Jazz");
-            juce::MemoryBlock after;
-            f1.loadFileAsData(after);
-            CHECK(after.getSize() > d1.getSize() && std::memcmp(after.getData(), d1.getData(), 8 + 8 + 8 + 1000) == 0);   // the audio is untouched
-            {
-                const auto* d = static_cast<const char*>(after.getData());
-                bool found = false;
-                for (size_t i = 0; i + 12 <= after.getSize() && !found; ++i) found = std::memcmp(d + i, "USABC2600011", 12) == 0;
-                CHECK(found);   // the ISRC, as a free-form tag
+            for (auto l : {MoovLast, MoovFirst, MoovFirstPadded}) {
+                auto f = dir.getChildFile("tags" + juce::String(int(l)) + ".m4a");
+                auto d = make(l);
+                f.replaceWithData(d.getData(), d.getSize());
+                CHECK(audioIntact(f));
+                CHECK(writeM4aTags(f, t));
+                CHECK(readM4aTag(f, "\xa9nam") == "First Song" && readM4aTag(f, "\xa9" "alb") == "Delivery Test" && readM4aTag(f, "aART") == "The Lathe Band");
+                CHECK(readM4aTag(f, "\xa9" "day") == "2026" && readM4aTag(f, "\xa9gen") == "Jazz");
+                CHECK(audioIntact(f));   // the chunk table still points at the audio
+                juce::MemoryBlock after;
+                f.loadFileAsData(after);
+                {
+                    const auto* bytes = static_cast<const char*>(after.getData());
+                    bool found = false;
+                    for (size_t i = 0; i + 12 <= after.getSize() && !found; ++i) found = std::memcmp(bytes + i, "USABC2600011", 12) == 0;
+                    CHECK(found);   // the ISRC, as a free-form tag
+                }
+                if (l == MoovFirstPadded) CHECK(after.getSize() == d.getSize());   // the pad took the tags: nothing moved
+                CHECK(writeM4aTags(f, t));   // writing again replaces the tags, it doesn't add a second set
+                juce::MemoryBlock again;
+                f.loadFileAsData(again);
+                CHECK(again.getSize() == after.getSize() && audioIntact(f));
             }
-            CHECK(writeM4aTags(f1, t));   // writing again replaces the tags, it doesn't add a second set
-            juce::MemoryBlock again;
-            f1.loadFileAsData(again);
-            CHECK(again.getSize() == after.getSize());
-            CHECK(!writeM4aTags(f2, t));
-            juce::MemoryBlock untouched;
-            f2.loadFileAsData(untouched);
-            CHECK(untouched == d2);
+            auto junk = dir.getChildFile("junk.m4a");
+            junk.replaceWithText("not an mp4 file at all");
+            CHECK(!writeM4aTags(junk, t) && junk.loadFileAsString() == "not an mp4 file at all");
         }
         // MP3, through the bundled encoder (when this build has it).
         if (formatAvailable(DeliveryFormat::Mp3Cbr320)) {
