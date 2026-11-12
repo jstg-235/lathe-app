@@ -332,8 +332,8 @@ juce::String Exporter::exportProgramWav(const Session& s, const juce::File& file
 }
 
 juce::String Exporter::exportRangeWav(const Session& s, const juce::File& file, int bits, const ExportSettings& es, juce::Range<double> range,
-                                      const Keep& keep) {
-    const double rate = s.effectiveRate();
+                                      const Keep& keep, double outRate) {
+    const double rate = outRate > 0 && s.programmeChannels() != 6 ? outRate : s.effectiveRate();
     range = range.getIntersectionWith({0.0, juce::jmax(s.end(), range.getEnd())});
     if (range.getLength() <= 0) return "Nothing to export there.";
     file.deleteFile();

@@ -56,7 +56,7 @@ enum : juce::CommandID {
     // Timeline gain
     gainOverlay = 0x1480, gainBypass, lockAllGain, clearGain,
     // Export
-    exportSegments = 0x1090,
+    exportSegments = 0x1090, exportInOut, exportTracksAs, exportProgrammeAs,
     // Metering
     meterBridge = 0x14a0, resetMeters,
     // Inputs and capture

@@ -458,7 +458,7 @@ void MeterBridge::paint(juce::Graphics& g) {
     if (out_.paused) {
         g.setColour(kYellow);
         g.setFont(juce::FontOptions(12.0f, juce::Font::bold));
-        g.drawText("PAUSED", content_.removeFromTop(16), juce::Justification::centredRight);
+        g.drawText("PAUSED", content_.withHeight(16), juce::Justification::centredRight);   // (never take it from content_: paint runs again and again)
     }
 }
 

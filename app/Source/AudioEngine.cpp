@@ -317,7 +317,22 @@ void AudioEngine::setInputSelection(int firstChannel, int channels) {
 
 // ---- recording
 
+void AudioEngine::resetLivePeaks() {
+    // About 100 peaks a second; room for six hours.
+    if (livePeaks_.empty()) livePeaks_.assign(size_t(1) << 21, 0.0f);
+    peakChunk_ = juce::jmax(64, int(rate_ / 100.0));
+    peakFill_ = 0;
+    peakAcc_ = 0.0f;
+    peakCount_ = 0;
+}
+
+double AudioEngine::livePosition() const {
+    if (recording_ && !recWithPlayback_) return recStart_ + double(recSamples_.load()) / rate_;
+    return transport_.getCurrentPosition();
+}
+
 bool AudioEngine::openWriter(const juce::File& file, int channels, int bits, juce::String& error) {
+    resetLivePeaks();
     file.getParentDirectory().createDirectory();
     file.deleteFile();
     std::unique_ptr<juce::OutputStream> os(file.createOutputStream().release());
@@ -832,6 +847,20 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
                 for (int c = 0; c < 6; ++c) ch[c] = print ? tapBuf_.getReadPointer(juce::jmin(c, 1)) : inBuf_.getReadPointer(c);
                 recWriter_->write(ch, n);
                 recSamples_ += n;
+                // The take's level for the timeline, as it is written.
+                const int nc = print ? 2 : juce::jlimit(1, 6, recChannels_.load());
+                int count = peakCount_;
+                for (int i = 0; i < n; ++i) {
+                    float v = 0.0f;
+                    for (int c = 0; c < nc; ++c) v = juce::jmax(v, std::abs(ch[c][i]));
+                    peakAcc_ = juce::jmax(peakAcc_, v);
+                    if (++peakFill_ >= peakChunk_ && count < int(livePeaks_.size())) {
+                        livePeaks_[size_t(count++)] = peakAcc_;
+                        peakAcc_ = 0.0f;
+                        peakFill_ = 0;
+                    }
+                }
+                peakCount_ = count;
             }
         }
         if (((capture && !capLevelOnly_) || print) && capStarted_ && !capDone_) {

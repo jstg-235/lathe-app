@@ -66,7 +66,10 @@ PluginManagerPanel::PluginManagerPanel(PluginHost& host) : host_(host) {
     setSize(820, 600);
 }
 
-PluginManagerPanel::~PluginManagerPanel() { host_.known().removeChangeListener(this); }
+PluginManagerPanel::~PluginManagerPanel() {
+    host_.known().removeChangeListener(this);
+    closeList(table_);
+}
 
 void PluginManagerPanel::refresh() {
     const auto q = search_.getText().trim();

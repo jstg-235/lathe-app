@@ -17,6 +17,9 @@ class MarkInfoPanel : public juce::Component,
                       public juce::DragAndDropTarget {
 public:
     explicit MarkInfoPanel(Session& s);
+    // Close the list while this panel is still whole: a cell being edited at close otherwise
+    // reaches back into a half-destroyed list (a crash on macOS).
+    ~MarkInfoPanel() override { closeList(table_); }
     std::function<void()> onChange;                 // commit (undo + reload)
     std::function<void(double)> onPlay;             // play from a time
     std::function<void()> onSegmentsToMarks, onEditedBlack, onAnalogBlack, onAutoSpace, onLockAll;

@@ -178,6 +178,14 @@ public:
     // file's first sample was taken. Subtract nothing: the round trip is the caller's to add.
     juce::int64 recordStartSample() const { return recStartSample_; }
     juce::int64 recordedSamples() const { return recSamples_; }
+    // Where on the timeline "now" is while recording: the playhead when the session plays (print,
+    // capture), otherwise the take's start plus what has been recorded. For markers dropped live.
+    double livePosition() const;
+    // The take's level as it is written: one peak (0..1, all channels) per livePeakSamples() of the
+    // file, oldest first. Read up to livePeakCount() on the message thread; reset by each recording.
+    int livePeakCount() const { return peakCount_; }
+    float livePeak(int i) const { return juce::isPositiveAndBelow(i, peakCount_.load()) ? livePeaks_[size_t(i)] : 0.0f; }
+    int livePeakSamples() const { return peakChunk_; }
     double recordRate() const { return rate_; }
     // Round-trip latency the interface reports (output + input), in samples.
     int reportedRoundTrip() const;
@@ -391,6 +399,11 @@ private:
     std::atomic<juce::int64> capFrom_{0}, capEnd_{0}, capPost_{0};
     juce::int64 capTail_ = 0;     // audio thread: samples recorded after the range
     bool capStarted_ = false;     // audio thread: the transport has been seen playing
+    std::vector<float> livePeaks_;
+    std::atomic<int> peakCount_{0};
+    int peakChunk_ = 441, peakFill_ = 0;   // audio thread (set before a recording starts)
+    float peakAcc_ = 0.0f;
+    void resetLivePeaks();
     std::atomic<bool> recording_{false}, recWithPlayback_{false};
     std::atomic<double> recStart_{0.0};
     std::atomic<juce::int64> recSamples_{0}, recStartSample_{0};

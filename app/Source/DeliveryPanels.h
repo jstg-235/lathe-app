@@ -42,6 +42,9 @@ private:
 class TrackCreditsPanel : public juce::Component, public juce::TableListBoxModel {
 public:
     explicit TrackCreditsPanel(Session& s);
+    // Close the list while this panel is still whole: a cell being edited at close otherwise
+    // reaches back into a half-destroyed list (a crash on macOS).
+    ~TrackCreditsPanel() override { closeList(table_); }
     std::function<void()> onChange;
     void refresh() { table_.updateContent(); table_.repaint(); }
     void resized() override { table_.setBounds(getLocalBounds().reduced(8)); }
@@ -86,6 +89,9 @@ private:
 class ProductsPanel : public juce::Component, public juce::TableListBoxModel {
 public:
     ProductsPanel(Session& s, std::function<const dsp::LoudnessMap*()> loudness);
+    // Close the list while this panel is still whole: a cell being edited at close otherwise
+    // reaches back into a half-destroyed list (a crash on macOS).
+    ~ProductsPanel() override { closeList(units_); }
     std::function<void()> onChange;                          // commit (undo + reload)
     std::function<void(int productId, int breakIndex)> onEditBreak;
     std::function<void(double)> onLocate;

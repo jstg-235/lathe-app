@@ -272,7 +272,89 @@ std::pair<int, int> Timeline::crossfadeNear(double t) const {
     return best;
 }
 
+std::pair<int, int> Timeline::fadeNear(double t, int region) const {
+    std::pair<int, int> best{0, 0};
+    double bestD = 1e9;
+    auto consider = [&](std::pair<int, int> p, double at) {
+        if (region != 0 && p.first != region && p.second != region) return;
+        if (std::abs(at - t) < bestD - 1e-9) { bestD = std::abs(at - t); best = p; }
+    };
+    // Edits first, so an edit wins a tie with a region edge.
+    for (auto& a : s_.regions)
+        for (auto& b : s_.regions) {
+            if (a.id == b.id || a.lane != b.lane || !(b.start > a.start && b.start < a.end() + 1e-4) || b.end() <= a.end()) continue;
+            consider({a.id, b.id}, 0.5 * (b.start + juce::jmin(a.end(), b.end())));
+        }
+    for (auto& r : s_.regions) {
+        bool joinedIn = false, joinedOut = false;
+        for (auto& o : s_.regions) {
+            if (o.id == r.id || o.lane != r.lane) continue;
+            if (o.start < r.start && r.start < o.end() + 1e-4 && r.end() > o.end()) joinedIn = true;
+            if (o.start > r.start && o.start < r.end() + 1e-4 && o.end() > r.end()) joinedOut = true;
+        }
+        if (!joinedIn) consider({0, r.id}, r.start);
+        if (!joinedOut) consider({r.id, 0}, r.end());
+    }
+    return best;
+}
+
 // ---------------------------------------------------------------- painting
+
+void Timeline::paintLiveTake(juce::Graphics& g) {
+    if (!live_.active || live_.lane >= s_.lanes) return;
+    auto lb = laneBounds(live_.lane).reduced(0, 2);
+    bool lowerHalf = live_.underLane;
+    if (!lowerHalf)   // the lane already has audio here: keep it visible above
+        for (auto& r : s_.regions)
+            if (r.lane == live_.lane && r.end() > live_.start && r.start < live_.end) { lowerHalf = true; break; }
+    if (lowerHalf) lb = lb.withTop(lb.getCentreY());
+    const juce::Colour rec(0xffe0504a);
+    const float x0 = juce::jmax(0.0f, timeToX(live_.start)), x1 = juce::jmin(float(getWidth()), timeToX(juce::jmax(live_.start, live_.end)));
+    if (x1 > x0) {
+        auto box = juce::Rectangle<float>(x0, float(lb.getY()), juce::jmax(2.0f, x1 - x0), float(lb.getHeight()));
+        g.setColour(rec.withAlpha(0.18f));
+        g.fillRect(box);
+        // The level as it is written: one line per pixel column, the loudest peak in it.
+        const int count = live_.peakCount ? live_.peakCount() : 0;
+        if (count > 0 && live_.peak && live_.peakDt > 0) {
+            g.setColour(rec.brighter(0.3f).withAlpha(0.9f));
+            const float mid = box.getCentreY(), half = box.getHeight() * 0.45f;
+            for (int x = int(x0); x < int(x1); ++x) {
+                const double ta = xToTime(float(x)), tb = xToTime(float(x + 1));
+                int ka = int(std::floor((ta - live_.peaksT0) / live_.peakDt)), kb = int(std::ceil((tb - live_.peaksT0) / live_.peakDt));
+                ka = juce::jlimit(0, count, ka);
+                kb = juce::jlimit(ka, count, juce::jmax(ka + 1, kb));
+                float v = 0.0f;
+                for (int k = ka; k < kb && k < count; ++k) v = juce::jmax(v, live_.peak(k));
+                if (v > 0.0f) g.drawVerticalLine(x, mid - v * half, mid + v * half + 1.0f);
+            }
+        }
+        g.setColour(rec);
+        g.drawRect(box, 1.0f);
+        g.setFont(juce::FontOptions(11.5f, juce::Font::bold));
+        const auto label = juce::String::charToString(0x25cf) + " REC  " + live_.name + "  " + msfString(juce::jmax(0.0, live_.end - live_.start));
+        auto tag = box.reduced(2).withHeight(15.0f).withWidth(juce::jmin(box.getWidth() - 4.0f, 8.0f + 6.6f * float(label.length())));
+        g.setColour(colours::bg.withAlpha(0.85f));
+        g.fillRect(tag);
+        g.setColour(rec.brighter(0.4f));
+        g.drawText(label, tag.reduced(3, 0).toNearestInt(), juce::Justification::centredLeft, true);
+    }
+    // Markers dropped while recording: dashed until the take is placed.
+    for (auto& m : live_.marks) {
+        const float x = timeToX(m.t);
+        if (x < 0 || x > getWidth()) continue;
+        const juce::Colour c = m.type == Marker::TrackStart ? colours::marker
+                             : m.type == Marker::Index      ? colours::index
+                             : m.type == Marker::PauseStart ? colours::pause.brighter(0.4f)
+                                                            : colours::end;
+        g.setColour(c);
+        const float dash[] = {5.0f, 4.0f};
+        g.drawDashedLine(juce::Line<float>(x, float(kRuler), x, float(getHeight() - kScroll)), dash, 2, 1.5f);
+        g.setFont(juce::FontOptions(11.0f, juce::Font::bold));
+        g.drawText(m.type == Marker::TrackStart ? "T" : m.type == Marker::Index ? "I" : m.type == Marker::PauseStart ? "P" : "E",
+                   juce::Rectangle<float>(x + 2, float(kRuler) + 2, 14, 13), juce::Justification::left);
+    }
+}
 
 void Timeline::paintRuler(juce::Graphics& g) {
     auto r = getLocalBounds().removeFromTop(kRuler);
@@ -430,6 +512,7 @@ void Timeline::paint(juce::Graphics& g) {
                 g.drawLine(xa, lb.getBottom(), xb, lb.getY(), 1.0f);
             }
 
+    paintLiveTake(g);
     if (!selection().isEmpty()) {
         float a = timeToX(in_), b = timeToX(out_);
         g.setColour(colours::selection);
@@ -873,13 +956,23 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
         menu.addItem(5, "Clear gain envelope", !r->envelope.isEmpty());
         menu.addItem(6, "Select region range");
         menu.addItem(10, "Segment gain / polarity...");
+        {
+            const auto f = fadeNear(xToTime(float(p.x)), id);
+            menu.addItem(11, f.first && f.second ? "Edit Fade (this edit)..." : f.second ? "Edit Fade (fade-in)..." : "Edit Fade (fade-out)...");
+        }
         menu.addSeparator();
         menu.addItem(7, r->fxState.isNotEmpty() ? "Region effects... (active)" : "Region effects...");
         menu.addItem(8, "Restore (declick, denoise, hum)...");
         menu.addItem(9, "Spectral editor...");
-        menu.showMenuAsync({}, [this, id](int c) {
+        const double clickT = xToTime(float(p.x));
+        menu.showMenuAsync({}, [this, id, clickT](int c) {
             auto* rr = s_.findRegion(id);
             if (!rr || c == 0) return;
+            if (c == 11) {
+                const auto f = fadeNear(clickT, id);
+                if ((f.first || f.second) && onCrossfade) onCrossfade(f.first, f.second);
+                return;
+            }
             if (c == 7) { if (onRegionFx) onRegionFx(id); return; }
             if (c == 8) { selRegion_ = id; if (onRegionRestore) onRegionRestore(id); return; }
             if (c == 9) { selRegion_ = id; if (onRegionSpectral) onRegionSpectral(id); return; }
@@ -1070,6 +1163,13 @@ void Timeline::mouseDoubleClick(const juce::MouseEvent& e) {
             }
     if (int id = regionAt(e.getPosition())) {
         auto* r = s_.findRegion(id);
+        // Double-click a region's own fade (or right at its start or end): Edit Fade for that fade.
+        const auto f = s_.fadesFor(s_.indexOfRegion(id));
+        const double grab = 8.0 / pps_;
+        if (t <= r->start + juce::jmax(grab, f.inOffset + f.in) || t >= r->end() - juce::jmax(grab, f.outOffset + f.out)) {
+            const auto p = fadeNear(t, id);
+            if ((p.first || p.second) && onCrossfade) { onCrossfade(p.first, p.second); return; }
+        }
         setSelection({r->start, r->end()});
     }
 }

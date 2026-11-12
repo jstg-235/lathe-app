@@ -35,4 +35,18 @@ inline void styleButton(juce::Button& b, bool accent = false) {
     b.setColour(juce::TextButton::textColourOffId, colours::text);
     b.setColour(juce::TextButton::textColourOnId, colours::bg);
 }
+// Tears a list down safely before its owner (usually also its model) is destroyed: finishes any
+// cell being edited, gives up keyboard focus, then removes the rows while everything is intact.
+inline void giveUpListFocus(juce::ListBox& list) {
+    if (auto* f = juce::Component::getCurrentlyFocusedComponent(); f && (f == &list || list.isParentOf(f))) f->giveAwayKeyboardFocus();
+}
+inline void closeList(juce::ListBox& list) {
+    giveUpListFocus(list);
+    list.setModel(nullptr);
+}
+inline void closeList(juce::TableListBox& table) {
+    giveUpListFocus(table);
+    table.setModel(nullptr);
+}
+
 }  // namespace lathe

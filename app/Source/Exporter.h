@@ -98,8 +98,9 @@ public:
     // One stretch of the programme (a segment, or an In-Out) to a WAV at the project rate, through
     // the master chain like the full programme (a second of pre-roll warms the chain up). A 5.1
     // programme is written as a six-channel WAV (L R C LFE Ls Rs) without the stereo master chain.
+    // With outRate (stereo only), the WAV is made at that rate instead (resampled after the chain).
     juce::String exportRangeWav(const Session& s, const juce::File& file, int bits, const ExportSettings& es, juce::Range<double> range,
-                                const Keep& keepGoing);
+                                const Keep& keepGoing, double outRate = 0);
     // Renders all selected deliverables into `folder` (created), with a QC + checksum report.
     BatchResult batchRender(const Session& s, const BatchSettings& bs, const juce::File& folder, const ExportSettings& es,
                             const Keep& keepGoing);

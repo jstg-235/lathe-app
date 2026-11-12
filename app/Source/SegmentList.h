@@ -12,6 +12,9 @@ namespace lathe {
 class SegmentListPanel : public juce::Component, public juce::TableListBoxModel {
 public:
     explicit SegmentListPanel(Session& s);
+    // Close the list while this panel is still whole: a cell being edited at close otherwise
+    // reaches back into a half-destroyed list (a crash on macOS).
+    ~SegmentListPanel() override { closeList(table_); }
     std::function<void(juce::Array<int> ids)> onGain;   // open Segment Gain for these regions
     std::function<void(double)> onLocate;
     std::function<void(int id)> onSelect;

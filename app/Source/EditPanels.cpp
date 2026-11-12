@@ -63,6 +63,27 @@ void applyFadePreset(Session& s, int outgoing, int incoming, const FadePreset& p
     a->fadeOut = b->fadeIn = 0;   // follow the overlap
 }
 
+void applySingleFadePreset(Session& s, int region, bool fadeIn, const FadePreset& p) {
+    auto* r = s.findRegion(region);
+    if (!r) return;
+    const double len = juce::jlimit(0.0, r->length(), p.length);
+    if (fadeIn) {
+        r->fadeIn = len;
+        r->fadeInManual = true;
+        r->fadeInOffset = 0;
+        r->fadeInShape = p.inShape;
+        r->fadeInDb = p.inDb;
+        r->fadeInAlpha = p.inAlpha;
+    } else {
+        r->fadeOut = len;
+        r->fadeOutManual = true;
+        r->fadeOutOffset = 0;
+        r->fadeOutShape = p.outShape;
+        r->fadeOutDb = p.outDb;
+        r->fadeOutAlpha = p.outAlpha;
+    }
+}
+
 juce::var FadeEditorPrefs::toVar() const {
     auto* o = new juce::DynamicObject();
     o->setProperty("lockSound", lockSound);
@@ -142,6 +163,19 @@ CrossfadeEditor::CrossfadeEditor(Session& s, ThumbPool& pool, juce::AudioFormatM
 
     setupSide(o_, true);
     setupSide(i_, false);
+    if (single()) {
+        // One fade: no crossfade length, Lock Sound, ripple, Power Lock or Align; only its side.
+        for (auto* c : std::initializer_list<juce::Component*>{&length_, &lenLbl_, &lockSound_, &rippleLbl_, &ripple_, &powerLock_, &align_}) c->setVisible(false);
+        Side& gone = out_ ? i_ : o_;
+        for (auto* c : std::initializer_list<juce::Component*>{&gone.title, &gone.shapeLbl, &gone.lenLbl, &gone.offLbl, &gone.dbLbl, &gone.alphaLbl, &gone.editLbl,
+                                                               &gone.slipLbl, &gone.shape, &gone.len, &gone.off, &gone.db, &gone.alpha, &gone.editL, &gone.editR,
+                                                               &gone.slipL, &gone.slipR, &gone.toEdit})
+            c->setVisible(false);
+        (out_ ? o_ : i_).title.setText(out_ ? "FADE-OUT" : "FADE-IN", juce::dontSendNotification);
+        (out_ ? o_ : i_).len.setTooltip("The fade's length");
+        (out_ ? o_ : i_).editLbl.setText("End", juce::dontSendNotification);
+        if (in_) i_.editLbl.setText("Start", juce::dontSendNotification);
+    }
 
     length_.onValueChange = [this] {
         if (updating_) return;
@@ -177,12 +211,27 @@ CrossfadeEditor::CrossfadeEditor(Session& s, ThumbPool& pool, juce::AudioFormatM
         changed(false);
     };
     audition_.onClick = [this] {
+        if (!onAudition) return;
+        if (single()) {
+            if (auto* r = only()) {
+                const auto f = s_.fadesFor(s_.indexOfRegion(r->id));
+                if (in_) onAudition(r->start - 1.0, r->start + f.inOffset + f.in + 2.0);
+                else onAudition(r->end() - f.outOffset - f.out - 2.0, r->end() + 1.0);
+            }
+            return;
+        }
         auto* a = s_.findRegion(out_);
         auto* b = s_.findRegion(in_);
-        if (a && b && onAudition) onAudition(b->start - 2.0, a->end() + 2.0);
+        if (a && b) onAudition(b->start - 2.0, a->end() + 2.0);
     };
-    pre_.onClick = [this] { if (auto* b = s_.findRegion(in_); b && onAudition) onAudition(b->start - 3.0, b->start); };
-    post_.onClick = [this] { if (auto* a = s_.findRegion(out_); a && onAudition) onAudition(a->end(), a->end() + 3.0); };
+    pre_.onClick = [this] {
+        if (single()) { if (onAudition && only()) onAudition(edge() - 3.0, edge()); return; }
+        if (auto* b = s_.findRegion(in_); b && onAudition) onAudition(b->start - 3.0, b->start);
+    };
+    post_.onClick = [this] {
+        if (single()) { if (onAudition && only()) onAudition(edge(), edge() + 3.0); return; }
+        if (auto* a = s_.findRegion(out_); a && onAudition) onAudition(a->end(), a->end() + 3.0);
+    };
     libApply_.onClick = [this] { recall(libSlot_.getSelectedId() - 1); };
     libSave_.onClick = [this] {
         const int slot = libSlot_.getSelectedId() - 1;
@@ -194,9 +243,27 @@ CrossfadeEditor::CrossfadeEditor(Session& s, ThumbPool& pool, juce::AudioFormatM
         w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
         w->enterModalState(true, juce::ModalCallbackFunction::create([this, w, slot](int r) {
             std::unique_ptr<juce::AlertWindow> owner(w);
+            if (r != 1) return;
+            if (single()) {
+                // One fade: its length and shape, for either side.
+                auto* reg = only();
+                if (!reg) return;
+                const auto f = s_.fadesFor(s_.indexOfRegion(reg->id));
+                FadePreset p;
+                p.name = w->getTextEditorContents("name").trim();
+                p.length = in_ ? f.in : f.out;
+                p.inShape = p.outShape = in_ ? f.inShape : f.outShape;
+                p.inDb = p.outDb = in_ ? f.inDb : f.outDb;
+                p.inAlpha = p.outAlpha = in_ ? f.inAlpha : f.outAlpha;
+                p.used = true;
+                lib_[size_t(slot)] = p;
+                libSlot_.changeItemText(slot + 1, juce::String(slot) + "  " + p.name);
+                if (onLibraryChanged) onLibraryChanged();
+                return;
+            }
             auto* a = s_.findRegion(out_);
             auto* b = s_.findRegion(in_);
-            if (r != 1 || !a || !b) return;
+            if (!a || !b) return;
             const int ia = s_.indexOfRegion(out_), ib = s_.indexOfRegion(in_);
             const auto fa = s_.fadesFor(ia), fb = s_.fadesFor(ib);
             FadePreset p;
@@ -214,8 +281,8 @@ CrossfadeEditor::CrossfadeEditor(Session& s, ThumbPool& pool, juce::AudioFormatM
             if (onLibraryChanged) onLibraryChanged();
         }), false);
     };
-    pool_.get(s_.findRegion(out_)->file, this);
-    pool_.get(s_.findRegion(in_)->file, this);
+    if (auto* a = s_.findRegion(out_)) pool_.get(a->file, this);
+    if (auto* b = s_.findRegion(in_)) pool_.get(b->file, this);
     refreshControls();
     setSize(980, 680);
     startTimer(30);
@@ -270,6 +337,28 @@ void CrossfadeEditor::setupSide(Side& sd, bool outgoing) {
 
 void CrossfadeEditor::sideParamChanged(bool outgoing) {
     if (updating_) return;
+    if (single()) {
+        auto* r = s_.findRegion(outgoing ? out_ : in_);
+        if (!r) return;
+        Side& sd = outgoing ? o_ : i_;
+        const auto f = s_.fadesFor(s_.indexOfRegion(r->id));
+        const double len = sd.len.getValue() / 1000.0;
+        if (outgoing) {
+            if (std::abs(len - f.out) > 1e-5) { r->fadeOut = len; r->fadeOutManual = true; }
+            r->fadeOutOffset = sd.off.getValue() / 1000.0;
+            r->fadeOutShape = FadeShape(sd.shape.getSelectedId() - 1);
+            r->fadeOutDb = sd.db.getValue();
+            r->fadeOutAlpha = sd.alpha.getValue();
+        } else {
+            if (std::abs(len - f.in) > 1e-5) { r->fadeIn = len; r->fadeInManual = true; }
+            r->fadeInOffset = sd.off.getValue() / 1000.0;
+            r->fadeInShape = FadeShape(sd.shape.getSelectedId() - 1);
+            r->fadeInDb = sd.db.getValue();
+            r->fadeInAlpha = sd.alpha.getValue();
+        }
+        changed(false);
+        return;
+    }
     auto* a = s_.findRegion(out_);
     auto* b = s_.findRegion(in_);
     if (!a || !b) return;
@@ -310,6 +399,7 @@ void CrossfadeEditor::nudgeEdit(bool outgoing, int dir) {
 void CrossfadeEditor::nudgeSlip(bool outgoing, int dir) {
     // "<" plays later material earlier: the audio moves left under the fixed edit point.
     s_.slip(outgoing ? out_ : in_, -dir * prefs_.nudge[prefs_.nudgeSize]);
+    if (single()) { changed(prefs_.autoAudition, only() ? edge() : -1); return; }
     auto* a = s_.findRegion(out_);
     auto* b = s_.findRegion(in_);
     changed(prefs_.autoAudition, a && b ? 0.5 * (b->start + a->end()) : -1);
@@ -326,17 +416,36 @@ void CrossfadeEditor::changed(bool audition, double at) {
 
 void CrossfadeEditor::recall(int slot) {
     if (!juce::isPositiveAndBelow(slot, 10) || !lib_[size_t(slot)].used) return;
-    applyFadePreset(s_, out_, in_, lib_[size_t(slot)], prefs_.lockSound, prefs_.ripple);
+    if (single()) applySingleFadePreset(s_, out_ ? out_ : in_, in_ != 0, lib_[size_t(slot)]);
+    else applyFadePreset(s_, out_, in_, lib_[size_t(slot)], prefs_.lockSound, prefs_.ripple);
     changed(false);
 }
 
+const Region* CrossfadeEditor::only() const { return single() ? s_.findRegion(out_ ? out_ : in_) : nullptr; }
+
+double CrossfadeEditor::edge() const {
+    auto* r = only();
+    return r ? (in_ ? r->start : r->end()) : 0.0;
+}
+
 double CrossfadeEditor::overlap() const {
+    if (single()) return 0.0;
     auto* a = s_.findRegion(out_);
     auto* b = s_.findRegion(in_);
     return a && b ? juce::jmax(0.0, a->end() - b->start) : 0.0;
 }
 
 juce::Range<double> CrossfadeEditor::viewRange() const {
+    if (single()) {
+        auto* r = only();
+        if (!r) return {0, 1};
+        const auto f = s_.fadesFor(s_.indexOfRegion(r->id));
+        const double len = in_ ? f.inOffset + f.in : f.outOffset + f.out;
+        // The fade and some silence (or the material) on the other side of the edge.
+        const double c = in_ ? r->start + len / 2 : r->end() - len / 2;
+        const double span = prefs_.autoZoom ? juce::jmax(0.2, len * 2.5) : zoomSpan_;
+        return {c - span / 2, c + span / 2};
+    }
     auto* a = s_.findRegion(out_);
     auto* b = s_.findRegion(in_);
     if (!a || !b) return {0, 1};
@@ -363,8 +472,7 @@ void CrossfadeEditor::refreshControls() {
                              (std::abs(v * 75 - std::round(v * 75)) < 1e-6 && v < 1 ? juce::String(juce::roundToInt(v * 75)) + "f" : juce::String(v * 1000, v < 0.01 ? 1 : 0) + "ms"));
     }
     const int ia = s_.indexOfRegion(out_), ib = s_.indexOfRegion(in_);
-    if (ia >= 0 && ib >= 0) {
-        const auto fa = s_.fadesFor(ia), fb = s_.fadesFor(ib);
+    {
         auto set = [](Side& sd, FadeShape sh, double len, double off, double db, double alpha) {
             sd.shape.setSelectedId(int(sh) + 1, juce::dontSendNotification);
             sd.len.setValue(len * 1000.0, juce::dontSendNotification);
@@ -375,8 +483,14 @@ void CrossfadeEditor::refreshControls() {
             sd.db.setEnabled(custom);
             sd.alpha.setEnabled(custom);
         };
-        set(o_, fa.outShape, fa.out, fa.outOffset, fa.outDb, fa.outAlpha);
-        set(i_, fb.inShape, fb.in, fb.inOffset, fb.inDb, fb.inAlpha);
+        if (ia >= 0) {
+            const auto fa = s_.fadesFor(ia);
+            set(o_, fa.outShape, fa.out, fa.outOffset, fa.outDb, fa.outAlpha);
+        }
+        if (ib >= 0) {
+            const auto fb = s_.fadesFor(ib);
+            set(i_, fb.inShape, fb.in, fb.inOffset, fb.inDb, fb.inAlpha);
+        }
     }
     updating_ = false;
 }
@@ -390,7 +504,8 @@ void CrossfadeEditor::renderResult() {
     resultDirty_ = false;
     auto* a = s_.findRegion(out_);
     auto* b = s_.findRegion(in_);
-    if (!a || !b) return;
+    if (!a && !b) return;
+    const Region* any = a ? a : b;
     const auto area = waveArea();
     const int cols = juce::jmax(1, area.getWidth());
     const auto vr = viewRange();
@@ -399,7 +514,7 @@ void CrossfadeEditor::renderResult() {
     lane.lanes = 1;
     lane.projectRate = s_.effectiveRate();
     for (auto r : s_.regions)
-        if (r.lane == a->lane) { r.lane = 0; r.fxState = {}; lane.regions.add(r); }
+        if (r.lane == any->lane) { r.lane = 0; r.fxState = {}; lane.regions.add(r); }
     const double rate = vr.getLength() > 20 ? 4000.0 : vr.getLength() > 4 ? 11025.0 : 44100.0;
     ProgramRenderer pr(formats_);
     pr.setSession(lane, rate);
@@ -434,6 +549,16 @@ void CrossfadeEditor::renderResult() {
         for (int k = i0; k < i1; ++k) sum += 0.5 * (double(buf.getSample(0, k)) * buf.getSample(0, k) + double(buf.getSample(1, k)) * buf.getSample(1, k));
         return std::sqrt(sum / (i1 - i0));
     };
+    if (!a || !b) {
+        // One fade: where it is and how long; no level dip to measure.
+        const auto f = s_.fadesFor(s_.indexOfRegion(any->id));
+        const double len = b ? f.in : f.out, off = b ? f.inOffset : f.outOffset;
+        info_.setText((b ? "Fade-in at " + msfString(any->start) : "Fade-out ending at " + msfString(any->end())) + "   length " +
+                          juce::String(len * 1000.0, 1) + " ms" + (off > 0 ? "   offset " + juce::String(off * 1000.0, 1) + " ms" : juce::String()),
+                      juce::dontSendNotification);
+        repaint();
+        return;
+    }
     const double xs = juce::jmin(b->start, a->end()), xe = juce::jmax(a->end(), b->start);
     const double w = juce::jmax(0.02, xe - xs);
     const double before = rmsOver(xs - w, xs), mid = rmsOver(xs, juce::jmax(xe, xs + 0.005)), after = rmsOver(xe, xe + w);
@@ -517,6 +642,10 @@ void CrossfadeEditor::resized() {
     lastRow.removeFromLeft(6);
     libSave_.setBounds(lastRow.removeFromLeft(110));
     bottom.removeFromBottom(6);
+    if (single()) {
+        layoutSide(out_ ? o_ : i_, bottom.removeFromLeft(bottom.getWidth() / 2 - 10));
+        return;
+    }
     const int half = bottom.getWidth() / 2;
     layoutSide(o_, bottom.removeFromLeft(half - 10));
     bottom.removeFromLeft(20);
@@ -573,7 +702,8 @@ void CrossfadeEditor::paintSide(juce::Graphics& g, juce::Rectangle<int> area, co
     g.setColour(juce::Colour(0xffe8c547));
     g.drawLine(xOf(ep), float(area.getY()), xOf(ep), float(area.getBottom()), 1.5f);
     g.setColour(colours::dim);
-    g.drawText((outgoing ? "OUTGOING  " : "INCOMING  ") + r.name, area.reduced(6, 4), juce::Justification::topLeft);
+    g.drawText((single() ? (outgoing ? "FADE-OUT  " : "FADE-IN  ") : (outgoing ? "OUTGOING  " : "INCOMING  ")) + r.name, area.reduced(6, 4),
+               juce::Justification::topLeft);
 }
 
 void CrossfadeEditor::paintResult(juce::Graphics& g, juce::Rectangle<int> area, double t0, double t1) {
@@ -597,6 +727,28 @@ void CrossfadeEditor::paint(juce::Graphics& g) {
     g.fillAll(colours::panel);
     auto* a = s_.findRegion(out_);
     auto* b = s_.findRegion(in_);
+    if (single()) {
+        auto* r = only();
+        if (!r) return;
+        auto area = waveArea();
+        const auto vr = viewRange();
+        const double t0 = vr.getStart(), t1 = vr.getEnd();
+        const int h = (area.getHeight() - 4) / 2;
+        paintSide(g, area.removeFromTop(h), *r, out_ != 0, t0, t1);
+        area.removeFromTop(4);
+        paintResult(g, area, t0, t1);
+        auto full = waveArea();
+        auto xOf = [&](double t) { return float(full.getX() + (t - t0) / (t1 - t0) * full.getWidth()); };
+        const auto f = s_.fadesFor(s_.indexOfRegion(r->id));
+        const double xs = in_ ? r->start + f.inOffset : r->end() - f.outOffset - f.out, xe = xs + (in_ ? f.in : f.out);
+        g.setColour(colours::accent.withAlpha(0.12f));
+        g.fillRect(juce::Rectangle<float>(xOf(xs), float(full.getY()), juce::jmax(1.0f, xOf(xe) - xOf(xs)), float(full.getHeight())));
+        if (playhead_ >= t0 && playhead_ <= t1) {
+            g.setColour(colours::text);
+            g.drawVerticalLine(int(xOf(playhead_)), float(full.getY()), float(full.getBottom()));
+        }
+        return;
+    }
     if (!a || !b) return;
     auto area = waveArea();
     const auto vr = viewRange();

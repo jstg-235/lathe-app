@@ -28,6 +28,8 @@ FadeLibrary defaultFadeLibrary();
 // Applies a preset to the edit between `outgoing` and `incoming`. With lockSound the edit is
 // re-centred by trimming (nothing moves); otherwise the incoming side moves per `ripple`.
 void applyFadePreset(Session& s, int outgoing, int incoming, const FadePreset& p, bool lockSound, Session::Ripple ripple);
+// Applies a preset to one region's own fade-in (or fade-out): its length and that side's shape.
+void applySingleFadePreset(Session& s, int region, bool fadeIn, const FadePreset& p);
 
 // Editor options, kept between sessions by the main window.
 struct FadeEditorPrefs {
@@ -40,6 +42,8 @@ struct FadeEditorPrefs {
     void fromVar(const juce::var& v);
 };
 
+// With both regions it edits the crossfade between them. With only one (the other id 0) it edits
+// that region's own fade: outgoing alone = its fade-out, incoming alone = its fade-in.
 class CrossfadeEditor : public juce::Component, public juce::ChangeListener, private juce::Timer {
 public:
     CrossfadeEditor(Session& s, ThumbPool& pool, juce::AudioFormatManager& formats, FadeEditorPrefs& prefs, FadeLibrary& lib,
@@ -50,6 +54,10 @@ public:
     void setPlayhead(double t) { playhead_ = t; repaint(); }
     int outgoing() const { return out_; }
     int incoming() const { return in_; }
+    bool single() const { return out_ == 0 || in_ == 0; }
+    Session& session() const { return s_; }
+    // The regions it edits still exist (after an undo, say).
+    bool stillValid() const { return (out_ == 0 || s_.findRegion(out_)) && (in_ == 0 || s_.findRegion(in_)) && (out_ || in_); }
     void recall(int slot);   // apply a library slot to this edit
     void refresh() { refreshControls(); resultDirty_ = true; startTimer(60); repaint(); }
 
@@ -75,6 +83,8 @@ private:
     void nudgeSlip(bool outgoing, int dir);
     void renderResult();
     double overlap() const;
+    const Region* only() const;   // the region of a single fade
+    double edge() const;          // where a single fade sits: the region's start or end
     juce::Range<double> viewRange() const;
     void paintSide(juce::Graphics&, juce::Rectangle<int> area, const Region& r, bool outgoing, double t0, double t1);
     void paintResult(juce::Graphics&, juce::Rectangle<int> area, double t0, double t1);

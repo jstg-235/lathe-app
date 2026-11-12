@@ -64,7 +64,7 @@ void runJob(const juce::String& title, std::function<void(Job&)> work, std::func
 
 class XfadeWindow : public juce::DocumentWindow {
 public:
-    XfadeWindow(juce::Component* c) : DocumentWindow("Crossfade Editor", colours::bg, DocumentWindow::closeButton) {
+    XfadeWindow(juce::Component* c) : DocumentWindow("Edit Fade", colours::bg, DocumentWindow::closeButton) {
         setUsingNativeTitleBar(true);
         setContentOwned(c, true);
         setResizable(true, false);
@@ -148,10 +148,8 @@ MainComponent::MainComponent() {
             timeline_.resized();
         });
     };
-    xfadeBtn_.onClick = [this] {
-        auto p = timeline_.crossfadeNear(engine_.isPlaying() ? engine_.positionSeconds() : timeline_.editPoint());
-        if (p.first) openCrossfade(p.first, p.second);
-    };
+    xfadeBtn_.onClick = [this] { openFadeNearEditPoint(); };
+    xfadeBtn_.setTooltip("Edit Fade (X) for the edit, or the region fade-in / fade-out, nearest the Edit Point. Or double-click a join or a region's start or end.");
     trackMk_.onClick = [this] { addMarkerAtPlayhead(Marker::TrackStart); };
     indexMk_.onClick = [this] { addMarkerAtPlayhead(Marker::Index); };
     pauseMk_.onClick = [this] { addMarkerAtPlayhead(Marker::PauseStart); };
@@ -223,7 +221,7 @@ MainComponent::MainComponent() {
         st.onSrpEdit = [this](int id) { editSrpText(true, id); };
         st.onSegmentGain = [this](int id) { setActiveTimeline(true); showSegmentGain({id}); };
         st.onLaneMenu = [this](int lane) { showLaneMenu(true, lane); };
-        st.onCrossfade = [this](int, int) {};
+        st.onCrossfade = [this](int a, int b) { setActiveTimeline(true); openCrossfade(a, b, true); };
     }
     timeline_.onFocus = [this] { setActiveTimeline(false); };
     timeline_.onSrpEdit = [this](int id) { editSrpText(false, id); };
@@ -232,7 +230,7 @@ MainComponent::MainComponent() {
 
     timeline_.onEdit = [this] { sessionChanged(); };
     timeline_.onSeek = [this](double t) { auditionEnd_ = -1; engine_.setPositionSeconds(t); timeline_.setPlayhead(t, false); };
-    timeline_.onCrossfade = [this](int a, int b) { openCrossfade(a, b); };
+    timeline_.onCrossfade = [this](int a, int b) { setActiveTimeline(false); openCrossfade(a, b); };
     timeline_.onBreakEdit = [this](int pid, int k) { openBreakEditor(pid, k); };
     timeline_.onProductsEdited = [this] { if (productsPanel_) productsPanel_->refresh(); };
     timeline_.onProductMenu = [this](int pid, double t, int k) { showProductStripMenu(pid, t, k); };
@@ -319,6 +317,32 @@ MainComponent::MainComponent() {
     issues_.setColour(juce::TextEditor::textColourId, colours::text);
     issues_.setColour(juce::TextEditor::outlineColourId, colours::line);
     addAndMakeVisible(issues_);
+    addAndMakeVisible(tcStrip_);
+    tcStrip_.setUnits(TimecodeStrip::Units(juce::jlimit(0, TimecodeStrip::kNumUnits - 1, props_.getUserSettings()->getIntValue("timecodeUnits", 0))));
+    tcStrip_.onUnitsChanged = [this](TimecodeStrip::Units u) { props_.getUserSettings()->setValue("timecodeUnits", int(u)); };
+    tcStrip_.onSetMain = [this](double t) {
+        if (takeInProgress()) return;
+        if (sourceActive_) {
+            sourceView_.timeline().setEditPoint(t, true);
+            engine_.setSourcePosition(t);
+            sourceView_.timeline().setPlayhead(t, false);
+        } else {
+            locateDest(t);
+        }
+    };
+    tcStrip_.onSetIn = [this](double t) { activeTimeline().setInPoint(t); };
+    tcStrip_.onSetOut = [this](double t) { activeTimeline().setOutPoint(t); };
+    tcStrip_.onSetDuration = [this](double d) {
+        auto& tl = activeTimeline();
+        if (tl.inPoint() >= 0 && d > 0) tl.setOutPoint(tl.inPoint() + d);
+    };
+    timeDisplay_.setVisible(false);   // (the timecode strip shows it now)
+    selDisplay_.setVisible(false);
+    issuesLbl_.setText("PROBLEMS & NOTES", juce::dontSendNotification);
+    issuesLbl_.setFont(juce::FontOptions(11.5f, juce::Font::bold));
+    issuesLbl_.setColour(juce::Label::textColourId, colours::dim);
+    issuesLbl_.setBorderSize({0, 2, 0, 2});
+    addAndMakeVisible(issuesLbl_);
 
     for (auto* l : {&timeDisplay_, &trackDisplay_, &rateWarning_, &selDisplay_}) {
         l->setColour(juce::Label::textColourId, colours::text);
@@ -366,6 +390,7 @@ MainComponent::MainComponent() {
     if (auto xml = props_.getUserSettings()->getXmlValue("keyMappings")) commands_.getKeyMappings()->restoreFromXml(*xml);
     commands_.getKeyMappings()->addChangeListener(this);
     addKeyListener(commands_.getKeyMappings());
+    engine_.chain().windowKeys = commands_.getKeyMappings();
     setApplicationCommandManagerToWatch(&commands_);
 #if JUCE_MAC
     juce::MenuBarModel::setMacMainMenu(this);
@@ -392,11 +417,13 @@ MainComponent::~MainComponent() {
 #endif
     commands_.getKeyMappings()->removeChangeListener(this);
     removeKeyListener(commands_.getKeyMappings());
+    engine_.chain().closeAllEditors();
+    engine_.chain().windowKeys = nullptr;
     xfadeWindow_.reset();
     engine_.devices().removeChangeListener(this);
     engine_.chain().closeAllEditors();
-    pqList_.setModel(nullptr);
-    chainList_.setModel(nullptr);
+    closeList(pqList_);
+    closeList(chainList_);
 }
 
 void MainComponent::paint(juce::Graphics& g) { g.fillAll(colours::bg); }
@@ -434,21 +461,26 @@ void MainComponent::resized() {
     r.removeFromRight(8);
     meters_->setBounds(right.removeFromTop(176));
     right.removeFromTop(8);
+    // Top to bottom: meters, (compare banner), the plugin list with its buttons right under it,
+    // then the problems and notes.
+    issues_.setBounds(right.removeFromBottom(160));
+    issuesLbl_.setBounds(right.removeFromBottom(18));
+    right.removeFromBottom(6);
     auto chainButtons = right.removeFromBottom(26);
     for (auto* b : {&chainAdd_, &chainRemove_, &chainBypass_, &chainUp_, &chainDown_}) {
         b->setBounds(chainButtons.removeFromLeft(56));
         chainButtons.removeFromLeft(4);
     }
-    right.removeFromBottom(6);
-    issues_.setBounds(right.removeFromBottom(160));
-    right.removeFromBottom(6);
+    right.removeFromBottom(4);
     if (compare_) {
         compareBar_.setBounds(right.removeFromTop(62));
         right.removeFromTop(4);
     }
     chainList_.setBounds(right);
 
-    sourceView_.setBounds(r.removeFromTop(juce::jlimit(170, 260, r.getHeight() / 4)));
+    tcStrip_.setBounds(r.removeFromTop(64));
+    r.removeFromTop(6);
+    sourceView_.setBounds(r.removeFromTop(juce::jlimit(150, 260, r.getHeight() / 4)));
     r.removeFromTop(6);
 
     auto transport = r.removeFromTop(34);
@@ -458,7 +490,7 @@ void MainComponent::resized() {
     transport.removeFromLeft(4);
     recordBtn_.setBounds(transport.removeFromLeft(50).reduced(0, 3));
     transport.removeFromLeft(10);
-    timeDisplay_.setBounds(transport.removeFromLeft(150));
+    timeDisplay_.setBounds({});
     // Buttons first; the track readout takes what is left.
     for (auto* b : {&zoomFit_, &zoomIn_, &zoomOut_}) { b->setBounds(transport.removeFromRight(b == &zoomFit_ ? 40 : 28).reduced(0, 3)); transport.removeFromRight(3); }
     transport.removeFromRight(6);
@@ -468,7 +500,7 @@ void MainComponent::resized() {
     }
     trackDisplay_.setBounds(transport.removeFromLeft(juce::jmin(170, transport.getWidth())));
     abDisplay_.setBounds(transport.removeFromLeft(juce::jmin(260, transport.getWidth() / 2)));
-    selDisplay_.setBounds(transport.removeFromLeft(transport.getWidth() / 2));
+    selDisplay_.setBounds({});
     rateWarning_.setBounds(transport);
 
     pqList_.setBounds(r.removeFromBottom(200));
@@ -553,6 +585,9 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::exportTrackWavs: exportTrackWavs(); break;
         case cmd::exportProgram24:
         case cmd::exportProgram32: showExportMenu(); break;
+        case cmd::exportInOut: exportInOut(); break;
+        case cmd::exportTracksAs: deliver("every track", trackItems(session_), false); break;
+        case cmd::exportProgrammeAs: deliver("the whole programme", {programmeItem(session_)}, false); break;
         case cmd::undo: undo(); break;
         case cmd::redo: redo(); break;
         case cmd::splitAtPlayhead: splitAtPlayhead(); break;
@@ -722,9 +757,11 @@ bool MainComponent::perform(const InvocationInfo& info) {
             const int slot = int(info.commandID - cmd::fadeRecall0);
             if (!fadeLib_[size_t(slot)].used) break;
             if (xfadeEditor_ && xfadeWindow_) { xfadeEditor_->recall(slot); break; }
-            auto p = timeline_.crossfadeNear(engine_.isPlaying() ? engine_.positionSeconds() : timeline_.editPoint());
-            if (!p.first) break;
-            applyFadePreset(session_, p.first, p.second, fadeLib_[size_t(slot)], fadePrefs_.lockSound, fadePrefs_.ripple);
+            auto& tl = activeTimeline();
+            auto p = tl.fadeNear(tl.editPoint());
+            if (!p.first && !p.second) break;
+            if (p.first && p.second) applyFadePreset(activeSession(), p.first, p.second, fadeLib_[size_t(slot)], fadePrefs_.lockSound, fadePrefs_.ripple);
+            else applySingleFadePreset(activeSession(), p.first ? p.first : p.second, p.second != 0, fadeLib_[size_t(slot)]);
             sessionChanged();
             break;
         }
@@ -888,7 +925,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             m.addSeparator();
             add({cmd::batchRender});
             m.addSeparator();
-            add({cmd::exportDdp, cmd::exportTrackWavs, cmd::exportProgram24, cmd::exportSegments});
+            add({cmd::exportDdp, cmd::exportTrackWavs, cmd::exportProgram24, cmd::exportTracksAs, cmd::exportProgrammeAs, cmd::exportInOut, cmd::exportSegments});
             break;
         case 1:
             add({cmd::undo, cmd::redo});
@@ -1260,6 +1297,9 @@ void MainComponent::showBatchDialog() {
 namespace {
 class AnalysisView : public juce::Component, private juce::ListBoxModel {
 public:
+    // Close the list while this panel is still whole: a cell being edited at close otherwise
+    // reaches back into a half-destroyed list (a crash on macOS).
+    ~AnalysisView() override { closeList(list_); }
     AnalysisView(std::shared_ptr<dsp::AnalysisResult> a, std::function<void(double)> locate) : a_(std::move(a)), locate_(std::move(locate)) {
         summary_.setMultiLine(true);
         summary_.setReadOnly(true);
@@ -1306,6 +1346,9 @@ private:
 
 class ReferencePanel : public juce::Component, private juce::ListBoxModel, private juce::Timer {
 public:
+    // Close the list while this panel is still whole: a cell being edited at close otherwise
+    // reaches back into a half-destroyed list (a crash on macOS).
+    ~ReferencePanel() override { closeList(list_); }
     ReferencePanel(Session& s, AudioEngine& e, std::function<void(int)> select, std::function<void()> add, std::function<void(int)> remove,
                    std::function<void()> changed, std::function<juce::String()> status)
         : s_(s), e_(e), select_(std::move(select)), add_(std::move(add)), remove_(std::move(remove)), changed_(std::move(changed)),
@@ -1812,6 +1855,7 @@ void MainComponent::beginRecording() {
     recPunch_ = rec_.autoPunch ? timeline_.selection() : juce::Range<double>();
     if (rec_.print && !recPunch_.isEmpty()) engine_.setPositionSeconds(juce::jmax(0.0, recPunch_.getStart() - 2.0));   // 2 s pre-roll
     juce::String err;
+    recMarks_.clear();
     if (!engine_.startRecording(recFile_, rec_.firstInput, io_.bits, rec_.print && !session_.regions.isEmpty(), err)) {
         juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Couldn't record", err);
         return;
@@ -1827,6 +1871,8 @@ void MainComponent::finishRecording() {
     engine_.stopRecording();
     std::unique_ptr<juce::AudioFormatReader> r(engine_.formats().createReaderFor(recFile_));
     if (!r || r->lengthInSamples < 16) {
+        recMarks_.clear();
+        timeline_.clearLiveTake();
         juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Recording", "Nothing was recorded.");
         return;
     }
@@ -1857,7 +1903,10 @@ void MainComponent::finishRecording() {
     }
     reg.name = recFile_.getFileNameWithoutExtension();
     session_.regions.add(reg);
-    if (session_.toDisc().tracks.empty() && !printed) session_.addMarker(Marker::TrackStart, reg.start, reg.id);
+    bool markedStart = false;
+    for (auto& m : recMarks_) markedStart |= m.type == Marker::TrackStart && std::abs(m.t - reg.start) < 1.0;
+    if (session_.toDisc().tracks.empty() && !printed && !markedStart) session_.addMarker(Marker::TrackStart, reg.start, reg.id);
+    placeRecMarks(reg.id);
     sessionChanged();
     timeline_.resized();
     timeline_.selectRegion(reg.id);
@@ -1915,6 +1964,7 @@ void MainComponent::showCapture() {
     h.folder = [this] { return recordingsFolder(); };
     auto* p = new CapturePanel(engine_, io_, meterHub_, inputHub_, std::move(h));
     auto* w = new PlainWindow(p, "Capture Through Outboard", true);
+    w->addKeyListener(commands_.getKeyMappings());   // M drops a marker, Space stops, while this window has the keys
     w->onClose = [this] {
         juce::MessageManager::callAsync([this] {
             if (cap_.levelCheck) captureLevelCheck(false);
@@ -2004,6 +2054,7 @@ void MainComponent::beginCapture() {
         return;
     }
     cap_.capturing = true;
+    recMarks_.clear();
     cap_.message = {};
     meterHub_.reset();
     inputHub_.reset();
@@ -2033,11 +2084,14 @@ void MainComponent::finishCapture() {
     if (id == 0) {
         engine_.loadSession(session_);
         cap_.message = "!Stopped before the range began, so there is nothing to put on the timeline.";
+        recMarks_.clear();
+        timeline_.clearLiveTake();
         commands_.commandStatusChanged();
         return;
     }
     cap_.regionId = id;
     cap_.haveTake = true;
+    placeRecMarks(id);
     const auto* reg = session_.findRegion(id);
     const double got = reg ? reg->length() : 0.0, want = cap_.plan.range.getLength();
     sessionChanged();
@@ -2302,6 +2356,7 @@ void MainComponent::beginPrint(int gear) {
         return;
     }
     print_.printing = true;
+    recMarks_.clear();
     commands_.commandStatusChanged();
 }
 
@@ -2325,6 +2380,8 @@ void MainComponent::finishPrint() {
     if (id == 0) {
         engine_.loadSession(session_);
         print_.message = "Stopped before the range began, so there is nothing to put on the timeline.";
+        recMarks_.clear();
+        timeline_.clearLiveTake();
         commands_.commandStatusChanged();
         return;
     }
@@ -2334,6 +2391,7 @@ void MainComponent::finishPrint() {
         reg->printOf = muted;
         got = reg->length();
     }
+    placeRecMarks(id);
     sessionChanged();
     timeline_.resized();
     timeline_.selectRegion(id);
@@ -2434,7 +2492,10 @@ public:
         startTimerHz(5);
         setSize(620, 560);
     }
-    ~SurfacePanel() override { s_.onLearned = nullptr; }
+    ~SurfacePanel() override {
+        s_.onLearned = nullptr;
+        closeList(table_);
+    }
     void paint(juce::Graphics& g) override { g.fillAll(colours::bg); }
     void resized() override {
         auto r = getLocalBounds().reduced(10);
@@ -2673,7 +2734,7 @@ void MainComponent::sessionChanged(bool undoable) {
     pqList_.repaint();
     refreshIssues();
     if (xfadeEditor_) {
-        if (session_.findRegion(xfadeEditor_->outgoing()) && session_.findRegion(xfadeEditor_->incoming())) xfadeEditor_->refresh();
+        if (xfadeEditor_->stillValid()) xfadeEditor_->refresh();
         else juce::MessageManager::callAsync([this] { xfadeWindow_.reset(); });
     }
     if (auto* w = findParentComponentOfClass<juce::DocumentWindow>())
@@ -3343,9 +3404,102 @@ void MainComponent::crossfadeNewEdits(const juce::Array<int>& ids, Session& s) {
 }
 
 void MainComponent::addMarkerAtPlayhead(Marker::Type t) {
+    if (takeInProgress()) {
+        // While recording nothing is reloaded (that would interrupt the take): the moment is noted,
+        // shown on the timeline, and becomes a real marker on the take when it stops.
+        recMarks_.add({t, engine_.livePosition()});
+        updateLiveTake();
+        return;
+    }
     int id = session_.addMarker(t, engine_.positionSeconds());
     timeline_.selectMarker(id);
     sessionChanged();
+}
+
+void MainComponent::updateTimecodeStrip() {
+    TimecodeStrip::Values v;
+    auto& tl = activeTimeline();
+    v.source = sourceActive_;
+    v.recording = takeInProgress();
+    if (v.recording) {
+        v.main = engine_.livePosition();
+        v.playing = true;
+        v.source = false;
+    } else if (sourceActive_) {
+        v.playing = engine_.isSourcePlaying();
+        v.main = v.playing ? engine_.sourcePosition() : tl.editPoint();
+    } else {
+        v.playing = engine_.isPlaying();
+        v.main = v.playing ? engine_.positionSeconds() : tl.editPoint();
+    }
+    v.in = tl.inPoint();
+    v.out = tl.outPoint();
+    auto& s = activeSession();
+    v.rate = s.effectiveRate();
+    // LEFT / RIGHT: segments picked in the Text View, else the selected region.
+    juce::Array<int> ids;
+    if (!sourceActive_ && textViewPanel_ && textViewWindow_) ids = textViewPanel_->selectedIds();
+    if (ids.isEmpty() && tl.selectedRegion()) ids.add(tl.selectedRegion());
+    for (int id : ids)
+        if (auto* r = s.findRegion(id)) {
+            v.left = v.left < 0 ? r->start : juce::jmin(v.left, r->start);
+            v.right = juce::jmax(v.right, r->end());
+        }
+    v.leftWhat = ids.size() > 1 ? juce::String(ids.size()) + " segments" : ids.size() == 1 ? juce::String("region") : juce::String();
+    tcStrip_.setValues(v);
+}
+
+void MainComponent::updateLiveTake() {
+    if (!takeInProgress()) return;
+    Timeline::LiveTake t;
+    t.active = true;
+    t.marks = recMarks_;
+    t.peakCount = [this] { return engine_.livePeakCount(); };
+    t.peak = [this](int i) { return engine_.livePeak(i); };
+    const double rate = engine_.recordRate();
+    t.peakDt = double(engine_.livePeakSamples()) / rate;
+    const double now = engine_.livePosition();
+    const double first = double(engine_.recordStartSample()) / rate;   // timeline time of the file's first sample, before the delay
+    if (cap_.capturing) {
+        t.lane = cap_.plan.underLane;
+        t.underLane = true;
+        t.start = cap_.plan.range.getStart();
+        t.end = juce::jmin(now, cap_.plan.range.getEnd());
+        t.peaksT0 = first - double(cap_.roundTrip + engine_.masterLatency()) / rate;
+        t.name = cap_.file.getFileNameWithoutExtension();
+    } else if (print_.printing) {
+        t.lane = print_.plan.underLane;
+        t.underLane = true;
+        t.start = print_.plan.range.getStart();
+        t.end = juce::jmin(now, print_.plan.range.getEnd());
+        t.peaksT0 = first - double(engine_.chain().latencyThrough(print_.gear)) / rate;
+        t.name = print_.file.getFileNameWithoutExtension();
+    } else if (rec_.print && engine_.isPlaying()) {
+        int maxLane = 0;
+        for (auto& x : session_.regions) maxLane = juce::jmax(maxLane, x.lane);
+        t.lane = maxLane;
+        t.underLane = true;
+        const int lat = (rec_.measured > 0 ? rec_.measured : engine_.reportedRoundTrip()) + rec_.extraLatency + engine_.masterLatency();
+        t.peaksT0 = first - double(lat) / rate;
+        t.start = recPunch_.isEmpty() ? juce::jmax(0.0, t.peaksT0) : recPunch_.getStart();
+        t.end = recPunch_.isEmpty() ? now : juce::jmin(now, recPunch_.getEnd());
+        t.name = recFile_.getFileNameWithoutExtension();
+    } else {
+        t.lane = juce::jlimit(0, juce::jmax(0, session_.lanes - 1), timeline_.selectedLane());
+        t.start = engine_.recordStartPosition();
+        t.end = now;
+        t.peaksT0 = t.start;
+        t.name = recFile_.getFileNameWithoutExtension();
+    }
+    timeline_.setLiveTake(t);
+}
+
+void MainComponent::placeRecMarks(int regionId) {
+    if (auto* r = session_.findRegion(regionId))
+        for (auto& m : recMarks_)
+            if (m.t >= r->start - 1.0e-6 && m.t <= r->end() + 1.0e-6) session_.addMarker(m.type, m.t, regionId);
+    recMarks_.clear();
+    timeline_.clearLiveTake();
 }
 
 void MainComponent::splitAtPlayhead() {
@@ -3383,13 +3537,26 @@ void MainComponent::nudgeSelectedRegion(double dt) {
     }
 }
 
-void MainComponent::openCrossfade(int out, int in) {
+void MainComponent::openFadeNearEditPoint() {
+    auto& tl = activeTimeline();
+    const double t = activePlaying() ? (sourceActive_ ? engine_.sourcePosition() : engine_.positionSeconds()) : tl.editPoint();
+    const auto p = tl.fadeNear(t);
+    if (!p.first && !p.second) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Edit Fade",
+                                               "There is no audio on this timeline yet, so there is no fade to edit.");
+        return;
+    }
+    openCrossfade(p.first, p.second, sourceActive_);
+}
+
+void MainComponent::openCrossfade(int out, int in, bool source) {
     xfadeWindow_.reset();
-    auto* ed = new CrossfadeEditor(session_, thumbs_, engine_.formats(), fadePrefs_, fadeLib_, out, in);
+    auto& s = source ? srcSession_ : session_;
+    auto* ed = new CrossfadeEditor(s, thumbs_, engine_.formats(), fadePrefs_, fadeLib_, out, in);
     ed->onChange = [this] { sessionChanged(); };
     ed->onPrefsChanged = [this] { saveFadeSettings(); };
     ed->onLibraryChanged = [this] { saveFadeSettings(); };
-    ed->onAudition = [this](double a, double b) { auditionRange(a, b); };
+    ed->onAudition = [this, source](double a, double b) { playRange(source, a, b); };
     xfadeEditor_ = ed;
     auto* w = new XfadeWindow(ed);
     w->onClose = [this] { juce::MessageManager::callAsync([this] { xfadeWindow_.reset(); }); };
@@ -3592,13 +3759,30 @@ ExportSettings MainComponent::exportSettings() const {
 
 void MainComponent::showExportMenu() {
     juce::PopupMenu m;
+    m.addSectionHeader("DISC");
     m.addItem(1, "DDP image for replication (CD master)");
-    m.addItem(2, "Track WAVs, 16-bit / 44.1 kHz (as on the CD)");
-    m.addItem(3, "Programme WAV, 24-bit at project rate");
-    m.addItem(4, "Programme WAV, 32-bit float at project rate");
+    m.addSectionHeader("WHOLE PROGRAMME");
+    m.addItem(3, "WAV, 24-bit at the project rate");
+    m.addItem(4, "WAV, 32-bit float at the project rate");
+    m.addItem(10, "Other format (MP3, AAC, Apple Lossless)...");
+    m.addSectionHeader("EACH TRACK");
+    m.addItem(2, "WAV, 16-bit / 44.1 kHz (as on the CD)");
+    m.addItem(11, "WAV, 24-bit at the project rate");
+    m.addItem(12, "Other format (MP3, AAC, Apple Lossless)...");
+    m.addSectionHeader("PART");
+    m.addItem(13, juce::String("In-Out") + (sourceActive_ ? " of the source" : "") + "...", !activeTimeline().selection().isEmpty());
+    m.addItem(14, "Selected segments...");
     m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&exportBtn_), [this](int r) {
         if (r == 1) exportDdp();
         if (r == 2) exportTrackWavs();
+        if (r == 10) deliver("the whole programme", {programmeItem(session_)}, false);
+        if (r == 11) {
+            props_.getUserSettings()->setValue("deliveryFormat", int(DeliveryFormat::Wav24));
+            deliver("every track", trackItems(session_), false);
+        }
+        if (r == 12) deliver("every track", trackItems(session_), false);
+        if (r == 13) exportInOut();
+        if (r == 14) exportSelectedSegments();
         if (r == 3 || r == 4) {
             int bits = r == 3 ? 24 : 32;
             chooser_ = std::make_unique<juce::FileChooser>("Export programme WAV", juce::File(), "*.wav");
@@ -3619,6 +3803,179 @@ void MainComponent::showExportMenu() {
             });
         }
     });
+}
+
+namespace {
+// Asks how to export: the format, a cover image (for MP3 / AAC / Apple Lossless) and, for one
+// file, its name.
+class DeliveryDialog : public juce::Component {
+public:
+    DeliveryDialog(const juce::String& what, int count, const juce::String& name, DeliveryFormat initial, const juce::File& cover)
+        : cover_(cover) {
+        title_.setText("Export " + what + (count > 1 ? "  (" + juce::String(count) + " files)" : juce::String()), juce::dontSendNotification);
+        title_.setFont(juce::FontOptions(14.0f, juce::Font::bold));
+        title_.setColour(juce::Label::textColourId, colours::text);
+        for (auto* l : {&formatL_, &coverL_, &nameL_, &note_}) {
+            l->setColour(juce::Label::textColourId, colours::dim);
+            l->setMinimumHorizontalScale(1.0f);
+        }
+        formatL_.setText("Format", juce::dontSendNotification);
+        coverL_.setText("Cover image", juce::dontSendNotification);
+        nameL_.setText("File name", juce::dontSendNotification);
+        note_.setJustificationType(juce::Justification::topLeft);
+        for (int k = 0; k < kNumDeliveryFormats; ++k) {
+            const auto f = DeliveryFormat(k);
+            juce::String why;
+            const bool ok = formatAvailable(f, &why);
+            format_.addItem(formatName(f) + (ok ? juce::String() : "   (" + why + ")"), k + 1);
+            format_.setItemEnabled(k + 1, ok);
+        }
+        format_.setSelectedId(int(initial) + 1, juce::dontSendNotification);
+        if (!formatAvailable(initial)) format_.setSelectedId(int(DeliveryFormat::Wav24) + 1, juce::dontSendNotification);
+        format_.onChange = [this] { update(); };
+        name_.setText(name, false);
+        name_.setVisible(count == 1);
+        nameL_.setVisible(count == 1);
+        for (auto* b : {&chooseCover_, &clearCover_, &go_, &cancel_}) styleButton(*b, b == &go_);
+        chooseCover_.onClick = [this] {
+            chooser_ = std::make_unique<juce::FileChooser>("Cover image (JPEG or PNG)", cover_.existsAsFile() ? cover_ : juce::File(), "*.jpg;*.jpeg;*.png");
+            chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles, [this](const juce::FileChooser& fc) {
+                if (fc.getResult().existsAsFile()) { cover_ = fc.getResult(); update(); }
+            });
+        };
+        clearCover_.onClick = [this] { cover_ = juce::File(); update(); };
+        go_.onClick = [this] { if (onGo) onGo(DeliveryFormat(format_.getSelectedId() - 1), cover_, name_.getText().trim()); };
+        cancel_.onClick = [this] { if (onCancel) onCancel(); };
+        for (auto* c : std::initializer_list<juce::Component*>{&title_, &formatL_, &format_, &coverL_, &coverName_, &chooseCover_, &clearCover_, &nameL_,
+                                                               &name_, &note_, &go_, &cancel_})
+            addAndMakeVisible(*c);
+        coverName_.setColour(juce::Label::textColourId, colours::text);
+        update();
+        setSize(560, 270);
+    }
+    std::function<void(DeliveryFormat, juce::File cover, juce::String name)> onGo;
+    std::function<void()> onCancel;
+    void paint(juce::Graphics& g) override { g.fillAll(colours::bg); }
+    void resized() override {
+        auto r = getLocalBounds().reduced(14, 12);
+        title_.setBounds(r.removeFromTop(22));
+        r.removeFromTop(8);
+        auto row = [&](juce::Label& l) {
+            auto x = r.removeFromTop(26);
+            r.removeFromTop(6);
+            l.setBounds(x.removeFromLeft(100));
+            return x;
+        };
+        format_.setBounds(row(formatL_));
+        {
+            auto x = row(coverL_);
+            clearCover_.setBounds(x.removeFromRight(60));
+            x.removeFromRight(4);
+            chooseCover_.setBounds(x.removeFromRight(90));
+            x.removeFromRight(6);
+            coverName_.setBounds(x);
+        }
+        name_.setBounds(row(nameL_));
+        auto bottom = r.removeFromBottom(30);
+        go_.setBounds(bottom.removeFromRight(110));
+        bottom.removeFromRight(8);
+        cancel_.setBounds(bottom.removeFromRight(90));
+        r.removeFromBottom(6);
+        note_.setBounds(r);
+    }
+
+private:
+    void update() {
+        const auto f = DeliveryFormat(format_.getSelectedId() - 1);
+        const bool comp = isCompressed(f);
+        for (auto* c : std::initializer_list<juce::Component*>{&coverL_, &coverName_, &chooseCover_, &clearCover_}) c->setEnabled(comp);
+        coverName_.setText(cover_.existsAsFile() ? cover_.getFileName() : juce::String("none"), juce::dontSendNotification);
+        note_.setText(comp ? "Tagged from the CD-Text and release details (title, artist, album, track number, ISRC, year, genre). After encoding, "
+                             "each file is checked for peaks over full scale."
+                           : f == DeliveryFormat::Wav16Cd ? "Resampled to 44.1 kHz and dithered, as for the CD."
+                                                          : "At the project's sample rate, no dither.",
+                      juce::dontSendNotification);
+    }
+    juce::File cover_;
+    juce::Label title_, formatL_, coverL_, coverName_, nameL_, note_;
+    juce::ComboBox format_;
+    juce::TextEditor name_;
+    juce::TextButton chooseCover_{"Choose..."}, clearCover_{"None"}, go_{"Export..."}, cancel_{"Cancel"};
+    std::unique_ptr<juce::FileChooser> chooser_;
+};
+}  // namespace
+
+void MainComponent::exportInOut() {
+    const auto sel = activeTimeline().selection();
+    if (sel.isEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Export In-Out",
+                                               "Mark an In (I) and an Out (O) first, on the timeline you want to export from.");
+        return;
+    }
+    DeliveryItem it;
+    it.range = sel;
+    it.tags = releaseTags(session_);
+    it.name = juce::File::createLegalFileName((session_.file.existsAsFile() ? session_.file.getFileNameWithoutExtension() : juce::String("Untitled")) +
+                                              " In-Out " + msfString(sel.getStart()).replace(":", "-"));
+    it.tags.title = it.name;
+    deliver(juce::String("the In-Out") + (sourceActive_ ? " of the source" : "") + " (" + msfString(sel.getStart()) + " to " + msfString(sel.getEnd()) + ")", {it},
+            sourceActive_);
+}
+
+void MainComponent::deliver(const juce::String& what, juce::Array<DeliveryItem> items, bool source) {
+    if (items.isEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Export", "There is nothing to export (no tracks yet?).");
+        return;
+    }
+    auto* u = props_.getUserSettings();
+    const auto initial = DeliveryFormat(juce::jlimit(0, kNumDeliveryFormats - 1, u->getIntValue("deliveryFormat", int(DeliveryFormat::Mp3Cbr320))));
+    auto* dlg = new DeliveryDialog(what, items.size(), items[0].name, initial, juce::File(u->getValue("deliveryCover")));
+    auto* w = new PlainWindow(dlg, "Export", true);
+    deliveryWindow_.reset(w);
+    dlg->onCancel = [this] { juce::MessageManager::callAsync([this] { deliveryWindow_.reset(); }); };
+    w->onClose = dlg->onCancel;
+    dlg->onGo = [this, items, source](DeliveryFormat f, juce::File cover, juce::String name) mutable {
+        auto* us = props_.getUserSettings();
+        us->setValue("deliveryFormat", int(f));
+        us->setValue("deliveryCover", cover.getFullPathName());
+        for (auto& it : items) it.tags.cover = cover;
+        if (items.size() == 1 && name.isNotEmpty()) items.getReference(0).name = juce::File::createLegalFileName(name);
+        juce::MessageManager::callAsync([this] { deliveryWindow_.reset(); });
+        auto start = [this, items, f, source](juce::File folder, juce::File one) {
+            DeliveryRequest rq;
+            rq.format = f;
+            rq.items = items;
+            rq.folder = folder;
+            rq.singleFile = one;
+            rq.es = exportSettings();
+            if (source) rq.es.runPlugins = false;   // the source plays raw, so it exports raw
+            auto snapshot = std::make_shared<Session>(source ? srcSession_ : session_);
+            snapshot->source = nullptr;
+            auto res = std::make_shared<DeliveryResult>();
+            runJob("Exporting " + formatName(f) + "...", [this, snapshot, rq, res](Job& j) { *res = runDelivery(exporter_, *snapshot, rq, [&](double p) { return j.keep(p); }); },
+                   [this, res](bool cancelled) {
+                       if (cancelled) return;
+                       if (res->error.isNotEmpty()) {
+                           juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Export", res->error);
+                           return;
+                       }
+                       showText(res->warnings.isEmpty() ? "Exported" : "Exported: check the warnings", res->summary());
+                   });
+        };
+        const auto ext = formatExtension(f);
+        if (items.size() == 1) {
+            chooser_ = std::make_unique<juce::FileChooser>("Export to", session_.file.getParentDirectory().getChildFile(items[0].name + ext), "*" + ext);
+            chooser_->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting,
+                                  [start, ext](const juce::FileChooser& fc) {
+                                      if (fc.getResult() != juce::File()) start({}, fc.getResult().withFileExtension(ext));
+                                  });
+        } else {
+            chooser_ = std::make_unique<juce::FileChooser>("Choose a folder for the files", session_.file.getParentDirectory());
+            chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories, [start](const juce::FileChooser& fc) {
+                if (fc.getResult() != juce::File()) start(fc.getResult(), {});
+            });
+        }
+    };
 }
 
 void MainComponent::exportDdp() {
@@ -3851,7 +4208,10 @@ void MainComponent::timerCallback() {
         }
     } else if (engine_.isRecording()) {
         timeDisplay_.setColour(juce::Label::textColourId, colours::error);
-        if (!engine_.isPlaying() && !rec_.print) timeDisplay_.setText("REC " + msfString(double(engine_.recordedSamples()) / engine_.recordRate()), juce::dontSendNotification);
+        if (!engine_.isPlaying() && !rec_.print) {
+            timeDisplay_.setText("REC " + msfString(double(engine_.recordedSamples()) / engine_.recordRate()), juce::dontSendNotification);
+            timeline_.setPlayhead(engine_.livePosition(), true);   // the playhead follows the take
+        }
         if (rec_.print && rec_.autoPunch && !recPunch_.isEmpty() && pos > recPunch_.getEnd() + 1.0) finishRecording();
         if (rec_.print && !engine_.isPlaying()) finishRecording();   // playback reached the end
     } else {
@@ -3874,6 +4234,9 @@ void MainComponent::timerCallback() {
         }
         abDisplay_.setText(ab, juce::dontSendNotification);
     }
+    if (takeInProgress()) updateLiveTake();
+    else if (timeline_.liveTake().active) timeline_.clearLiveTake();
+    updateTimecodeStrip();
     meterHub_.sessionTarget = session_.loudnessTarget;
     meterHub_.prepare(engine_.deviceRate());
     meterHub_.feed(engine_.meterTap());
@@ -4115,46 +4478,42 @@ void MainComponent::showLaneMenu(bool source, int lane) {
 }
 
 void MainComponent::exportSelectedSegments() {
-    // What to export: the Text View selection, else the selected region, else the In-Out.
-    juce::Array<juce::Range<double>> ranges;
-    juce::StringArray names;
+    // What to export: segments picked in the Text View; else the selected region, or the In-Out
+    // (asking which when both are there).
     juce::Array<int> ids;
     if (textViewPanel_ && textViewWindow_) ids = textViewPanel_->selectedIds();
-    if (ids.isEmpty() && session_.findRegion(timeline_.selectedRegion())) ids.add(timeline_.selectedRegion());
-    for (int id : ids)
-        if (auto* r = session_.findRegion(id)) { ranges.add({r->start, r->end()}); names.add(r->name); }
-    if (ranges.isEmpty() && !timeline_.selection().isEmpty()) { ranges.add(timeline_.selection()); names.add("In-Out " + msfString(timeline_.selection().getStart()).replace(":", "-")); }
-    if (ranges.isEmpty()) {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Export Selected Segments",
-                                               "Select a segment (or several in the Text View), or mark an In and Out on the destination.");
+    const auto sel = timeline_.selection();
+    auto regionItems = [this](const juce::Array<int>& which) {
+        juce::Array<DeliveryItem> items;
+        int k = 0;
+        for (int id : which)
+            if (auto* r = session_.findRegion(id)) {
+                DeliveryItem it;
+                it.range = {r->start, r->end()};
+                it.tags = releaseTags(session_);
+                it.tags.title = r->name;
+                it.name = juce::File::createLegalFileName(juce::String(++k).paddedLeft('0', 2) + " " + r->name);
+                items.add(it);
+            }
+        return items;
+    };
+    if (!ids.isEmpty()) { deliver(juce::String(ids.size()) + (ids.size() == 1 ? " segment" : " segments"), regionItems(ids), false); return; }
+    const int region = session_.findRegion(timeline_.selectedRegion()) ? timeline_.selectedRegion() : 0;
+    if (region && !sel.isEmpty()) {
+        auto* r = session_.findRegion(region);
+        juce::AlertWindow::showOkCancelBox(juce::MessageBoxIconType::QuestionIcon, "Export",
+                                           "Both an In-Out (" + msfString(sel.getStart()) + " to " + msfString(sel.getEnd()) + ") and a region (" + r->name +
+                                               ") are selected. Which do you want to export?",
+                                           "The In-Out", "The region", this, juce::ModalCallbackFunction::create([this, region, regionItems](int inOut) {
+                                               if (inOut) exportInOut();
+                                               else deliver("the region", regionItems({region}), false);
+                                           }));
         return;
     }
-    chooser_ = std::make_unique<juce::FileChooser>("Choose a folder for the segment files", session_.file.getParentDirectory());
-    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
-                          [this, ranges, names](const juce::FileChooser& fc) {
-        auto folder = fc.getResult();
-        if (folder == juce::File()) return;
-        folder.createDirectory();
-        auto snapshot = std::make_shared<Session>(session_);
-        snapshot->source = nullptr;
-        auto es = exportSettings();
-        auto result = std::make_shared<juce::StringArray>();
-        auto err = std::make_shared<juce::String>();
-        runJob("Exporting segments...",
-               [this, snapshot, es, ranges, names, folder, result, err](Job& j) {
-                   for (int i = 0; i < ranges.size() && err->isEmpty(); ++i) {
-                       auto base = juce::File::createLegalFileName(juce::String(i + 1).paddedLeft('0', 2) + " " + names[i]);
-                       auto f = folder.getNonexistentChildFile(base, ".wav", false);
-                       *err = exporter_.exportRangeWav(*snapshot, f, 24, es, ranges[i], [&](double p) { return j.keep((i + p) / ranges.size()); });
-                       if (err->isEmpty()) result->add(f.getFileName());
-                   }
-               },
-               [this, result, err, folder](bool) {
-                   if (err->isNotEmpty()) juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Export Selected Segments", *err);
-                   else showText("Segments exported", juce::String(result->size()) + " file(s), 24-bit at the project rate, in " + folder.getFullPathName() +
-                                                          ":\n\n" + result->joinIntoString("\n"));
-               });
-    });
+    if (region) { deliver("the region", regionItems({region}), false); return; }
+    if (!sel.isEmpty()) { exportInOut(); return; }
+    juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Export Selected Segments",
+                                           "Select a segment (or several in the Text View), or mark an In and Out.");
 }
 
 void MainComponent::showMeterBridge() {

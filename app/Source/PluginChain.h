@@ -76,6 +76,8 @@ public:
     };
     // Makes built-in inserts (set by the owner of a chain that may hold them: the master chain).
     std::function<std::unique_ptr<juce::AudioPluginInstance>(const juce::PluginDescription&)> builtinFactory;
+    // Lathe's key commands, given to the plugin windows (so M, Space and the rest work there too).
+    juce::KeyListener* windowKeys = nullptr;
     // The built-in insert in a slot, or nullptr.
     BuiltinInsert* builtinAt(int i) const { return slots_[i] ? slots_[i]->builtin : nullptr; }
     juce::AudioPluginInstance* pluginAt(int i) const { return slots_[i] ? slots_[i]->plugin.get() : nullptr; }

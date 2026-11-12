@@ -1,6 +1,7 @@
 // End-to-end batch render: DDP + WAV/FLAC 16/44.1 + hi-res, then checks that the 16-bit
 // track files are bit-identical to the DDP image and the tags are present.
 #include "../app/Source/Capture.h"
+#include "../app/Source/Delivery.h"
 #include "../app/Source/ControlSurface.h"
 #include "../app/Source/DdpFormat.h"
 #include "../app/Source/Exporter.h"
@@ -1041,6 +1042,226 @@ int main() {
         }
         engine.stop();
         engine.loadSession(Session());
+        engine.releaseResources();
+    }
+
+    // ---- Exports in any format: tracks, In-Out, MP3 / AAC / Apple Lossless with tags ----
+    {
+        auto a = noiseFile(dir, "dl-a.wav", 48000, 3.0, 11);
+        auto b = noiseFile(dir, "dl-b.wav", 48000, 4.0, 12);
+        Session s;
+        s.discTitle = "Delivery Test";
+        s.discPerformer = "The Lathe Band";
+        s.genreText = "Jazz";
+        s.releaseDate = "2026-11-12";
+        for (auto& f : {a, b}) {
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(f));
+            const int id = s.append(s.makeRegion(f, r->sampleRate, r->lengthInSamples), 2.0);
+            for (auto& m : s.markers)
+                if (m.attachedRegion == id && m.type == Marker::TrackStart) {
+                    m.text.title = id == s.regions[0].id ? "First Song" : "Second Song";
+                    m.isrc = id == s.regions[0].id ? "USABC2600011" : "USABC2600012";
+                }
+        }
+        auto items = trackItems(s);
+        CHECK(items.size() == 2);
+        if (items.size() == 2) {
+            CHECK(items[0].tags.title == "First Song" && items[1].tags.isrc == "USABC2600012");
+            CHECK(items[1].tags.track == 2 && items[1].tags.tracks == 2 && items[0].tags.album == "Delivery Test" && items[0].tags.year == "2026");
+            CHECK(items[0].name == "01 First Song" && items[1].name == "02 Second Song");
+            CHECK(std::abs(items[0].range.getEnd() - items[1].range.getStart()) < 1e-9);   // track to track, as on the disc
+            CHECK(std::abs(items[1].range.getEnd() - s.toDisc().leadOutSector * 588.0 / 44100.0) < 1e-9);
+        }
+        Exporter ex(engine);
+        ExportSettings es;
+        // Each track as a 24-bit WAV at the project rate.
+        {
+            DeliveryRequest rq;
+            rq.format = DeliveryFormat::Wav24;
+            rq.items = items;
+            rq.folder = dir.getChildFile("deliver-wav24");
+            auto res = runDelivery(ex, s, rq, [](double) { return true; });
+            CHECK(res.error.isEmpty() && res.files.size() == 2);
+            for (int i = 0; i < res.files.size(); ++i)
+                if (std::unique_ptr<juce::AudioFormatReader> r{fm.createReaderFor(juce::File(res.files[i]))}) {
+                    CHECK(r->sampleRate == 48000 && r->bitsPerSample == 24);
+                    CHECK(std::abs(double(r->lengthInSamples) - items[i].range.getLength() * 48000) <= 1.0);
+                }
+        }
+        // An In-Out as a CD WAV: resampled to 44.1 kHz and 16-bit, named as asked.
+        {
+            DeliveryRequest rq;
+            rq.format = DeliveryFormat::Wav16Cd;
+            DeliveryItem it;
+            it.range = {3.0, 4.5};
+            it.name = "piece";
+            rq.items.add(it);
+            rq.singleFile = dir.getChildFile("my piece.wav");
+            auto res = runDelivery(ex, s, rq, [](double) { return true; });
+            CHECK(res.error.isEmpty() && res.files.size() == 1 && juce::File(res.files[0]) == rq.singleFile);
+            if (std::unique_ptr<juce::AudioFormatReader> r{fm.createReaderFor(rq.singleFile)})
+                CHECK(r->sampleRate == 44100 && r->bitsPerSample == 16 && std::abs(double(r->lengthInSamples) - 1.5 * 44100) <= 1.0);
+        }
+        // .m4a tags on a minimal file (any platform): written when "moov" is last, refused otherwise.
+        {
+            auto box = [](const char* type, const juce::MemoryBlock& body) {
+                juce::MemoryOutputStream o;
+                o.writeIntBigEndian(int(8 + body.getSize()));
+                o.write(type, 4);
+                o.write(body.getData(), body.getSize());
+                return o.getMemoryBlock();
+            };
+            juce::MemoryBlock payload(1000, true), mvhd(100, true);
+            auto make = [&](bool moovLast) {
+                juce::MemoryOutputStream o;
+                auto ftyp = box("ftyp", juce::MemoryBlock("M4A \0\0\0\0", 8));
+                auto mdat = box("mdat", payload);
+                auto moov = box("moov", box("mvhd", mvhd));
+                o.write(ftyp.getData(), ftyp.getSize());
+                if (moovLast) { o.write(mdat.getData(), mdat.getSize()); o.write(moov.getData(), moov.getSize()); }
+                else { o.write(moov.getData(), moov.getSize()); o.write(mdat.getData(), mdat.getSize()); }
+                return o.getMemoryBlock();
+            };
+            auto f1 = dir.getChildFile("tags.m4a"), f2 = dir.getChildFile("tags-front.m4a");
+            auto d1 = make(true), d2 = make(false);
+            f1.replaceWithData(d1.getData(), d1.getSize());
+            f2.replaceWithData(d2.getData(), d2.getSize());
+            DeliveryTags t = items[0].tags;
+            t.comment = "Mastered in Lathe";
+            CHECK(writeM4aTags(f1, t));
+            CHECK(readM4aTag(f1, "\xa9nam") == "First Song" && readM4aTag(f1, "\xa9" "alb") == "Delivery Test" && readM4aTag(f1, "aART") == "The Lathe Band");
+            CHECK(readM4aTag(f1, "\xa9" "day") == "2026" && readM4aTag(f1, "\xa9gen") == "Jazz");
+            juce::MemoryBlock after;
+            f1.loadFileAsData(after);
+            CHECK(after.getSize() > d1.getSize() && std::memcmp(after.getData(), d1.getData(), 8 + 8 + 8 + 1000) == 0);   // the audio is untouched
+            {
+                const auto* d = static_cast<const char*>(after.getData());
+                bool found = false;
+                for (size_t i = 0; i + 12 <= after.getSize() && !found; ++i) found = std::memcmp(d + i, "USABC2600011", 12) == 0;
+                CHECK(found);   // the ISRC, as a free-form tag
+            }
+            CHECK(writeM4aTags(f1, t));   // writing again replaces the tags, it doesn't add a second set
+            juce::MemoryBlock again;
+            f1.loadFileAsData(again);
+            CHECK(again.getSize() == after.getSize());
+            CHECK(!writeM4aTags(f2, t));
+            juce::MemoryBlock untouched;
+            f2.loadFileAsData(untouched);
+            CHECK(untouched == d2);
+        }
+        // MP3, through the bundled encoder (when this build has it).
+        if (formatAvailable(DeliveryFormat::Mp3Cbr320)) {
+            DeliveryRequest rq;
+            rq.format = DeliveryFormat::Mp3Cbr320;
+            rq.items = items;
+            rq.folder = dir.getChildFile("deliver-mp3");
+            auto res = runDelivery(ex, s, rq, [](double) { return true; });
+            CHECK(res.error.isEmpty() && res.files.size() == 2);
+            if (res.files.size() == 2) {
+                juce::MemoryBlock mp3;
+                juce::File(res.files[1]).loadFileAsData(mp3);
+                CHECK(mp3.getSize() > 20000 && std::memcmp(mp3.getData(), "ID3", 3) == 0);
+                CHECK(juce::File(res.files[1]).getFileName() == "02 Second Song.mp3");
+                // tag text (ID3v2 text frames are Latin-1 here)
+                auto contains = [&](const char* needle) {
+                    const auto* d = static_cast<const char*>(mp3.getData());
+                    const size_t len = std::strlen(needle);
+                    for (size_t i = 0; i + len < juce::jmin<size_t>(mp3.getSize(), 8192); ++i)
+                        if (std::memcmp(d + i, needle, len) == 0) return true;
+                    return false;
+                };
+                CHECK(contains("Second Song") && contains("USABC2600012") && contains("Delivery Test") && contains("2/2"));
+            }
+            std::printf("mp3 export: %s\n", res.error.isEmpty() ? "ok" : res.error.toRawUTF8());
+        } else {
+            std::printf("mp3 export: skipped (no encoder in this build)\n");
+        }
+       #if JUCE_MAC
+        // AAC and Apple Lossless with macOS's encoders; decoded again with the Mac's own reader.
+        for (auto f : {DeliveryFormat::Aac256, DeliveryFormat::Alac}) {
+            DeliveryRequest rq;
+            rq.format = f;
+            rq.items.add(items[0]);
+            rq.folder = dir.getChildFile(f == DeliveryFormat::Alac ? "deliver-alac" : "deliver-aac");
+            auto res = runDelivery(ex, s, rq, [](double) { return true; });
+            CHECK(res.error.isEmpty() && res.files.size() == 1);
+            if (res.files.size() != 1) continue;
+            const juce::File out(res.files[0]);
+            CHECK(readM4aTag(out, "\xa9nam") == "First Song" && readM4aTag(out, "\xa9" "alb") == "Delivery Test");
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(out));
+            CHECK(r != nullptr);
+            if (!r) continue;
+            const double len = double(r->lengthInSamples) / r->sampleRate;
+            std::printf("%s: %.3f s at %.0f Hz (track is %.3f s)\n", f == DeliveryFormat::Alac ? "alac" : "aac", len, r->sampleRate, items[0].range.getLength());
+            CHECK(std::abs(len - items[0].range.getLength()) < 0.05);
+            CHECK(r->sampleRate == 48000);
+            if (f == DeliveryFormat::Alac) {
+                // Lossless: the same audio as the 24-bit WAV of that track.
+                std::unique_ptr<juce::AudioFormatReader> w(fm.createReaderFor(dir.getChildFile("deliver-wav24").getChildFile("01 First Song.wav")));
+                if (w) {
+                    juce::AudioBuffer<float> x(2, 20000), y(2, 20000);
+                    r->read(&x, 0, 20000, 10000, true, true);
+                    w->read(&y, 0, 20000, 10000, true, true);
+                    float worst = 0;
+                    for (int i = 0; i < 20000; ++i) worst = juce::jmax(worst, std::abs(x.getSample(0, i) - y.getSample(0, i)));
+                    std::printf("alac against the 24-bit wav: worst difference %.3g\n", double(worst));
+                    CHECK(worst < 2.0f / 8388608.0f);
+                }
+            }
+        }
+        // A lossy file going over full scale is reported.
+        {
+            auto sq = dir.getChildFile("square.wav");
+            {
+                juce::WavAudioFormat wav;
+                std::unique_ptr<juce::OutputStream> os(sq.createOutputStream().release());
+                std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), 44100, 2, 24, {}, 0));
+                os.release();
+                juce::AudioBuffer<float> bb(2, 44100 * 2);
+                for (int i = 0; i < bb.getNumSamples(); ++i) bb.setSample(0, i, (i / 22) % 2 ? 0.98f : -0.98f), bb.setSample(1, i, bb.getSample(0, i));
+                w->writeFromAudioSampleBuffer(bb, 0, bb.getNumSamples());
+            }
+            Session hot;
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(sq));
+            hot.append(hot.makeRegion(sq, r->sampleRate, r->lengthInSamples), 0.0);
+            DeliveryRequest rq;
+            rq.format = DeliveryFormat::Aac256;
+            rq.items.add(programmeItem(hot));
+            rq.folder = dir.getChildFile("deliver-hot");
+            auto res = runDelivery(ex, hot, rq, [](double) { return true; });
+            std::printf("hot aac: %s\n", res.warnings.joinIntoString(" ").toRawUTF8());
+            CHECK(res.error.isEmpty() && res.warnings.size() == 1 && res.warnings[0].contains("dBTP"));
+        }
+       #endif
+    }
+
+    // ---- A take in progress: where "now" is, and the level trace drawn as it grows ----
+    {
+        const int N = 512;
+        engine.prepareToPlay(N, 44100);
+        engine.loadSession(Session());
+        engine.setPositionSeconds(12.5);
+        juce::String err;
+        auto f = dir.getChildFile("live.wav");
+        CHECK(engine.startRecording(f, 0, 24, false, err));
+        juce::AudioBuffer<float> io(2, N);
+        const int blocks = 200;   // about 2.3 s: quiet for the first half, then -6 dB
+        for (int b = 0; b < blocks; ++b) {
+            const float level = b < blocks / 2 ? 0.05f : 0.5f;
+            for (int i = 0; i < N; ++i) { io.setSample(0, i, (i % 2 ? level : -level)); io.setSample(1, i, 0.0f); }
+            engine.getNextAudioBlock(juce::AudioSourceChannelInfo(&io, 0, N));
+        }
+        const double expect = engine.recordStartPosition() + double(blocks * N) / 44100.0;   // (an empty session starts at 0)
+        CHECK(std::abs(engine.livePosition() - expect) < 1e-9);   // a marker dropped now lands here
+        const int count = engine.livePeakCount(), per = engine.livePeakSamples();
+        CHECK(per == 441 && count == blocks * N / per);
+        CHECK(std::abs(engine.livePeak(2) - 0.05f) < 1e-6f && std::abs(engine.livePeak(count - 2) - 0.5f) < 1e-6f);
+        CHECK(engine.livePeak(count + 5) == 0.0f);
+        engine.stopRecording();
+        // The next take starts its trace from nothing.
+        CHECK(engine.startRecording(dir.getChildFile("live2.wav"), 0, 24, false, err));
+        CHECK(engine.livePeakCount() == 0);
+        engine.stopRecording();
         engine.releaseResources();
     }
 

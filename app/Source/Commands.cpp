@@ -18,7 +18,10 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::exportTrackWavs, "Export Track WAVs...", "File", "16-bit / 44.1 kHz WAV per track, cut at the PQ marks", "command + shift + E"},
         {cmd::exportProgram24, "Export Programme WAV (24-bit)...", "File", "The whole programme at the project rate, 24-bit dithered", ""},
         {cmd::exportProgram32, "Export Programme WAV (32-bit float)...", "File", "The whole programme at the project rate, 32-bit float", ""},
-        {cmd::exportSegments, "Export Selected Segments...", "File", "Each selected segment (or the In-Out) as its own WAV at the project rate, through the master chain", "command + option + E"},
+        {cmd::exportSegments, "Export Selected Segments...", "File", "Each selected segment as its own file, in any format (WAV, MP3, AAC, Apple Lossless)", "command + option + E"},
+        {cmd::exportInOut, "Export In-Out...", "File", "The In-Out of the active timeline as one file, in any format", ""},
+        {cmd::exportTracksAs, "Export Tracks As...", "File", "Every CD track as its own file in any format, tagged from CD-Text", ""},
+        {cmd::exportProgrammeAs, "Export Programme As...", "File", "The whole programme as one file in any format, tagged", ""},
         {cmd::batchRender, "Render Album (Batch)...", "File", "DDP plus WAV / FLAC deliverables in one go, with a QC and checksum report", "command + R"},
         // Edit
         // Delivery
@@ -133,8 +136,8 @@ const std::vector<CommandDef>& allCommands() {
         {cmd::zoomFit, "Zoom to Fit", "View", "Show the whole programme", "command + 0"},
         {cmd::toggleEnvelope, "Gain Envelope Mode", "View", "Edit clip gain envelopes on the timeline", "G"},
         {cmd::toggleSnap, "Snap", "View", "Snap edits to region edges, markers and the playhead", "N"},
-        {cmd::crossfadeEditor, "Edit Fade...", "Edit Fade", "Open Edit Fade for the edit nearest the Edit Point: both sides, the result, shapes, nudges and the fade library", "X"},
-        {cmd::fadeRecall0, "Recall Default Crossfade", "Edit Fade", "Apply library slot 0 (the default crossfade) to the edit nearest the Edit Point, or the one open in Edit Fade", "option + 0"},
+        {cmd::crossfadeEditor, "Edit Fade...", "Edit Fade", "Open Edit Fade for the edit (or region fade-in / fade-out) nearest the Edit Point: the sides, the result, shapes, nudges and the fade library", "X"},
+        {cmd::fadeRecall0, "Recall Default Crossfade", "Edit Fade", "Apply library slot 0 (the default crossfade) to the fade nearest the Edit Point, or the one open in Edit Fade", "option + 0"},
         {cmd::fadeRecall1, "Recall Fade 1", "Edit Fade", "Apply library slot 1 to the edit nearest the Edit Point, or the one open in Edit Fade", "option + 1"},
         {cmd::fadeRecall2, "Recall Fade 2", "Edit Fade", "Apply library slot 2 to the edit nearest the Edit Point, or the one open in Edit Fade", "option + 2"},
         {cmd::fadeRecall3, "Recall Fade 3", "Edit Fade", "Apply library slot 3 to the edit nearest the Edit Point, or the one open in Edit Fade", "option + 3"},

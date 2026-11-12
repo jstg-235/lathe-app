@@ -38,7 +38,8 @@ public:
 
     std::function<void()> onEdit;                      // session changed (commit: undo + reload)
     std::function<void(double)> onSeek;                // user located the playhead
-    std::function<void(int out, int in)> onCrossfade;  // open the crossfade editor
+    // Open Edit Fade: a crossfade (both ids), or one region's own fade-out (in = 0) or fade-in (out = 0).
+    std::function<void(int out, int in)> onCrossfade;
     std::function<void(int markerId)> onMarkerSelected;
     std::function<void(int markerId)> onMarkerDoubleClicked;
     std::function<void(int regionId)> onRegionFx;      // open the region's effects window
@@ -107,6 +108,9 @@ public:
 
     // Overlap (crossfade) nearest the playhead on the selected lane: {out, in} or {0,0}.
     std::pair<int, int> crossfadeNear(double t) const;
+    // The fade nearest to t: an edit (both ids), or a region's fade-in {0, id} or fade-out {id, 0}
+    // where nothing joins it. {0, 0} when the timeline is empty. With `region`, only that region's.
+    std::pair<int, int> fadeNear(double t, int region = 0) const;
 
     void paint(juce::Graphics&) override;
     void resized() override;
@@ -118,6 +122,23 @@ public:
     void mouseWheelMove(const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
     void mouseMagnify(const juce::MouseEvent&, float scale) override;
     void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
+
+    // A take being recorded, drawn as it grows. Nothing in the session changes until it stops.
+    struct LiveTake {
+        bool active = false;
+        int lane = 0;
+        bool underLane = false;          // it will land on a new lane under `lane`: drawn over that lane's lower half
+        double start = 0, end = 0;       // the stretch shown, timeline seconds
+        double peaksT0 = 0, peakDt = 0.01;   // timeline time of peak 0, and of each peak after it
+        std::function<int()> peakCount;
+        std::function<float(int)> peak;
+        juce::String name;
+        struct Mark { Marker::Type type; double t; };
+        juce::Array<Mark> marks;         // markers dropped while recording, placed when it stops
+    };
+    void setLiveTake(const LiveTake& t) { live_ = t; repaint(); }
+    void clearLiveTake() { if (live_.active) { live_ = {}; repaint(); } }
+    const LiveTake& liveTake() const { return live_; }
 
 private:
     static constexpr int kRuler = 22, kMarkerStrip = 26, kProductStrip = 22, kTrackBar = 14, kScroll = 12;
@@ -157,6 +178,8 @@ private:
     void scrollBarMoved(juce::ScrollBar*, double newStart) override;
     void paintRegion(juce::Graphics&, int index);
     void paintMarkers(juce::Graphics&);
+    void paintLiveTake(juce::Graphics&);
+    LiveTake live_;
     void paintRuler(juce::Graphics&);
     void paintLoudness(juce::Graphics&);
     int problemAt(juce::Point<int> p) const;   // index into processed problems, -1 = none

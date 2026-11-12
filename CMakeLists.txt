@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 # Must come before project(): CMake fixes the deployment target when the project starts.
 # 10.15 is the floor because the DDP code uses std::filesystem.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS")
-project(Lathe VERSION 0.13.0 LANGUAGES C CXX)
+project(Lathe VERSION 0.14.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,7 +95,10 @@ target_sources(Lathe PRIVATE
     app/Source/DeliveryPanels.cpp
     app/Source/Capture.cpp
     app/Source/IoPanels.cpp
-    app/Source/ExternalGear.cpp)
+    app/Source/ExternalGear.cpp
+    app/Source/Encoders.cpp
+    app/Source/Delivery.cpp
+    app/Source/TimecodeStrip.cpp)
 
 target_include_directories(Lathe PRIVATE ${r8b_SOURCE_DIR})
 
@@ -110,6 +113,22 @@ target_compile_definitions(Lathe PRIVATE
     JUCE_DISPLAY_SPLASH_SCREEN=0
     JUCE_USE_FLAC=1
     JUCE_USE_MP3AUDIOFORMAT=0)
+
+# MP3 export: the LAME encoder program, carried inside the app (see cmake/Lame.cmake).
+include(cmake/Lame.cmake)
+if(LATHE_HAVE_LAME)
+    add_dependencies(Lathe lame)
+    if(APPLE)
+        add_custom_command(TARGET Lathe POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:Lathe>/Resources"
+            COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:lame>" "$<TARGET_BUNDLE_CONTENT_DIR:Lathe>/Resources/lame"
+            COMMAND ${CMAKE_COMMAND} -E copy "${LATHE_LAME_SOURCE}/COPYING" "$<TARGET_BUNDLE_CONTENT_DIR:Lathe>/Resources/LAME-LICENSE.txt"
+            VERBATIM)
+    else()
+        add_custom_command(TARGET Lathe POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:lame>" "$<TARGET_FILE_DIR:Lathe>/lame" VERBATIM)
+    endif()
+endif()
 
 target_link_libraries(Lathe PRIVATE
     lathe_core
@@ -136,13 +155,29 @@ if(LATHE_BUILD_TESTS)
     target_sources(lathe_batch_tests PRIVATE tests/batch_tests.cpp app/Source/Exporter.cpp app/Source/AudioEngine.cpp
         app/Source/PluginChain.cpp app/Source/PluginScan.cpp app/Source/RegionFx.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp
         app/Source/DdpFormat.cpp app/Source/ControlSurface.cpp app/Source/Commands.cpp app/Source/Restore.cpp
-        app/Source/Products.cpp app/Source/Paperwork.cpp app/Source/Capture.cpp app/Source/ExternalGear.cpp)
+        app/Source/Products.cpp app/Source/Paperwork.cpp app/Source/Capture.cpp app/Source/ExternalGear.cpp app/Source/Encoders.cpp app/Source/Delivery.cpp)
     target_include_directories(lathe_batch_tests PRIVATE ${r8b_SOURCE_DIR})
     target_compile_definitions(lathe_batch_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1
         JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)
     target_link_libraries(lathe_batch_tests PRIVATE lathe_core juce::juce_audio_utils juce::juce_audio_processors
         juce::juce_audio_formats juce::juce_audio_devices juce::juce_gui_extra juce::juce_recommended_config_flags)
     add_test(NAME batch COMMAND lathe_batch_tests)
+    if(LATHE_HAVE_LAME)
+        set_tests_properties(batch PROPERTIES ENVIRONMENT "LATHE_LAME=$<TARGET_FILE:lame>")
+        add_dependencies(lathe_batch_tests lame)
+    endif()
+
+    juce_add_console_app(lathe_ui_tests PRODUCT_NAME "lathe_ui_tests")
+    target_sources(lathe_ui_tests PRIVATE tests/ui_tests.cpp app/Source/MarkInfo.cpp app/Source/DeliveryPanels.cpp app/Source/SegmentList.cpp
+        app/Source/Session.cpp app/Source/Products.cpp app/Source/AutoMarks.cpp app/Source/Paperwork.cpp
+        app/Source/Timeline.cpp app/Source/ProgramRenderer.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp app/Source/PluginScan.cpp
+        app/Source/Metering.cpp app/Source/AudioEngine.cpp app/Source/ExternalGear.cpp app/Source/Capture.cpp app/Source/DdpFormat.cpp
+        app/Source/EditPanels.cpp app/Source/TimecodeStrip.cpp)
+    target_include_directories(lathe_ui_tests PRIVATE ${r8b_SOURCE_DIR})
+    target_compile_definitions(lathe_ui_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1 JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0 JUCE_MODAL_LOOPS_PERMITTED=1)
+    target_link_libraries(lathe_ui_tests PRIVATE lathe_core juce::juce_audio_utils juce::juce_audio_formats juce::juce_gui_extra
+        juce::juce_recommended_config_flags)
+    add_test(NAME ui COMMAND lathe_ui_tests)
 
     # Crash-proof plugin scanning: the test binary is also its own scan helper.
     juce_add_console_app(lathe_scan_tests PRODUCT_NAME "lathe_scan_tests")

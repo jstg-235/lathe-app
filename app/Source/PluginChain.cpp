@@ -183,13 +183,17 @@ void PluginChain::showEditor(int i) {
         auto* ed = s->plugin->createEditorIfNeeded();
         if (!ed) ed = new juce::GenericAudioProcessorEditor(*s->plugin);
         s->window = std::make_unique<EditorWindow>(ed, label_.isEmpty() ? s->plugin->getName() : s->plugin->getName() + "  -  " + label_);
+        if (windowKeys && s->builtin) s->window->addKeyListener(windowKeys);   // (built-in inserts only: a plugin's own keys stay its own)
     }
     s->window->setVisible(true);
     s->window->toFront(true);
 }
 
 void PluginChain::closeAllEditors() {
-    for (auto* s : slots_) s->window.reset();
+    for (auto* s : slots_) {
+        if (s->window && windowKeys) s->window->removeKeyListener(windowKeys);
+        s->window.reset();
+    }
 }
 
 void PluginChain::prepare(double rate, int block, bool doublePrecision) {

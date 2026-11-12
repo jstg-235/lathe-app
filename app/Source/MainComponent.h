@@ -16,6 +16,8 @@
 #include "EditPanels.h"
 #include "Exporter.h"
 #include "IoPanels.h"
+#include "Delivery.h"
+#include "TimecodeStrip.h"
 #include "Session.h"
 #include "SourceView.h"
 #include "Timeline.h"
@@ -125,8 +127,10 @@ private:
     void splitAtPlayhead();
     void deleteSelection(bool ripple);
     void nudgeSelectedRegion(double dt);
-    void openCrossfade(int out, int in);
+    void openCrossfade(int out, int in, bool source = false);   // in or out may be 0: a single fade
     void auditionRange(double from, double to) { playRange(false, from, to); }
+    // Edit Fade for the fade nearest the Edit Point (or playhead) on the active timeline.
+    void openFadeNearEditPoint();
     void refreshAll();
     void refreshIssues();
     void showPluginScanner();
@@ -207,6 +211,10 @@ private:
     void showMarkInfo();
     void showLaneMenu(bool source, int lane);
     void exportSelectedSegments();
+    // ---- exports in any format ----
+    void exportInOut();
+    // Asks for the format (and cover, and name for one file), then where, then renders.
+    void deliver(const juce::String& what, juce::Array<DeliveryItem> items, bool source);
     void showTextView();
     void showSegmentGain(juce::Array<int> ids);
     std::unique_ptr<juce::DocumentWindow> textViewWindow_;
@@ -220,7 +228,7 @@ private:
     IoSettings io_;
     bool armInputs_ = false, inputsWereLive_ = false;
     int armTried_ = -1;
-    std::unique_ptr<juce::DocumentWindow> audioSetupWindow_, captureWindow_;
+    std::unique_ptr<juce::DocumentWindow> audioSetupWindow_, captureWindow_, deliveryWindow_;
     struct CaptureRun {
         bool levelCheck = false, capturing = false;
         CapturePlan plan;
@@ -259,6 +267,12 @@ private:
     void gearHear(int gear, int which);
     juce::String printStatus(int gear) const;
     int printCount(int gear) const;
+    // ---- a take in progress (record, print, capture): live drawing and markers dropped on it ----
+    juce::Array<Timeline::LiveTake::Mark> recMarks_;
+    bool takeInProgress() const { return engine_.isRecording() || cap_.capturing || print_.printing; }
+    void updateLiveTake();
+    // Turns the markers dropped while recording into real ones on the take (those inside it).
+    void placeRecMarks(int regionId);
     std::unique_ptr<MeterStrip> meters_;
     std::unique_ptr<juce::DocumentWindow> meterWindow_;
     juce::Component::SafePointer<MeterBridge> meterBridge_;
@@ -269,9 +283,12 @@ private:
     ChainModel chainModel_{*this};
     juce::ListBox chainList_{"Plugins", &chainModel_};
     juce::TextEditor issues_;
+    juce::Label issuesLbl_;
     juce::Label timeDisplay_, trackDisplay_, rateWarning_, selDisplay_;
+    TimecodeStrip tcStrip_;
+    void updateTimecodeStrip();
     juce::TextButton newBtn_{"New"}, openBtn_{"Open"}, saveBtn_{"Save"}, importBtn_{"Import"},
-        envBtn_{"Envelope"}, snapBtn_{"Snap"}, lanesBtn_{"Lanes..."}, xfadeBtn_{"Crossfade..."},
+        envBtn_{"Envelope"}, snapBtn_{"Snap"}, lanesBtn_{"Lanes..."}, xfadeBtn_{"Edit Fade..."},
         trackMk_{"+ Track"}, indexMk_{"+ Index"}, pauseMk_{"+ Pause"}, splitBtn_{"Split"},
         playBtn_{"Play"}, homeBtn_{"|<"}, pluginsBtn_{"Plugins..."}, exportBtn_{"Export..."},
         analyseBtn_{"Analyse"}, verifyBtn_{"Verify DDP"}, audioBtn_{"Audio Setup"},

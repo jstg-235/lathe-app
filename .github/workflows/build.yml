@@ -14,8 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # MP3 export: the official LAME 3.100 release source (LGPL), checked against its SHA-512.
+      - name: Fetch the LAME MP3 encoder source
+        run: |
+          curl -fsSL --retry 4 -o "$RUNNER_TEMP/lame.tar.gz" "https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz"
+          echo "0844b9eadb4aacf8000444621451277de365041cc1d97b7f7a589da0b7a23899310afd4e4d81114b9912aa97832621d20588034715573d417b2923948c08634b  $RUNNER_TEMP/lame.tar.gz" | shasum -a 512 -c -
+          tar -xzf "$RUNNER_TEMP/lame.tar.gz" -C "$RUNNER_TEMP"
+
       - name: "Configure (universal: Apple Silicon + Intel)"
-        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DLATHE_LAME_SOURCE="$RUNNER_TEMP/lame-3.100"
 
       - name: Build
         run: cmake --build build --config Release -- -quiet
@@ -28,7 +35,7 @@ jobs:
       - name: Crash backtrace (only when a test failed)
         if: failure()
         run: |
-          for name in lathe_render_tests lathe_batch_tests; do
+          for name in lathe_render_tests lathe_batch_tests lathe_ui_tests; do
             T=$(find build -name "$name" -type f -perm -u+x | grep Release | head -1)
             echo "==== $name"
             lldb --batch -o run -k "bt 40" -k "frame variable" -k quit -- "$T" 2>&1 | tail -120
@@ -58,6 +65,10 @@ jobs:
       - name: Package
         run: |
           APP=$(find build -name "Lathe.app" -type d | grep Release | head -1)
+          # The MP3 encoder must be inside the app, for both kinds of Mac.
+          test -x "$APP/Contents/Resources/lame"
+          lipo -info "$APP/Contents/Resources/lame" | grep -q "x86_64 arm64\|arm64 x86_64"
+          "$APP/Contents/Resources/lame" --version | head -1
           codesign --force --deep --sign - "$APP"
           mkdir -p dist
           ditto -c -k --keepParent "$APP" dist/Lathe-mac.zip

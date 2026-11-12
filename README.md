@@ -184,6 +184,50 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
   keep working.
 - The printed key command guide now shows Control and Command correctly.
 
+## Timecode strip, markers while recording, Edit Fade, exports in any format (v0.14)
+
+- **Timecode strip** across the top of the main window:
+  - a large main counter: the playhead, or the Edit Point when stopped, and the take while
+    recording;
+  - **IN / OUT / DUR** of the In-Out;
+  - **LEFT / RIGHT / DUR** of what is selected: a region, or several segments in the Text View;
+  - one units setting for all of them, picked by clicking the units line: CD time (default), h:mm:ss.ms,
+    samples, seconds, SMPTE 24 / 25 / 30;
+  - it follows the active timeline (SRC / DEST);
+  - click IN, OUT, DUR or the main counter to type a time (DUR moves the Out).
+- **Markers while recording, Print or Capture**: M (track), Shift-M (index), P (pause) note the moment
+  without interrupting the take, show it as a dashed line, and become real markers on the take when
+  it stops. Stopping early keeps the ones inside what was recorded. The keys also work while the
+  Capture or External Gear window is in front.
+- **While recording** the timeline shows the take growing on its lane, with its level drawn as it
+  comes in, and the playhead follows it.
+- **Edit Fade**:
+  - opens from the right-click menu on a region, by double-clicking a join or a region's start or
+    end, with X, or with the "Edit Fade..." button;
+  - works on the source timeline too;
+  - also edits a region's own **fade-in or fade-out** as a single fade, with the same shapes, Custom
+    dB down and alpha, nudges, audition and the fade library;
+  - says so when there is nothing to edit.
+- **Export menu**: everything is on the Export button, in four groups:
+  - Disc: DDP;
+  - Whole programme: WAV 24 / 32 float, or another format;
+  - Each track: the CD WAVs, 24-bit WAVs, or another format;
+  - Part: the In-Out of the active timeline, or selected segments.
+  - The formats are WAV (CD, 24-bit, 32-bit float), **MP3** (320 kbps or V0), **AAC** (256 kbps,
+    .m4a) and **Apple Lossless** (.m4a). Compressed files are tagged from the CD-Text and release
+    details (title, artist, album, track n/N, ISRC, year, genre), with an optional cover image. After
+    encoding, each lossy file is checked for peaks over full scale.
+  - When both an In-Out and a region are selected, Export Selected Segments asks which you mean. The
+    source exports raw, as it plays.
+  - The MP3 encoder is LAME 3.100 (LGPL), built from its official release and carried inside the app
+    as its own program (Contents/Resources/lame, licence beside it).
+- **Fixes and layout**:
+  - closing Mark Info (and ten other windows with lists) while a cell was being edited could crash
+    Lathe; fixed;
+  - pausing the Meter Bridge no longer shrinks the meters;
+  - the plugin buttons sit directly under the plugin list, with a labelled "Problems & notes" box
+    below.
+
 ## Stability by design
 
 - Audio is streamed from disk on a background thread; the audio callback never touches the disk.

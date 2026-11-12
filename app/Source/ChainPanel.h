@@ -13,6 +13,9 @@ void showPluginPicker(PluginHost& host, juce::Component* target, std::function<v
 
 class ChainPanel : public juce::Component, private juce::ListBoxModel {
 public:
+    // Close the list while this panel is still whole: a cell being edited at close otherwise
+    // reaches back into a half-destroyed list (a crash on macOS).
+    ~ChainPanel() override { closeList(list_); }
     ChainPanel(PluginChain& chain, const juce::String& title);
     std::function<void()> onChange;   // chain edited: commit to the session
     std::function<void()> onScan;     // open the plugin manager

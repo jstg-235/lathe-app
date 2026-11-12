@@ -51,6 +51,7 @@ DdpPlayer::DdpPlayer(AudioEngine& e, const juce::File& folder, const ddp::ReadRe
 }
 
 DdpPlayer::~DdpPlayer() {
+    closeList(table_);
     e_.stopPlayer();
     e_.clearPlayer();
 }
